@@ -1,0 +1,15 @@
+[package]
+name = "veyra"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.102"
+directories = "6.0.0"
+rustyline = { version = "18.0.0", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+strip = true
