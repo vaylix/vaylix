@@ -1,0 +1,120 @@
+
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  BINARY_NAME: veyra
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            archive: tar.gz
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            archive: tar.gz
+
+          - os: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            archive: tar.gz
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            archive: tar.gz
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+            archive: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Prepare archive directory
+        shell: bash
+        run: |
+          mkdir -p dist
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe dist/
+          else
+            cp target/${{ matrix.target }}/release/${{ env.BINARY_NAME }} dist/
+          fi
+
+      - name: Create tar.gz archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          cd dist
+
+          tar -czf ../${{ env.BINARY_NAME }}-${{ matrix.target }}.tar.gz *
+
+      - name: Create zip archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Compress-Archive \
+            -Path dist/* \
+            -DestinationPath ${{ env.BINARY_NAME }}-${{ matrix.target }}.zip
+
+      - name: Skip unsupported targets
+        if: contains(matrix.target, 'freebsd')
+        run: |
+          echo "FreeBSD cross-compilation is currently experimental on GitHub-hosted runners."
+          echo "Skipping build for ${{ matrix.target }}."
+          exit 0
+
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            *.tar.gz
+            *.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
