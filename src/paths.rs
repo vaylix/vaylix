@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub struct VeyraPaths {
     pub history_path: PathBuf,
     pub snapshot_path: PathBuf,
+    pub wal_path: PathBuf,
 }
 
 impl VeyraPaths {
@@ -21,9 +22,12 @@ impl VeyraPaths {
 
         let snapshot_path = data_dir.join("snapshot.bin");
 
+        let wal_path = data_dir.join("wal.log");
+
         Ok(Self {
             history_path,
             snapshot_path,
+            wal_path,
         })
     }
 }

@@ -22,6 +22,7 @@ pub fn parse(input: &str) -> Result<Command> {
         "count" => parse_no_args(&tokens, Command::Count, "count"),
         "help" => parse_no_args(&tokens, Command::Help, "help"),
         "exit" | "quit" => parse_no_args(&tokens, Command::Exit, "exit"),
+        "snapshot" => parse_no_args(&tokens, Command::Snapshot, "snapshot"),
         unknown => bail!("unknown command: {}", unknown),
     }
 }

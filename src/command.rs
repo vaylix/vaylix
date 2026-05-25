@@ -41,6 +41,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "exit",
         usage: "exit",
     },
+    CommandInfo {
+        name: "snapshot",
+        usage: "snapshot",
+    },
 ];
 
 pub fn command_info(name: &str) -> Option<&'static CommandInfo> {
@@ -57,4 +61,5 @@ pub enum Command {
     Count,
     Help,
     Exit,
+    Snapshot,
 }

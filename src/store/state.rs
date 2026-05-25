@@ -1,3 +1,4 @@
+use crate::store::WalEntry;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +21,22 @@ impl EngineState {
                 .unwrap()
                 .as_secs(),
             version: ENGINE_VERSION,
+        }
+    }
+
+    pub fn apply(&mut self, entry: WalEntry) {
+        match entry {
+            WalEntry::Set { key, value } => {
+                self.data.insert(key, value);
+            }
+
+            WalEntry::Delete { key } => {
+                self.data.remove(&key);
+            }
+
+            WalEntry::Clear => {
+                self.data.clear();
+            }
         }
     }
 }

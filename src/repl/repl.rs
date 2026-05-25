@@ -173,6 +173,12 @@ impl Repl {
 
                 return true;
             }
+
+            Command::Snapshot => match self.engine.snapshot() {
+                Ok(_) => println!("OK"),
+
+                Err(err) => println!("{err}"),
+            },
         }
 
         false

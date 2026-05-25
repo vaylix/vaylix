@@ -16,4 +16,6 @@ pub trait StorageEngine {
     fn clear(&mut self) -> Result<()>;
 
     fn list(&self) -> Result<Vec<(String, String)>>;
+
+    fn snapshot(&self) -> Result<()>;
 }
