@@ -5,10 +5,10 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 
 use crate::command::Command;
+use crate::engine::{Engine, StorageEngine};
 use crate::parser;
 use crate::paths::VeyraPaths;
 use crate::repl::helper::VeyraHelper;
-use crate::store::{Engine, StorageEngine};
 
 pub struct Repl {
     editor: Editor<VeyraHelper, rustyline::history::DefaultHistory>,

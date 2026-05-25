@@ -1,4 +1,4 @@
-use crate::store::EngineState;
+use crate::engine::EngineState;
 use anyhow::Result;
 use postcard::{from_bytes, to_allocvec};
 

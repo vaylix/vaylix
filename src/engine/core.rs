@@ -1,7 +1,7 @@
+use crate::engine::{EngineState, StorageEngine};
 use crate::paths::VeyraPaths;
-use crate::store::{EngineState, StorageEngine, replay, truncate};
-use crate::store::{WalEntry, append};
-use crate::store::{deserialize, load, save, serialize};
+use crate::store::{WalEntry, append, replay};
+use crate::store::{deserialize, load, save, serialize, truncate};
 use anyhow::Result;
 
 pub struct Engine {
