@@ -19,7 +19,7 @@ impl VeyraPaths {
 
         let history_path = data_dir.join("history.txt");
 
-        let snapshot_path = data_dir.join("snapshot.json");
+        let snapshot_path = data_dir.join("snapshot.bin");
 
         Ok(Self {
             history_path,

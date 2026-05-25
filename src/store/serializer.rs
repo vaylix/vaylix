@@ -1,16 +1,15 @@
-use serde_json::{from_slice, to_vec};
-use std::collections::HashMap;
-
+use crate::store::EngineState;
 use anyhow::Result;
+use postcard::{from_bytes, to_allocvec};
 
-pub fn serialize(data: &HashMap<String, String>) -> Result<Vec<u8>> {
-    let serialized = to_vec(data)?;
+pub fn serialize(data: &EngineState) -> Result<Vec<u8>> {
+    let serialized = to_allocvec(data)?;
 
     Ok(serialized)
 }
 
-pub fn deserialize(bytes: &[u8]) -> Result<HashMap<String, String>> {
-    let deserialized: HashMap<String, String> = from_slice(bytes)?;
+pub fn deserialize(bytes: &[u8]) -> Result<EngineState> {
+    let deserialized: EngineState = from_bytes(bytes)?;
 
     Ok(deserialized)
 }
