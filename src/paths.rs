@@ -4,7 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 
 pub struct VeyraPaths {
-    pub data_dir: PathBuf,
+    pub history_path: PathBuf,
+    pub snapshot_path: PathBuf,
 }
 
 impl VeyraPaths {
@@ -16,6 +17,13 @@ impl VeyraPaths {
 
         fs::create_dir_all(&data_dir)?;
 
-        Ok(Self { data_dir })
+        let history_path = data_dir.join("history.txt");
+
+        let snapshot_path = data_dir.join("snapshot.json");
+
+        Ok(Self {
+            history_path,
+            snapshot_path,
+        })
     }
 }

@@ -8,11 +8,11 @@ use crate::command::Command;
 use crate::parser;
 use crate::paths::VeyraPaths;
 use crate::repl::helper::VeyraHelper;
-use crate::store::Store;
+use crate::store::{Engine, StorageEngine};
 
 pub struct Repl {
     editor: Editor<VeyraHelper, rustyline::history::DefaultHistory>,
-    store: Store,
+    engine: Engine,
     paths: VeyraPaths,
 }
 
@@ -28,15 +28,16 @@ impl Repl {
 
         let helper = VeyraHelper::new();
         let paths = VeyraPaths::new()?;
+        let engine = Engine::new()?;
 
         let mut editor = Editor::<VeyraHelper, DefaultHistory>::with_config(config)?;
 
         editor.set_helper(Some(helper));
-        editor.load_history(&paths.data_dir.join("history")).ok();
+        editor.load_history(&paths.history_path).ok();
 
         Ok(Self {
             editor,
-            store: Store::new()?,
+            engine,
             paths,
         })
     }
@@ -62,22 +63,19 @@ impl Repl {
                     };
 
                     if self.execute(command) {
-                        self.editor
-                            .save_history(&self.paths.data_dir.join("history"))?;
+                        self.editor.save_history(&self.paths.history_path)?;
                         break;
                     }
                 }
                 Err(ReadlineError::Interrupted) => {
                     println!("Exiting...");
-                    self.editor
-                        .save_history(&self.paths.data_dir.join("history"))?;
+                    self.editor.save_history(&self.paths.history_path)?;
                     break;
                 }
 
                 Err(ReadlineError::Eof) => {
                     println!("Exiting...");
-                    self.editor
-                        .save_history(&self.paths.data_dir.join("history"))?;
+                    self.editor.save_history(&self.paths.history_path)?;
                     break;
                 }
 
@@ -92,13 +90,15 @@ impl Repl {
 
     fn execute(&mut self, command: Command) -> bool {
         match command {
-            Command::Get { key } => match self.store.get(&key) {
-                Ok(value) => println!("{value}"),
+            Command::Get { key } => match self.engine.get(&key) {
+                Ok(Some(value)) => println!("{}", value),
+
+                Ok(None) => println!("Could not find value"),
 
                 Err(err) => println!("{err}"),
             },
 
-            Command::Set { key, value } => match self.store.set(key, value) {
+            Command::Set { key, value } => match self.engine.set(key, value) {
                 Ok(_) => println!("OK"),
 
                 Err(err) => println!("{err}"),
@@ -106,13 +106,13 @@ impl Repl {
 
             Command::Delete { keys } => {
                 if keys.len() > 1 {
-                    match self.store.delete_many(&keys) {
+                    match self.engine.delete_many(&keys) {
                         Ok(_) => println!("OK"),
 
                         Err(err) => println!("{err}"),
                     }
                 } else {
-                    match self.store.delete(&keys[0]) {
+                    match self.engine.delete(&keys[0]) {
                         Ok(_) => println!("OK"),
 
                         Err(err) => println!("{err}"),
@@ -120,13 +120,13 @@ impl Repl {
                 }
             }
 
-            Command::Exists { key } => match self.store.exists(&key) {
+            Command::Exists { key } => match self.engine.exists(&key) {
                 Ok(value) => println!("{}", value),
 
                 Err(err) => println!("{err}"),
             },
 
-            Command::List => match self.store.list() {
+            Command::List => match self.engine.list() {
                 Ok(values) => {
                     for (key, value) in values {
                         println!("{key} = {value}");
@@ -136,13 +136,13 @@ impl Repl {
                 Err(err) => println!("{err}"),
             },
 
-            Command::Clear => match self.store.clear() {
+            Command::Clear => match self.engine.clear() {
                 Ok(_) => println!("OK"),
 
                 Err(err) => println!("{err}"),
             },
 
-            Command::Count => match self.store.count() {
+            Command::Count => match self.engine.count() {
                 Ok(value) => println!("{}", value),
 
                 Err(err) => println!("{err}"),
