@@ -1,24 +1,44 @@
 # Veyra
 
-Veyra is a lightweight key-value database written in Rust.
+Veyra is an experimental key-value database written in Rust.
 
-The project began as a systems programming exercise focused on understanding database internals, parser design, storage engines, and distributed systems architecture from first principles.
+The project began as a systems programming exercise focused on understanding database internals from first principles: storage engines, write-ahead logging, snapshots, protocol design, concurrency, and distributed systems architecture.
 
-Veyra is currently an in-memory database with a custom REPL, parser, lexer, command completion, syntax highlighting, and persistent shell history support.
+Veyra is currently evolving from a REPL-driven in-memory database into a persistent storage engine with WAL-based recovery and a future TCP client/server architecture.
 
-The project is under active development and the architecture is expected to evolve significantly over time.
+> Veyra is intentionally built in layers. The goal is not just to build a database, but to understand why databases are designed the way they are.
 
-## Current Features
+---
 
-- In-memory key-value store
+## Features
+
+### Query Engine
+
 - Interactive REPL built with Rustyline
 - Custom lexer and parser
-- Command completion and validation
+- Quoted string parsing
+- Command validation and completion
 - Syntax highlighting and inline hints
 - Persistent shell history
+
+### Storage Engine
+
+- In-memory key-value engine
+- Snapshot-based persistence
+- Write-ahead logging (WAL)
+- Crash recovery through WAL replay
+- Binary serialization using Postcard
 - Multi-key delete support
-- Quoted string parsing
-- Modular architecture for future storage/networking layers
+
+### Architecture
+
+- Modular engine/storage separation
+- Snapshot + WAL recovery model
+- Structured command pipeline
+- Extensible protocol layer for future TCP support
+- Filesystem abstraction for OS-specific paths
+
+---
 
 ## Example
 
@@ -32,9 +52,14 @@ John Doe
 veyra> exists name
 true
 
-veyra> delete name
+veyra> count
+1
+
+veyra> snapshot
 OK
 ```
+
+---
 
 ## Supported Commands
 
@@ -44,63 +69,73 @@ get <key>
 delete <key> [key...]
 exists <key>
 list
-clear
 count
+clear
+snapshot
 help
 exit
 ```
 
-## Project Structure
+---
 
-```text
-src/
-├── command.rs      # Command definitions and metadata
-├── lexer.rs        # Tokenizer
-├── parser.rs       # Command parser
-├── store.rs        # In-memory storage engine
-├── paths.rs        # OS-specific data/config paths
-└── repl/
-    ├── helper.rs   # Completion/highlighting/validation
-    ├── repl.rs     # REPL runtime
-    └── mod.rs
-```
+## Storage Architecture
+
+Veyra currently uses a hybrid persistence model:
+
+- Writes are appended to a write-ahead log (WAL)
+- Snapshots periodically checkpoint the full engine state
+- On startup, snapshots are restored first and WAL entries are replayed afterward
+
+This provides:
+
+- Durable writes
+- Crash recovery
+- Fast startup recovery through snapshot checkpointing
+- Separation between durability and in-memory state transitions
+
+---
 
 ## Roadmap
 
 Planned work includes:
 
-- Persistent storage engine
-- Write-ahead logging (WAL)
-- Snapshotting and compaction
-- TCP server/client architecture
+- TCP server/client protocol
 - Concurrent client handling
+- Async networking with Tokio
+- Automatic snapshot checkpointing
+- WAL compaction and checksums
 - Replication experiments
-- Storage engine optimizations
 - Namespace support
 - Transaction support
+- Binary wire protocol
+- Storage engine optimizations
+- Distributed systems experiments
 
-The long-term goal is to gradually evolve Veyra from a simple in-memory database into a distributed systems playground for learning storage and database internals.
+---
 
 ## Limitations
 
-Veyra is currently experimental software.
+Veyra is experimental software and is not production-ready.
 
 Current limitations include:
 
-- No persistence layer yet
-- No networking layer
-- No replication
-- No concurrency support
-- No transaction guarantees
-- No crash recovery
+- Single-process architecture
 - No authentication or access control
-- Not production-ready
+- No replication or clustering
+- No transaction isolation guarantees
+- No concurrent write coordination
+- Limited corruption recovery
+- No benchmarking or performance tuning yet
+
+---
 
 ## Building
 
 ```bash
-cargo build
+cargo build --release
 ```
+
+---
 
 ## Running
 
@@ -108,11 +143,24 @@ cargo build
 cargo run
 ```
 
-## Development Status
+---
 
-Veyra is in active development.
+## Philosophy
 
-Breaking changes, architectural refactors, parser rewrites, and storage format changes are expected while the project evolves.
+Veyra is designed as a long-term systems programming project.
+
+The focus is on understanding:
+
+- How databases recover from crashes
+- Why WAL exists
+- How storage engines separate durability from state transitions
+- How protocols and networking layers evolve
+- How concurrency changes storage semantics
+- Why distributed systems become difficult at scale
+
+The architecture is expected to evolve aggressively over time.
+
+---
 
 ## License
 
