@@ -1,8 +1,9 @@
 mod args;
 mod client;
+mod error;
 mod helper;
+mod paths;
 
-use anyhow::Result;
 use args::Args;
 use clap::Parser;
 use client::Client;
@@ -16,7 +17,14 @@ Vaylix Database Client
 
 "#;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(err) = try_main() {
+        eprintln!("[{}] {}: {err}", err.code(), err.name());
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> error::Result<()> {
     let args = Args::parse();
     let mut client = Client::new(args.host, args.port)?;
 

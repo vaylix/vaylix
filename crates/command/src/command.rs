@@ -51,6 +51,7 @@ pub fn command_info(name: &str) -> Option<&'static CommandInfo> {
     COMMANDS.iter().find(|command| command.name == name)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Get { key: String },
     Set { key: String, value: String },

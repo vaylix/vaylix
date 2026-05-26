@@ -1,4 +1,4 @@
-use anyhow::Result;
+use crate::Result;
 
 pub trait StorageEngine {
     fn get(&self, key: &str) -> Result<Option<String>>;

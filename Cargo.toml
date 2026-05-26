@@ -1,7 +1,13 @@
 [workspace]
 resolver = "2"
 
-members = ["crates/engine", "crates/server", "crates/client"]
+members = [
+    "crates/command",
+    "crates/engine",
+    "crates/server",
+    "crates/client",
+    "crates/transport",
+]
 
 [profile.release]
 opt-level = "z"

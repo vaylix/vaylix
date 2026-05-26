@@ -40,3 +40,42 @@ impl EngineState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{ENGINE_VERSION, EngineState};
+    use crate::store::WalEntry;
+
+    #[test]
+    fn initializes_with_version_and_empty_data() {
+        let state = EngineState::new();
+
+        assert!(state.data.is_empty());
+        assert_eq!(state.version, ENGINE_VERSION);
+        assert!(state.created_at > 0);
+    }
+
+    #[test]
+    fn applies_set_delete_and_clear_entries() {
+        let mut state = EngineState::new();
+
+        state.apply(WalEntry::Set {
+            key: "name".to_string(),
+            value: "alice".to_string(),
+        });
+        assert_eq!(state.data.get("name").map(String::as_str), Some("alice"));
+
+        state.apply(WalEntry::Delete {
+            key: "name".to_string(),
+        });
+        assert!(!state.data.contains_key("name"));
+
+        state.apply(WalEntry::Set {
+            key: "city".to_string(),
+            value: "paris".to_string(),
+        });
+        state.apply(WalEntry::Clear);
+
+        assert!(state.data.is_empty());
+    }
+}

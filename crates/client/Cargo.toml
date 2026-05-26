@@ -8,7 +8,9 @@ name = "vaylix-client"
 path = "src/main.rs"
 
 [dependencies]
-engine = { path = "../engine" }
-anyhow = "1.0.102"
+command = { path = "../command" }
+transport = { path = "../transport" }
+directories = "6.0.0"
 rustyline = { version = "18.0.0", features = ["derive"] }
 clap = { version = "4.6.1", features = ["derive"] }
+thiserror = "2.0.18"

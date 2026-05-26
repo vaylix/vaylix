@@ -1,11 +1,9 @@
-use crate::Protocol;
-use crate::Response;
-use anyhow::{Result, bail};
+use command::Command;
 use engine::{Engine, StorageEngine};
-use std::{
-    io::{BufRead, BufReader, Write},
-    net::{TcpListener, TcpStream},
-};
+use std::net::{TcpListener, TcpStream};
+use transport::{Response, TransportError, read_request_from, write_response_to};
+
+use crate::error::{Result, ServerError};
 
 pub struct Server {
     listener: TcpListener,
@@ -15,7 +13,7 @@ pub struct Server {
 impl Server {
     pub fn new(bind: String, port: u16) -> Result<Self> {
         let addr = format!("{}:{}", bind, port);
-        let listener = TcpListener::bind(addr)?;
+        let listener = TcpListener::bind(addr).map_err(ServerError::Bind)?;
         let engine = Engine::new()?;
         println!("Ready for connections on {}", port);
 
@@ -29,196 +27,274 @@ impl Server {
                     println!("Client connected");
 
                     if let Err(err) = self.handle_client(stream) {
-                        eprintln!("Client error: {err}");
+                        eprintln!("Client error [{}] {}: {err}", err.code(), err.name());
                     }
                 }
-
                 Err(err) => {
-                    eprintln!("Connection failed: {err}");
+                    let err = ServerError::Accept(err);
+                    eprintln!("Connection failed [{}] {}: {err}", err.code(), err.name());
                 }
             }
         }
     }
 
     fn handle_client(&mut self, mut stream: TcpStream) -> Result<()> {
-        let mut reader = BufReader::new(stream.try_clone()?);
-
         loop {
-            let mut line = String::new();
+            let request = match read_request_from(&mut stream) {
+                Ok(request) => request,
+                Err(TransportError::UnexpectedEof) => break,
+                Err(err) => return Err(err.into()),
+            };
 
-            let bytes_read = reader.read_line(&mut line)?;
+            let request_id = request.request_id;
 
-            if bytes_read == 0 {
-                break;
-            }
+            let response = match request.into_command() {
+                Ok(command) => self
+                    .execute_command(request_id, command)
+                    .unwrap_or_else(|err| {
+                        error_response(request_id, err.code(), err.name(), &err.to_string())
+                    }),
+                Err(err) => error_response(request_id, err.code(), err.name(), &err.to_string()),
+            };
 
-            let command = self.parse_command(&line)?;
-
-            let should_exit = matches!(command, Protocol::Exit);
-
-            let response = self.execute_command(command)?;
-
-            self.write_response(&mut stream, response)?;
-
-            if should_exit {
-                break;
-            }
+            write_response_to(&mut stream, &response)?;
         }
 
         Ok(())
     }
 
-    fn parse_command(&self, line: &str) -> Result<Protocol> {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
-
-        if parts.is_empty() {
-            bail!("Empty command")
-        }
-
-        match parts[0].to_lowercase().as_str() {
-            "get" => {
-                if parts.len() != 2 {
-                    bail!("Usage: get <key>")
-                }
-
-                Ok(Protocol::Get {
-                    key: parts[1].to_string(),
-                })
-            }
-
-            "set" => {
-                if parts.len() < 3 {
-                    bail!("Usage: set <key> <value>")
-                }
-
-                Ok(Protocol::Set {
-                    key: parts[1].to_string(),
-                    value: parts[2..].join(" "),
-                })
-            }
-
-            "delete" => {
-                if parts.len() < 2 {
-                    bail!("Usage: delete <key> [key...]")
-                }
-
-                Ok(Protocol::Delete {
-                    keys: parts[1..].iter().map(|key| key.to_string()).collect(),
-                })
-            }
-
-            "exists" => {
-                if parts.len() != 2 {
-                    bail!("Usage: exists <key>")
-                }
-
-                Ok(Protocol::Exists {
-                    key: parts[1].to_string(),
-                })
-            }
-
-            "list" => Ok(Protocol::List),
-
-            "clear" => Ok(Protocol::Clear),
-
-            "count" => Ok(Protocol::Count),
-
-            "help" => Ok(Protocol::Help),
-
-            "exit" => Ok(Protocol::Exit),
-
-            "snapshot" => Ok(Protocol::Snapshot),
-
-            _ => bail!("Unknown command"),
-        }
+    fn execute_command(&mut self, request_id: u32, command: Command) -> Result<Response> {
+        execute_command(&mut self.engine, request_id, command)
     }
+}
 
-    fn execute_command(&mut self, command: Protocol) -> Result<Response> {
-        match command {
-        Protocol::Get { key } => match self.engine.get(&key)? {
-            Some(value) => Ok(Response::Value(value)),
+fn error_response(request_id: u32, code: &str, name: &str, message: &str) -> Response {
+    Response::error(request_id, code, name, message).unwrap_or_else(|_| {
+        Response::error(
+            request_id,
+            "TRN-011",
+            "Remote Error Encoding Failure",
+            "failed to encode structured error payload",
+        )
+        .expect("static remote error encoding should never fail")
+    })
+}
 
-            None => Ok(Response::NotFound),
+fn execute_command<E>(engine: &mut E, request_id: u32, command: Command) -> Result<Response>
+where
+    E: StorageEngine,
+{
+    match command {
+        Command::Get { key } => match engine.get(&key)? {
+            Some(value) => Ok(Response::value(request_id, &value)?),
+            None => Ok(Response::not_found(request_id)),
         },
+        Command::Set { key, value } => {
+            engine.set(key, value)?;
+            Ok(Response::ok(request_id))
+        }
+        Command::Delete { keys } => {
+            engine.delete_many(&keys)?;
+            Ok(Response::ok(request_id))
+        }
+        Command::Exists { key } => {
+            let exists = engine.exists(&key)?;
+            Ok(Response::boolean(request_id, exists))
+        }
+        Command::List => {
+            let entries = engine.list()?;
+            Ok(Response::entries(request_id, &entries)?)
+        }
+        Command::Clear => {
+            engine.clear()?;
+            Ok(Response::ok(request_id))
+        }
+        Command::Count => {
+            let count = engine.count()?;
+            Ok(Response::count(request_id, count as u64))
+        }
+        Command::Snapshot => {
+            engine.snapshot()?;
+            Ok(Response::ok(request_id))
+        }
+        Command::Help | Command::Exit => Err(ServerError::UnsupportedRemoteCommand),
+    }
+}
 
-        Protocol::Set { key, value } => {
-            self.engine.set(key, value)?;
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
 
-            Ok(Response::Ok)
+    use super::{error_response, execute_command};
+    use command::Command;
+    use engine::{Result, StorageEngine};
+    use transport::{Response, Status};
+
+    #[derive(Default)]
+    struct FakeEngine {
+        data: BTreeMap<String, String>,
+    }
+
+    impl StorageEngine for FakeEngine {
+        fn get(&self, key: &str) -> Result<Option<String>> {
+            Ok(self.data.get(key).cloned())
         }
 
-        Protocol::Delete { keys } => {
-            self.engine.delete_many(&keys)?;
-
-            Ok(Response::Ok)
+        fn set(&mut self, key: String, value: String) -> Result<()> {
+            self.data.insert(key, value);
+            Ok(())
         }
 
-        Protocol::Exists { key } => {
-            let exists = self.engine.exists(&key)?;
-
-            Ok(Response::Value(exists.to_string()))
+        fn delete(&mut self, key: &str) -> Result<()> {
+            self.data.remove(key);
+            Ok(())
         }
 
-        Protocol::List => {
-            let entries = self.engine.list()?;
+        fn delete_many(&mut self, keys: &[String]) -> Result<()> {
+            for key in keys {
+                self.data.remove(key);
+            }
 
-            let formatted = entries
+            Ok(())
+        }
+
+        fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.data.contains_key(key))
+        }
+
+        fn count(&self) -> Result<usize> {
+            Ok(self.data.len())
+        }
+
+        fn clear(&mut self) -> Result<()> {
+            self.data.clear();
+            Ok(())
+        }
+
+        fn list(&self) -> Result<Vec<(String, String)>> {
+            Ok(self
+                .data
                 .iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<String>>()
-                .join(", ");
-
-            Ok(Response::Value(formatted))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect())
         }
 
-        Protocol::Clear => {
-            self.engine.clear()?;
-
-            Ok(Response::Ok)
-        }
-
-        Protocol::Count => {
-            let count = self.engine.count()?;
-
-            Ok(Response::Count(count))
-        }
-
-        Protocol::Help => Ok(Response::Value(
-            "Available commands: get, set, delete, exists, list, clear, count, snapshot, help, exit"
-                .to_string(),
-        )),
-
-        Protocol::Exit => Ok(Response::Ok),
-
-        Protocol::Snapshot => {
-            self.engine.snapshot()?;
-
-            Ok(Response::Ok)
+        fn snapshot(&self) -> Result<()> {
+            Ok(())
         }
     }
+
+    #[test]
+    fn routes_get_request_to_value_response() {
+        let mut engine = FakeEngine::default();
+        engine.set("name".to_string(), "alice".to_string()).unwrap();
+
+        let response = execute_command(
+            &mut engine,
+            41,
+            Command::Get {
+                key: "name".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(response.request_id, 41);
+        assert_eq!(response.status, Status::Ok);
+        assert_eq!(response.decode_value().unwrap(), "alice");
     }
 
-    fn write_response(&self, stream: &mut TcpStream, response: Response) -> Result<()> {
-        let output = match response {
-            Response::Ok => "OK\n".to_string(),
+    #[test]
+    fn routes_exists_count_and_list_responses() {
+        let mut engine = FakeEngine::default();
+        engine.set("name".to_string(), "alice".to_string()).unwrap();
 
-            Response::Value(value) => {
-                format!("{value}\n")
-            }
+        let exists = execute_command(
+            &mut engine,
+            1,
+            Command::Exists {
+                key: "name".to_string(),
+            },
+        )
+        .unwrap();
+        let count = execute_command(&mut engine, 2, Command::Count).unwrap();
+        let list = execute_command(&mut engine, 3, Command::List).unwrap();
 
-            Response::Count(count) => {
-                format!("{count}\n")
-            }
+        assert!(exists.decode_bool().unwrap());
+        assert_eq!(count.decode_count().unwrap(), 1);
+        assert_eq!(
+            list.decode_entries().unwrap(),
+            vec![("name".to_string(), "alice".to_string())]
+        );
+    }
 
-            Response::NotFound => "NOT_FOUND\n".to_string(),
+    #[test]
+    fn routes_missing_key_to_not_found() {
+        let mut engine = FakeEngine::default();
 
-            Response::Error { code, message } => {
-                format!("ERROR [{code}]: {message}\n")
-            }
-        };
+        let response = execute_command(
+            &mut engine,
+            9,
+            Command::Get {
+                key: "missing".to_string(),
+            },
+        )
+        .unwrap();
 
-        stream.write_all(output.as_bytes())?;
+        assert_eq!(response, Response::not_found(9));
+    }
 
-        Ok(())
+    #[test]
+    fn routes_mutating_commands_and_remote_local_command_errors() {
+        let mut engine = FakeEngine::default();
+
+        assert_eq!(
+            execute_command(
+                &mut engine,
+                1,
+                Command::Set {
+                    key: "name".to_string(),
+                    value: "alice".to_string()
+                }
+            )
+            .unwrap(),
+            Response::ok(1)
+        );
+
+        assert_eq!(engine.get("name").unwrap().as_deref(), Some("alice"));
+
+        assert_eq!(
+            execute_command(
+                &mut engine,
+                2,
+                Command::Delete {
+                    keys: vec!["name".to_string()]
+                }
+            )
+            .unwrap(),
+            Response::ok(2)
+        );
+
+        assert_eq!(engine.get("name").unwrap(), None);
+        assert_eq!(
+            execute_command(&mut engine, 3, Command::Clear).unwrap(),
+            Response::ok(3)
+        );
+        assert_eq!(
+            execute_command(&mut engine, 4, Command::Snapshot).unwrap(),
+            Response::ok(4)
+        );
+        assert!(execute_command(&mut engine, 5, Command::Help).is_err());
+        assert!(execute_command(&mut engine, 6, Command::Exit).is_err());
+    }
+
+    #[test]
+    fn builds_error_responses() {
+        let response = error_response(99, "SRV-999", "Boom", "boom");
+        assert_eq!(response.request_id, 99);
+        assert_eq!(response.status, Status::Error);
+        let remote = response.decode_error().unwrap();
+        assert_eq!(remote.code, "SRV-999");
+        assert_eq!(remote.name, "Boom");
+        assert_eq!(remote.message, "boom");
     }
 }

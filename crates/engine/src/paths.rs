@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use crate::{EngineError, Result};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ pub struct Paths {
 impl Paths {
     pub fn new() -> Result<Self> {
         let dirs = ProjectDirs::from("dev", "veyra", "veyra")
-            .ok_or_else(|| anyhow!("Could not determine project directories"))?;
+            .ok_or(EngineError::ProjectDirsUnavailable)?;
 
         let data_dir = dirs.data_dir().to_path_buf();
 

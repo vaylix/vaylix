@@ -1,11 +1,8 @@
-mod command;
 mod engine;
-mod lexer;
-mod parser;
+mod error;
 mod paths;
 mod store;
 
-pub use command::{COMMANDS, command_info};
 pub use engine::{Engine, EngineState, StorageEngine};
-pub use parser::Parser;
+pub use error::{EngineError, Result};
 pub use paths::Paths;

@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use crate::{CommandError, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Token {
@@ -30,12 +30,8 @@ impl<'a> Lexer<'a> {
                 ' ' | '\t' | '\n' | '\r' => {
                     self.chars.next();
                 }
-                '"' => {
-                    tokens.push(Token::QuotedString(self.read_quoted_string()?));
-                }
-                _ => {
-                    tokens.push(Token::Word(self.read_word()));
-                }
+                '"' => tokens.push(Token::QuotedString(self.read_quoted_string()?)),
+                _ => tokens.push(Token::Word(self.read_word())),
             }
         }
 
@@ -47,8 +43,7 @@ impl<'a> Lexer<'a> {
 
         while let Some((_, ch)) = self.chars.peek().copied() {
             match ch {
-                ' ' | '\t' | '\n' | '\r' => break,
-                '"' => break,
+                ' ' | '\t' | '\n' | '\r' | '"' => break,
                 _ => {
                     word.push(ch);
                     self.chars.next();
@@ -61,7 +56,7 @@ impl<'a> Lexer<'a> {
 
     fn read_quoted_string(&mut self) -> Result<String> {
         let Some((start, '"')) = self.chars.next() else {
-            bail!("expected opening quote");
+            return Err(CommandError::ExpectedOpeningQuote);
         };
 
         let mut value = String::new();
@@ -88,6 +83,51 @@ impl<'a> Lexer<'a> {
             }
         }
 
-        bail!("unterminated quoted string starting at byte {start}")
+        Err(CommandError::UnterminatedQuotedString { start })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Token, tokenize};
+
+    #[test]
+    fn tokenizes_words_and_quoted_strings() {
+        assert_eq!(
+            tokenize(r#"set name "John Doe""#).unwrap(),
+            vec![
+                Token::Word("set".to_string()),
+                Token::Word("name".to_string()),
+                Token::QuotedString("John Doe".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn tokenizes_escaped_characters_inside_quotes() {
+        assert_eq!(
+            tokenize(r#"set message "line 1\nline 2\t\"ok\"\\done""#).unwrap(),
+            vec![
+                Token::Word("set".to_string()),
+                Token::Word("message".to_string()),
+                Token::QuotedString("line 1\nline 2\t\"ok\"\\done".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_mixed_whitespace() {
+        assert_eq!(
+            tokenize("  get\tname \n").unwrap(),
+            vec![
+                Token::Word("get".to_string()),
+                Token::Word("name".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unterminated_quotes() {
+        assert!(tokenize(r#"set name "oops"#).is_err());
     }
 }

@@ -1,8 +1,8 @@
 use crate::engine::{EngineState, StorageEngine};
+use crate::error::Result;
 use crate::paths::Paths;
 use crate::store::{WalEntry, append, replay};
 use crate::store::{deserialize, load, save, serialize, truncate};
-use anyhow::Result;
 
 pub struct Engine {
     state: EngineState,

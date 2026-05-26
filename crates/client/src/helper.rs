@@ -1,4 +1,4 @@
-use engine::{COMMANDS, command_info};
+use command::{COMMANDS, command_info};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -108,7 +108,7 @@ impl Validator for ClientHelper {
 
         let command = input.split_whitespace().next().unwrap_or("");
 
-        if command_info(command).is_some() {
+        if command_info(command).is_some() || command.eq_ignore_ascii_case("quit") {
             Ok(ValidationResult::Valid(None))
         } else {
             Ok(ValidationResult::Invalid(Some(format!(
