@@ -10,9 +10,21 @@ use protocol::Protocol;
 use response::Response;
 use server::Server;
 
+const BANNER: &str = r#"        
+        ■ ■ ■
+    ████████████
+      ████████
+         ██
+Vaylix Database Server
+
+"#;
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut server = Server::new(args.bind, args.port)?;
+
+    println!("{BANNER}");
+
     server.start()?;
 
     Ok(())
