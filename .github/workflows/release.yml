@@ -127,9 +127,9 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          Compress-Archive \
-            -Path dist/* \
-            -DestinationPath ${{ matrix.artifact_prefix }}-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip
+          Compress-Archive `
+            -Path dist/* `
+            -DestinationPath "${{ matrix.artifact_prefix }}-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip"
 
       - name: Upload release artifacts
         uses: softprops/action-gh-release@v2
