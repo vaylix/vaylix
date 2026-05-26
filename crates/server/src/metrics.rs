@@ -34,8 +34,14 @@ impl Metrics {
                 "completed_connections",
                 self.completed_connections.load(Ordering::Relaxed),
             ),
-            ("requests_total", self.requests_total.load(Ordering::Relaxed)),
-            ("auth_successes", self.auth_successes.load(Ordering::Relaxed)),
+            (
+                "requests_total",
+                self.requests_total.load(Ordering::Relaxed),
+            ),
+            (
+                "auth_successes",
+                self.auth_successes.load(Ordering::Relaxed),
+            ),
             ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
             (
                 "transactions_started",
@@ -49,7 +55,10 @@ impl Metrics {
                 "transactions_discarded",
                 self.transactions_discarded.load(Ordering::Relaxed),
             ),
-            ("idle_disconnects", self.idle_disconnects.load(Ordering::Relaxed)),
+            (
+                "idle_disconnects",
+                self.idle_disconnects.load(Ordering::Relaxed),
+            ),
             (
                 "snapshots_completed",
                 self.snapshots_completed.load(Ordering::Relaxed),

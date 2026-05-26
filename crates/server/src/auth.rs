@@ -1,8 +1,11 @@
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand::random;
 
 use crate::error::{Result, ServerError};
+
+pub const DEFAULT_USERNAME: &str = "vaylix";
+pub const DEFAULT_PASSWORD: &str = "vaylix";
 
 /// Immutable authentication settings for the server.
 #[derive(Clone)]

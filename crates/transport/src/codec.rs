@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use bytes::{Buf, BufMut, BytesMut};
 use crc32fast::hash;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use uuid::Uuid;
 
 use crate::constants::{HEADER_LEN, MAX_FRAME_LEN};
 use crate::error::{Result, TransportError};
@@ -13,8 +14,8 @@ use crate::response::{Response, Status};
 
 /// Encodes a request into a framed binary packet.
 pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
-    let mut body = BytesMut::with_capacity(5 + request.payload.len());
-    body.put_u32(request.request_id);
+    let mut body = BytesMut::with_capacity(17 + request.payload.len());
+    body.extend_from_slice(request.request_id.as_bytes());
     body.put_u8(request.opcode.into());
     body.extend_from_slice(&request.payload);
 
@@ -29,8 +30,8 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request> {
 
 /// Encodes a response into a framed binary packet.
 pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
-    let mut body = BytesMut::with_capacity(5 + response.payload.len());
-    body.put_u32(response.request_id);
+    let mut body = BytesMut::with_capacity(17 + response.payload.len());
+    body.extend_from_slice(response.request_id.as_bytes());
     body.put_u8(response.status.into());
     body.extend_from_slice(&response.payload);
 
@@ -186,11 +187,12 @@ async fn read_frame_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<V
 fn decode_request_body(body: &[u8]) -> Result<Request> {
     let mut buf = body;
 
-    if buf.remaining() < 5 {
+    if buf.remaining() < 17 {
         return Err(TransportError::UnexpectedEof);
     }
 
-    let request_id = buf.get_u32();
+    let request_id =
+        Uuid::from_slice(&buf.copy_to_bytes(16)).map_err(|_| TransportError::CorruptedPayload)?;
     let opcode = Opcode::try_from(buf.get_u8())?;
     let payload = buf.to_vec();
 
@@ -200,11 +202,12 @@ fn decode_request_body(body: &[u8]) -> Result<Request> {
 fn decode_response_body(body: &[u8]) -> Result<Response> {
     let mut buf = body;
 
-    if buf.remaining() < 5 {
+    if buf.remaining() < 17 {
         return Err(TransportError::UnexpectedEof);
     }
 
-    let request_id = buf.get_u32();
+    let request_id =
+        Uuid::from_slice(&buf.copy_to_bytes(16)).map_err(|_| TransportError::CorruptedPayload)?;
     let status = Status::try_from(buf.get_u8())?;
     let payload = buf.to_vec();
 
@@ -240,6 +243,7 @@ mod tests {
 
     use command::{Command, Expiration, SetCondition, SetOptions};
     use tokio::runtime::Runtime;
+    use uuid::Uuid;
 
     use super::{
         decode_request, decode_response, encode_request, encode_response, read_request_from,
@@ -248,6 +252,10 @@ mod tests {
     };
     use crate::constants::{HEADER_LEN, MAGIC_BYTES, MAX_FRAME_LEN, VERSION};
     use crate::{Request, Response, Status, TransportError};
+
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
 
     struct FailingWriter;
 
@@ -344,7 +352,7 @@ mod tests {
         ];
 
         for command in commands {
-            let request = Request::from_command(11, command.clone()).unwrap();
+            let request = Request::from_command(id(11), command.clone()).unwrap();
             let encoded = encode_request(&request).unwrap();
             let decoded = decode_request(&encoded).unwrap();
 
@@ -356,16 +364,16 @@ mod tests {
     #[test]
     fn response_frame_round_trip_for_payload_types() {
         let responses = vec![
-            Response::ok(1),
-            Response::not_found(2),
-            Response::error(3, "SRV-400", "Bad Request", "bad request").unwrap(),
-            Response::value(4, "alice").unwrap(),
-            Response::boolean(5, true),
-            Response::count(6, 42),
-            Response::integer(7, -2),
-            Response::entries(8, &[("name".to_string(), "alice".to_string())]).unwrap(),
-            Response::strings(9, &[Some("alice".to_string()), None]).unwrap(),
-            Response::scan(10, 3, &["one".to_string(), "two".to_string()]).unwrap(),
+            Response::ok(id(1)),
+            Response::not_found(id(2)),
+            Response::error(id(3), "SRV-400", "Bad Request", "bad request").unwrap(),
+            Response::value(id(4), "alice").unwrap(),
+            Response::boolean(id(5), true),
+            Response::count(id(6), 42),
+            Response::integer(id(7), -2),
+            Response::entries(id(8), &[("name".to_string(), "alice".to_string())]).unwrap(),
+            Response::strings(id(9), &[Some("alice".to_string()), None]).unwrap(),
+            Response::scan(id(10), 3, &["one".to_string(), "two".to_string()]).unwrap(),
         ];
 
         for response in responses {
@@ -378,7 +386,7 @@ mod tests {
     #[test]
     fn io_helpers_round_trip() {
         let request = Request::from_command(
-            9,
+            id(9),
             Command::Set {
                 key: "name".to_string(),
                 value: "alice".to_string(),
@@ -386,7 +394,7 @@ mod tests {
             },
         )
         .unwrap();
-        let response = Response::value(9, "alice").unwrap();
+        let response = Response::value(id(9), "alice").unwrap();
         let mut request_cursor = Cursor::new(Vec::new());
         let mut response_cursor = Cursor::new(Vec::new());
 
@@ -406,7 +414,7 @@ mod tests {
 
         runtime.block_on(async {
             let request = Request::from_command(
-                9,
+                id(9),
                 Command::Set {
                     key: "name".to_string(),
                     value: "alice".to_string(),
@@ -414,7 +422,7 @@ mod tests {
                 },
             )
             .unwrap();
-            let response = Response::value(9, "alice").unwrap();
+            let response = Response::value(id(9), "alice").unwrap();
             let (mut request_reader, mut request_writer) = tokio::io::duplex(1024);
             let (mut response_reader, mut response_writer) = tokio::io::duplex(1024);
 
@@ -441,7 +449,7 @@ mod tests {
     #[test]
     fn rejects_bad_magic() {
         let request = Request::from_command(
-            1,
+            id(1),
             Command::Get {
                 key: "name".to_string(),
             },
@@ -459,7 +467,7 @@ mod tests {
     #[test]
     fn rejects_wrong_version() {
         let request = Request::from_command(
-            1,
+            id(1),
             Command::Get {
                 key: "name".to_string(),
             },
@@ -477,12 +485,12 @@ mod tests {
     #[test]
     fn rejects_unknown_opcode() {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u32.to_be_bytes());
+        payload.extend_from_slice(id(1).as_bytes());
         payload.push(0xff);
         let mut frame = Vec::from(MAGIC_BYTES);
         frame.push(VERSION);
         frame.push(0);
-        frame.extend_from_slice(&5_u32.to_be_bytes());
+        frame.extend_from_slice(&17_u32.to_be_bytes());
         frame.extend_from_slice(&crc32fast::hash(&payload).to_be_bytes());
         frame.extend_from_slice(&payload);
 
@@ -495,12 +503,12 @@ mod tests {
     #[test]
     fn rejects_unknown_status() {
         let mut payload = Vec::new();
-        payload.extend_from_slice(&1_u32.to_be_bytes());
+        payload.extend_from_slice(id(1).as_bytes());
         payload.push(0xff);
         let mut frame = Vec::from(MAGIC_BYTES);
         frame.push(VERSION);
         frame.push(0);
-        frame.extend_from_slice(&5_u32.to_be_bytes());
+        frame.extend_from_slice(&17_u32.to_be_bytes());
         frame.extend_from_slice(&crc32fast::hash(&payload).to_be_bytes());
         frame.extend_from_slice(&payload);
 
@@ -522,7 +530,7 @@ mod tests {
     #[test]
     fn rejects_truncated_payload() {
         let request = Request::from_command(
-            1,
+            id(1),
             Command::Get {
                 key: "name".to_string(),
             },
@@ -554,7 +562,7 @@ mod tests {
     #[test]
     fn rejects_invalid_utf8_payload() {
         let response = Response {
-            request_id: 1,
+            request_id: id(1),
             status: Status::Ok,
             payload: vec![0, 0, 0, 2, 0xff, 0xfe],
         };
@@ -568,7 +576,7 @@ mod tests {
     #[test]
     fn rejects_frame_with_trailing_bytes() {
         let request = Request::from_command(
-            1,
+            id(1),
             Command::Get {
                 key: "name".to_string(),
             },
@@ -586,7 +594,7 @@ mod tests {
     #[test]
     fn propagates_reader_and_writer_io_errors() {
         let request = Request::from_command(
-            1,
+            id(1),
             Command::Get {
                 key: "name".to_string(),
             },

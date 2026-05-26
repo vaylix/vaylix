@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum OutputModeArg {
@@ -8,7 +9,7 @@ pub enum OutputModeArg {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "vaylix", about = "Vaylix database server")]
+#[command(name = "vaylix-client", about = "Vaylix database client")]
 pub struct Args {
     /// URL-style connection string, for example: vaylix://user:password@127.0.0.1:9173
     #[arg(long)]
@@ -21,6 +22,22 @@ pub struct Args {
     /// Port to bind to
     #[arg(long, default_value_t = 9173)]
     pub port: u16,
+
+    /// Enable TLS for the client connection.
+    #[arg(long, default_value_t = false)]
+    pub ssl: bool,
+
+    /// Optional PEM-encoded CA certificate used to validate the server certificate.
+    #[arg(long)]
+    pub tls_ca_cert: Option<PathBuf>,
+
+    /// Username used for server authentication.
+    #[arg(long)]
+    pub user: Option<String>,
+
+    /// Password used for server authentication.
+    #[arg(long)]
+    pub password: Option<String>,
 
     /// Output rendering mode.
     #[arg(long, value_enum, default_value_t = OutputModeArg::Plain)]

@@ -10,8 +10,6 @@ permissions:
   packages: write
 
 env:
-  SERVER_BINARY: vaylix
-  CLIENT_BINARY: vaylix-client
   IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/vaylix
 
 jobs:
@@ -24,133 +22,61 @@ jobs:
 
       matrix:
         include:
-          # =========================
-          # Linux GNU
-          # =========================
-
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             package: server
             binary: vaylix
-            artifact_name: vaylix-linux-amd64
+            artifact_prefix: vaylix-server
 
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             package: client
             binary: vaylix-client
-            artifact_name: vaylix-client-linux-amd64
+            artifact_prefix: vaylix-client
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             package: server
             binary: vaylix
-            artifact_name: vaylix-linux-arm64
+            artifact_prefix: vaylix-server
 
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             archive: tar.gz
             package: client
             binary: vaylix-client
-            artifact_name: vaylix-client-linux-arm64
-
-          # =========================
-          # Linux MUSL
-          # =========================
-
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            archive: tar.gz
-            package: server
-            binary: vaylix
-            artifact_name: vaylix-linux-musl-amd64
-
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            archive: tar.gz
-            package: client
-            binary: vaylix-client
-            artifact_name: vaylix-client-linux-musl-amd64
-
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            archive: tar.gz
-            package: server
-            binary: vaylix
-            artifact_name: vaylix-linux-musl-arm64
-
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
-            archive: tar.gz
-            package: client
-            binary: vaylix-client
-            artifact_name: vaylix-client-linux-musl-arm64
-
-          # =========================
-          # macOS
-          # =========================
-
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: tar.gz
-            package: server
-            binary: vaylix
-            artifact_name: vaylix-macos-amd64
-
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            archive: tar.gz
-            package: client
-            binary: vaylix-client
-            artifact_name: vaylix-client-macos-amd64
+            artifact_prefix: vaylix-client
 
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             package: server
             binary: vaylix
-            artifact_name: vaylix-macos-arm64
+            artifact_prefix: vaylix-server
 
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
             package: client
             binary: vaylix-client
-            artifact_name: vaylix-client-macos-arm64
-
-          # =========================
-          # Windows
-          # =========================
+            artifact_prefix: vaylix-client
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             package: server
             binary: vaylix.exe
-            artifact_name: vaylix-windows-amd64
+            artifact_prefix: vaylix-server
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
             package: client
             binary: vaylix-client.exe
-            artifact_name: vaylix-client-windows-amd64
-
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            archive: zip
-            package: server
-            binary: vaylix.exe
-            artifact_name: vaylix-windows-arm64
-
-          - os: windows-latest
-            target: aarch64-pc-windows-msvc
-            archive: zip
-            package: client
-            binary: vaylix-client.exe
-            artifact_name: vaylix-client-windows-arm64
+            artifact_prefix: vaylix-client
 
     steps:
       - name: Checkout repository
@@ -161,14 +87,23 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install musl tools
-        if: contains(matrix.target, 'musl')
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cross for Linux cross-compilation
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       - name: Build release binary
-        run: cargo build --release --package ${{ matrix.package }} --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" && "${{ matrix.target }}" == "aarch64-unknown-linux-gnu" ]]; then
+            cross build --release --package ${{ matrix.package }} --target ${{ matrix.target }}
+          else
+            cargo build --release --package ${{ matrix.package }} --target ${{ matrix.target }}
+          fi
 
       - name: Prepare archive directory
         shell: bash
@@ -179,14 +114,14 @@ jobs:
 
           cp README.md dist/ || true
           cp LICENSE dist/ || true
+          echo "${GITHUB_REF_NAME}" > dist/VERSION
 
       - name: Create tar.gz archive
         if: matrix.archive == 'tar.gz'
         shell: bash
         run: |
           cd dist
-
-          tar -czf ../${{ matrix.artifact_name }}.tar.gz *
+          tar -czf ../${{ matrix.artifact_prefix }}-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz *
 
       - name: Create zip archive
         if: matrix.archive == 'zip'
@@ -194,7 +129,7 @@ jobs:
         run: |
           Compress-Archive \
             -Path dist/* \
-            -DestinationPath ${{ matrix.artifact_name }}.zip
+            -DestinationPath ${{ matrix.artifact_prefix }}-${env:GITHUB_REF_NAME}-${{ matrix.target }}.zip
 
       - name: Upload release artifacts
         uses: softprops/action-gh-release@v2
@@ -236,9 +171,7 @@ jobs:
           images: ${{ env.IMAGE_NAME }}
           tags: |
             type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6

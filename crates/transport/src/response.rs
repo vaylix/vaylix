@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut, BytesMut};
+use uuid::Uuid;
 
 use crate::error::{Result, TransportError};
 
@@ -48,14 +49,14 @@ impl TryFrom<u8> for Status {
 /// A decoded server response without outer frame bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
-    pub request_id: u32,
+    pub request_id: Uuid,
     pub status: Status,
     pub payload: Vec<u8>,
 }
 
 impl Response {
     /// Builds a raw response from its request id, status, and payload.
-    pub fn new(request_id: u32, status: Status, payload: Vec<u8>) -> Self {
+    pub fn new(request_id: Uuid, status: Status, payload: Vec<u8>) -> Self {
         Self {
             request_id,
             status,
@@ -64,17 +65,17 @@ impl Response {
     }
 
     /// Builds an empty successful response.
-    pub fn ok(request_id: u32) -> Self {
+    pub fn ok(request_id: Uuid) -> Self {
         Self::new(request_id, Status::Ok, Vec::new())
     }
 
     /// Builds a not-found response for a missing key.
-    pub fn not_found(request_id: u32) -> Self {
+    pub fn not_found(request_id: Uuid) -> Self {
         Self::new(request_id, Status::NotFound, Vec::new())
     }
 
     /// Builds a structured error response.
-    pub fn error(request_id: u32, code: &str, name: &str, message: &str) -> Result<Self> {
+    pub fn error(request_id: Uuid, code: &str, name: &str, message: &str) -> Result<Self> {
         Ok(Self::new(
             request_id,
             Status::Error,
@@ -83,31 +84,31 @@ impl Response {
     }
 
     /// Builds a response containing a single string value.
-    pub fn value(request_id: u32, value: &str) -> Result<Self> {
+    pub fn value(request_id: Uuid, value: &str) -> Result<Self> {
         Ok(Self::new(request_id, Status::Ok, encode_string_u32(value)?))
     }
 
     /// Builds a response containing a boolean value.
-    pub fn boolean(request_id: u32, value: bool) -> Self {
+    pub fn boolean(request_id: Uuid, value: bool) -> Self {
         Self::new(request_id, Status::Ok, vec![u8::from(value)])
     }
 
     /// Builds a response containing an unsigned count value.
-    pub fn count(request_id: u32, count: u64) -> Self {
+    pub fn count(request_id: Uuid, count: u64) -> Self {
         let mut buf = BytesMut::with_capacity(8);
         buf.put_u64(count);
         Self::new(request_id, Status::Ok, buf.to_vec())
     }
 
     /// Builds a response containing a signed integer value.
-    pub fn integer(request_id: u32, value: i64) -> Self {
+    pub fn integer(request_id: Uuid, value: i64) -> Self {
         let mut buf = BytesMut::with_capacity(8);
         buf.put_i64(value);
         Self::new(request_id, Status::Ok, buf.to_vec())
     }
 
     /// Builds a response containing a list of key/value pairs.
-    pub fn entries(request_id: u32, entries: &[(String, String)]) -> Result<Self> {
+    pub fn entries(request_id: Uuid, entries: &[(String, String)]) -> Result<Self> {
         let entry_count =
             u32::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
         let mut buf = BytesMut::new();
@@ -122,7 +123,7 @@ impl Response {
     }
 
     /// Builds a response containing a list of optional string values.
-    pub fn strings(request_id: u32, values: &[Option<String>]) -> Result<Self> {
+    pub fn strings(request_id: Uuid, values: &[Option<String>]) -> Result<Self> {
         let value_count =
             u32::try_from(values.len()).map_err(|_| TransportError::CorruptedPayload)?;
         let mut buf = BytesMut::new();
@@ -142,7 +143,7 @@ impl Response {
     }
 
     /// Builds a cursor-based scan response.
-    pub fn scan(request_id: u32, next_cursor: u64, keys: &[String]) -> Result<Self> {
+    pub fn scan(request_id: Uuid, next_cursor: u64, keys: &[String]) -> Result<Self> {
         let key_count = u32::try_from(keys.len()).map_err(|_| TransportError::CorruptedPayload)?;
         let mut buf = BytesMut::new();
         buf.put_u64(next_cursor);
@@ -355,23 +356,28 @@ fn ensure_empty(buf: &[u8]) -> Result<()> {
 mod tests {
     use super::{Response, Status};
     use crate::TransportError;
+    use uuid::Uuid;
+
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
 
     #[test]
     fn response_helpers_round_trip() {
-        let value = Response::value(1, "hello").unwrap();
+        let value = Response::value(id(1), "hello").unwrap();
         assert_eq!(value.decode_value().unwrap(), "hello");
 
-        let boolean = Response::boolean(2, true);
+        let boolean = Response::boolean(id(2), true);
         assert!(boolean.decode_bool().unwrap());
 
-        let count = Response::count(3, 42);
+        let count = Response::count(id(3), 42);
         assert_eq!(count.decode_count().unwrap(), 42);
 
-        let integer = Response::integer(4, -2);
+        let integer = Response::integer(id(4), -2);
         assert_eq!(integer.decode_integer().unwrap(), -2);
 
         let entries = Response::entries(
-            5,
+            id(5),
             &[
                 ("name".to_string(), "alice".to_string()),
                 ("city".to_string(), "paris".to_string()),
@@ -387,7 +393,7 @@ mod tests {
         );
 
         let strings = Response::strings(
-            6,
+            id(6),
             &[Some("alice".to_string()), None, Some("paris".to_string())],
         )
         .unwrap();
@@ -396,7 +402,7 @@ mod tests {
             vec![Some("alice".to_string()), None, Some("paris".to_string())]
         );
 
-        let scan = Response::scan(7, 10, &["one".to_string(), "two".to_string()]).unwrap();
+        let scan = Response::scan(id(7), 10, &["one".to_string(), "two".to_string()]).unwrap();
         let decoded = scan.decode_scan().unwrap();
         assert_eq!(decoded.next_cursor, 10);
         assert_eq!(decoded.keys, vec!["one".to_string(), "two".to_string()]);
@@ -404,7 +410,7 @@ mod tests {
 
     #[test]
     fn decodes_error_payload() {
-        let response = Response::error(9, "SRV-500", "Server Failure", "boom").unwrap();
+        let response = Response::error(id(9), "SRV-500", "Server Failure", "boom").unwrap();
         assert_eq!(response.status, Status::Error);
         let remote = response.decode_error().unwrap();
         assert_eq!(remote.code, "SRV-500");
@@ -414,19 +420,19 @@ mod tests {
 
     #[test]
     fn rejects_corrupted_response_payloads() {
-        let bool_response = Response::new(1, Status::Ok, vec![2]);
+        let bool_response = Response::new(id(1), Status::Ok, vec![2]);
         assert!(matches!(
             bool_response.decode_bool(),
             Err(TransportError::CorruptedPayload)
         ));
 
-        let count_response = Response::new(1, Status::Ok, vec![0, 0, 0, 1, 0]);
+        let count_response = Response::new(id(1), Status::Ok, vec![0, 0, 0, 1, 0]);
         assert!(matches!(
             count_response.decode_count(),
             Err(TransportError::UnexpectedEof)
         ));
 
-        let strings_response = Response::new(1, Status::Ok, vec![0, 0, 0, 1, 2]);
+        let strings_response = Response::new(id(1), Status::Ok, vec![0, 0, 0, 1, 2]);
         assert!(matches!(
             strings_response.decode_strings(),
             Err(TransportError::CorruptedPayload)

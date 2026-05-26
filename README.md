@@ -1,218 +1,140 @@
 # Vaylix
 
-Vaylix is a transport-oriented database engine written in Rust.
+Vaylix is a Rust key/value database project built around a strict transport boundary. It currently provides a single-node, string-to-string database with a framed binary protocol, a Tokio multi-client server, authenticated access, optional TLS, and encrypted-at-rest persistence.
 
-The project focuses on understanding database internals from first principles: storage engines, write-ahead logging, binary protocols, persistence, concurrency, networking, and distributed systems architecture.
+The project is intentionally structured as a serious systems codebase rather than a demo:
+- protocol and engine responsibilities are separated
+- errors carry stable codes and friendly names
+- persistence behavior is explicit
+- CI enforces formatting, linting, and tests
 
-Vaylix is built as a layered system with a dedicated storage engine, WAL-based recovery, a modular client/server architecture, and an evolving binary transport layer.
+## Current Scope
 
-> The goal is not just to build a database, but to understand why databases are designed the way they are.
+Implemented today:
+- `String -> String` data model
+- custom framed binary transport protocol
+- shared transport crate for client and server
+- mandatory authentication
+- optional TLS
+- WAL + snapshot durability
+- server-managed storage keyring with rotation support
+- request rate limiting and command quotas
+- REPL client with `plain`, `table`, and `json` output
+- session transaction commands: `MULTI`, `EXEC`, `DISCARD`
 
----
+Not implemented yet:
+- replication
+- sharding
+- full ACID isolation semantics
+- audit logging
+- transport compression
 
-## Features
+## Workspace
 
-### Query Engine
+- `crates/command` — parser, lexer, command metadata
+- `crates/transport` — framing, codec, wire protocol, sync/async I/O
+- `crates/engine` — state, WAL, snapshots, recovery, storage encryption
+- `crates/server` — Tokio server, auth, TLS, quotas, rate limits, engine runtime
+- `crates/client` — REPL, connection strings, TLS client, output rendering
 
-- Interactive remote client built with Rustyline
-- Custom lexer and parser
-- Quoted string parsing
-- Command validation and completion
-- Syntax highlighting and inline hints
-- Persistent shell history
-
-### Storage Engine
-
-- In-memory key-value engine
-- Snapshot-based persistence
-- Write-ahead logging (WAL)
-- Crash recovery through WAL replay
-- Binary serialization using Postcard
-- Multi-key delete support
-- Snapshot + WAL recovery model
-- Configurable WAL durability modes
-
-### Architecture
-
-- Dedicated engine, transport, server, and client crates
-- Layered transport abstraction shared between client and server
-- Snapshot + WAL persistence architecture
-- Binary framed protocol foundation
-- Modular request/response transport design
-- Filesystem abstraction for OS-specific paths
-- Docker and multi-architecture release support
-
----
-
-## Example
-
-```text
-$ vaylix
-
-        ■ ■ ■
-
-    ████████████
-      ████████
-        ████
-          ██
-           █
-
-        Vaylix
- transport-oriented storage
-
-vaylix> set name "John Doe"
-OK
-
-vaylix> get name
-John Doe
-
-vaylix> count
-1
-```
-
----
-
-## Supported Commands
-
-```text
-set <key> <value>
-get <key>
-delete <key> [key...]
-exists <key>
-list
-count
-clear
-snapshot
-help
-exit
-```
-
----
-
-## Storage Architecture
-
-Vaylix currently uses a hybrid persistence model:
-
-- Writes are appended to a write-ahead log (WAL)
-- Snapshots periodically checkpoint the full engine state
-- On startup, snapshots are restored first and WAL entries are replayed afterward
-
-This provides:
-
-- Durable writes
-- Crash recovery
-- Fast startup recovery through snapshot checkpointing
-- Separation between durability and in-memory state transitions
-
----
-
-## Roadmap
-
-Planned work includes:
-
-- Stable Vaylix Transport Protocol (VTP)
-- Concurrent client handling
-- Async networking with Tokio
-- Automatic snapshot checkpointing
-- WAL compaction and checksums
-- Replication experiments
-- Namespace support
-- Transaction support
-- Protocol versioning and compression
-- Storage engine optimizations
-- Distributed systems experiments
-- TLS support
-- Replication transport streams
-- Observability and tracing
-
----
-
-## Limitations
-
-Vaylix is experimental software and is not production-ready.
-
-Current limitations include:
-
-- No authentication or access control
-- No replication or clustering
-- No transaction isolation guarantees
-- No concurrent write coordination
-- Limited corruption recovery
-- No benchmarking or performance tuning yet
-- Limited multi-client coordination
-
----
-
-## Building
+## Build
 
 ```bash
-cargo build --release
+cargo build --workspace
 ```
 
-Build specific workspace packages:
+Release binaries:
 
 ```bash
 cargo build --release -p server
 cargo build --release -p client
 ```
 
----
-
-## Running
+## Run
 
 Start the server:
 
 ```bash
-cargo run -p server -- --bind 127.0.0.1 --port 9173
+cargo run -p server -- \
+  --bind 127.0.0.1 \
+  --port 9173 \
+  --user vaylix \
+  --password vaylix
 ```
 
 Start the client:
 
 ```bash
-cargo run -p client
+cargo run -p client -- \
+  --host 127.0.0.1 \
+  --port 9173
 ```
 
----
+URL-based client connection:
 
-## Docker
+```bash
+cargo run -p client -- \
+  --url 'vaylix://vaylix:vaylix@127.0.0.1:9173?output=table'
+```
 
-Run the latest container:
+Enable TLS:
+
+```bash
+cargo run -p server -- \
+  --bind 127.0.0.1 \
+  --port 9173 \
+  --user vaylix \
+  --password vaylix \
+  --ssl \
+  --tls-cert ./certs/server.crt \
+  --tls-key ./certs/server.key
+
+cargo run -p client -- \
+  --url 'vaylix://vaylix:vaylix@127.0.0.1:9173?ssl=true' \
+  --tls-ca-cert ./certs/ca.crt
+```
+
+## Docker Persistence
+
+The server stores durable state under `/var/lib/vaylix`. Mount that path for persistence:
 
 ```bash
 docker run \
   -p 9173:9173 \
-  ghcr.io/vaylix/vaylix:latest
+  -v vaylix-data:/var/lib/vaylix \
+  -e VAYLIX_USER=vaylix \
+  -e VAYLIX_PASSWORD=vaylix \
+  ghcr.io/<owner>/vaylix:latest
 ```
 
-Configure runtime settings:
+The data directory contains the snapshot, WAL, manifest, and server-managed storage keyring.
+
+## Security and Operational Notes
+
+- Authentication is mandatory.
+- TLS is supported but opt-in.
+- At-rest encryption is managed by the server; there is no raw `--data-key` flag.
+- Development defaults are convenient, not production-safe.
+
+## Quality Gates
+
+Local validation:
 
 ```bash
-docker run \
-  -e VAYLIX_PORT=9173 \
-  -e VAYLIX_MAX_CONNECTIONS=512 \
-  ghcr.io/vaylix/vaylix:latest
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace
 ```
 
----
+The PR workflow runs the same checks against `main`.
 
-## Philosophy
+## Roadmap Constraints
 
-Vaylix is designed as a long-term systems programming project.
+Vaylix is being shaped for a larger future system. That means current changes should preserve room for:
+- replication
+- sharding
+- stronger transactional guarantees
+- audit logging
+- transport compression
 
-The focus is on understanding:
-
-- How databases recover from crashes
-- Why WAL exists
-- How storage engines separate durability from state transitions
-- How transport protocols evolve over time
-- How concurrency changes storage semantics
-- Why distributed systems become difficult at scale
-- Why transport abstraction matters in distributed systems
-
-The architecture is expected to evolve aggressively over time.
-
----
-
-## License
-
-MIT
+The authoritative project context lives in [LLM.md](LLM.md).

@@ -1,4 +1,5 @@
 use thiserror::Error;
+use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, ClientError>;
 
@@ -15,7 +16,7 @@ pub enum ClientError {
     #[error("could not determine project directories")]
     ProjectDirsUnavailable,
     #[error("mismatched response id: expected {expected}, got {actual}")]
-    ResponseIdMismatch { expected: u32, actual: u32 },
+    ResponseIdMismatch { expected: Uuid, actual: Uuid },
     #[error("local command should not receive a response")]
     LocalCommandResponse,
 }

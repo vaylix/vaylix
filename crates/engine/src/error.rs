@@ -18,6 +18,10 @@ pub enum EngineError {
     ManifestDeserialize(#[source] postcard::Error),
     #[error("checksum validation failed for {resource}")]
     ChecksumMismatch { resource: &'static str },
+    #[error("encrypted storage operation failed for {resource}")]
+    CryptoFailure { resource: &'static str },
+    #[error("unsupported storage format for {resource}")]
+    UnsupportedStorageFormat { resource: &'static str },
     #[error("write-ahead log serialization failed: {0}")]
     WalSerialize(#[source] postcard::Error),
     #[error("write-ahead log deserialization failed: {0}")]
@@ -38,10 +42,12 @@ impl EngineError {
             Self::ManifestSerialize(_) => "ENG-005",
             Self::ManifestDeserialize(_) => "ENG-006",
             Self::ChecksumMismatch { .. } => "ENG-007",
-            Self::WalSerialize(_) => "ENG-008",
-            Self::WalDeserialize(_) => "ENG-009",
-            Self::InvalidIntegerValue { .. } => "ENG-010",
-            Self::NumericOverflow { .. } => "ENG-011",
+            Self::CryptoFailure { .. } => "ENG-008",
+            Self::UnsupportedStorageFormat { .. } => "ENG-009",
+            Self::WalSerialize(_) => "ENG-010",
+            Self::WalDeserialize(_) => "ENG-011",
+            Self::InvalidIntegerValue { .. } => "ENG-012",
+            Self::NumericOverflow { .. } => "ENG-013",
         }
     }
 
@@ -54,6 +60,8 @@ impl EngineError {
             Self::ManifestSerialize(_) => "Manifest Serialization Failure",
             Self::ManifestDeserialize(_) => "Manifest Deserialization Failure",
             Self::ChecksumMismatch { .. } => "Checksum Validation Failure",
+            Self::CryptoFailure { .. } => "Encrypted Storage Failure",
+            Self::UnsupportedStorageFormat { .. } => "Unsupported Storage Format",
             Self::WalSerialize(_) => "WAL Serialization Failure",
             Self::WalDeserialize(_) => "WAL Deserialization Failure",
             Self::InvalidIntegerValue { .. } => "Invalid Integer Value",

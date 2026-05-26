@@ -1,5 +1,6 @@
 use bytes::{Buf, BufMut, BytesMut};
 use command::{Command, Expiration, SetCondition, SetOptions};
+use uuid::Uuid;
 
 use crate::error::{Result, TransportError};
 use crate::opcode::Opcode;
@@ -7,14 +8,14 @@ use crate::opcode::Opcode;
 /// A decoded client request without outer frame bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    pub request_id: u32,
+    pub request_id: Uuid,
     pub opcode: Opcode,
     pub payload: Vec<u8>,
 }
 
 impl Request {
     /// Builds a raw request from its request id, opcode, and payload.
-    pub fn new(request_id: u32, opcode: Opcode, payload: Vec<u8>) -> Self {
+    pub fn new(request_id: Uuid, opcode: Opcode, payload: Vec<u8>) -> Self {
         Self {
             request_id,
             opcode,
@@ -23,7 +24,7 @@ impl Request {
     }
 
     /// Encodes a parsed command into a transport request.
-    pub fn from_command(request_id: u32, command: Command) -> Result<Self> {
+    pub fn from_command(request_id: Uuid, command: Command) -> Result<Self> {
         match command {
             Command::Auth { username, password } => Ok(Self::new(
                 request_id,
@@ -589,9 +590,14 @@ fn ensure_empty(buf: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use command::{Command, Expiration, SetCondition, SetOptions};
+    use uuid::Uuid;
 
     use super::Request;
     use crate::{Opcode, TransportError};
+
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
 
     #[test]
     fn request_command_round_trip() {
@@ -665,7 +671,7 @@ mod tests {
         ];
 
         for command in commands {
-            let request = Request::from_command(7, command.clone()).unwrap();
+            let request = Request::from_command(id(7), command.clone()).unwrap();
             assert_eq!(request.into_command().unwrap(), command);
         }
     }
@@ -673,24 +679,24 @@ mod tests {
     #[test]
     fn rejects_local_only_commands() {
         assert!(matches!(
-            Request::from_command(1, Command::Help),
+            Request::from_command(id(1), Command::Help),
             Err(TransportError::UnsupportedCommand("help"))
         ));
         assert!(matches!(
-            Request::from_command(1, Command::Exit),
+            Request::from_command(id(1), Command::Exit),
             Err(TransportError::UnsupportedCommand("exit"))
         ));
     }
 
     #[test]
     fn rejects_corrupted_payloads_for_command_decoding() {
-        let request = Request::new(1, Opcode::Get, vec![0, 4, b'n', b'a']);
+        let request = Request::new(id(1), Opcode::Get, vec![0, 4, b'n', b'a']);
         assert!(matches!(
             request.into_command(),
             Err(TransportError::UnexpectedEof)
         ));
 
-        let request = Request::new(2, Opcode::List, vec![1]);
+        let request = Request::new(id(2), Opcode::List, vec![1]);
         assert!(matches!(
             request.into_command(),
             Err(TransportError::CorruptedPayload)

@@ -4,10 +4,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command::{Command, Expiration, SetCondition, SetOptions};
 use engine::{Engine, EngineOptions, Paths, WalSyncPolicy};
+use rcgen::generate_simple_self_signed;
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig, RootCertStore};
 use server::Server;
+use server::auth::AuthConfig;
+use server::server::{ServerGuards, ServerRuntimeConfig};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
+use tokio_rustls::TlsConnector;
 use transport::{Request, Status, read_response_from_async, write_request_to_async};
+use uuid::Uuid;
 
 fn temp_dir(name: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -15,6 +23,102 @@ fn temp_dir(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("veyra-server-test-{name}-{unique}"))
+}
+
+fn id(value: u128) -> Uuid {
+    Uuid::from_u128(value)
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+fn test_keyring(secret: &str) -> engine::StorageKeyring {
+    engine::StorageKeyring {
+        active: engine::StorageKey {
+            id: Uuid::from_u128(1),
+            secret: secret.to_string(),
+            created_at_ms: now_ms(),
+        },
+        previous: Vec::new(),
+    }
+}
+
+async fn authenticate(stream: &mut TcpStream) {
+    let auth = Request::from_command(
+        id(0),
+        Command::Auth {
+            username: "vaylix".to_string(),
+            password: "vaylix".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(stream, &auth).await.unwrap();
+    let response = read_response_from_async(stream).await.unwrap();
+    assert_eq!(response.status, Status::Ok);
+}
+
+fn runtime(snapshot_interval: Option<Duration>) -> ServerRuntimeConfig {
+    ServerRuntimeConfig {
+        snapshot_interval,
+        expiration_sweep_interval: None,
+        idle_timeout: None,
+        auth_config: AuthConfig::new("vaylix".to_string(), "vaylix".to_string()).unwrap(),
+        guards: ServerGuards {
+            max_request_payload_bytes: 1_048_576,
+            max_key_bytes: 1_024,
+            max_value_bytes: 262_144,
+            max_keys_per_batch: 256,
+            max_transaction_queue_len: 128,
+            requests_per_second: 200,
+            request_burst: 400,
+        },
+        tls_config: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_unauthenticated_requests() {
+    let root = temp_dir("tcp-auth-required");
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
+        },
+    )
+    .unwrap();
+
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime(None))
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let mut stream = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let request = Request::from_command(
+        id(1),
+        Command::Get {
+            key: "missing".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &request).await.unwrap();
+    let response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(response.status, Status::Error);
+    let error = response.decode_error().unwrap();
+    assert_eq!(error.code, "SRV-007");
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -25,22 +129,14 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         paths,
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
         },
     )
     .unwrap();
 
-    let server = Server::with_engine(
-        "127.0.0.1".to_string(),
-        0,
-        16,
-        engine,
-        Some(Duration::from_millis(50)),
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime(None))
+        .await
+        .unwrap();
     let addr = server.local_addr().unwrap();
     let server_task = tokio::spawn(async move { server.start().await });
 
@@ -48,9 +144,10 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         .await
         .unwrap()
         .unwrap();
+    authenticate(&mut stream).await;
 
     let set = Request::from_command(
-        1,
+        id(1),
         Command::Set {
             key: "user:1".to_string(),
             value: "alice".to_string(),
@@ -69,7 +166,7 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
     assert!(set_response.decode_bool().unwrap());
 
     let getex = Request::from_command(
-        2,
+        id(2),
         Command::GetEx {
             key: "user:1".to_string(),
             expiration: Some(Expiration::Ex(1)),
@@ -82,7 +179,7 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
     assert_eq!(getex_response.decode_value().unwrap(), "alice");
 
     let scan = Request::from_command(
-        3,
+        id(3),
         Command::Scan {
             cursor: 0,
             pattern: Some("user:*".to_string()),
@@ -96,7 +193,7 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
     assert_eq!(scan_payload.keys, vec!["user:1".to_string()]);
 
     let getdel = Request::from_command(
-        4,
+        id(4),
         Command::GetDel {
             key: "user:1".to_string(),
         },
@@ -118,6 +215,7 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
         paths,
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
         },
     )
     .unwrap();
@@ -127,10 +225,7 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
         0,
         16,
         engine,
-        Some(Duration::from_millis(50)),
-        None,
-        None,
-        None,
+        runtime(Some(Duration::from_millis(50))),
     )
     .await
     .unwrap();
@@ -141,9 +236,10 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
         .await
         .unwrap()
         .unwrap();
+    authenticate(&mut stream).await;
 
     let set = Request::from_command(
-        1,
+        id(1),
         Command::Set {
             key: "snapshot:key".to_string(),
             value: "value".to_string(),
@@ -155,12 +251,147 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
     let response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(response.status, Status::Ok);
 
-    sleep(Duration::from_millis(150)).await;
+    let snapshot_path = root.join("snapshot.bin");
+    let manifest_path = root.join("manifest.bin");
+    for _ in 0..20 {
+        if snapshot_path.exists() && manifest_path.exists() {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 
-    assert!(root.join("snapshot.bin").exists());
-    assert!(root.join("manifest.bin").exists());
-    let wal_len = fs::metadata(root.join("wal.log")).unwrap().len();
+    assert!(snapshot_path.exists());
+    assert!(manifest_path.exists());
+
+    let wal_path = root.join("wal.log");
+    let mut wal_len = fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    for _ in 0..20 {
+        if wal_len == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+        wal_len = fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+    }
     assert_eq!(wal_len, 0);
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepts_tls_connections_when_enabled() {
+    let root = temp_dir("tls");
+    let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    let cert_path = root.join("server.crt");
+    let key_path = root.join("server.key");
+    fs::create_dir_all(&root).unwrap();
+    fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
+    fs::write(&key_path, key_pem.as_bytes()).unwrap();
+
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
+        },
+    )
+    .unwrap();
+
+    let mut runtime = runtime(None);
+    runtime.tls_config = Some(server::tls::load_server_config(&cert_path, &key_path).unwrap());
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime)
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let mut roots = RootCertStore::empty();
+    let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .next()
+        .unwrap()
+        .unwrap();
+    roots.add(cert_der).unwrap();
+    let tls_config = std::sync::Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    );
+    let connector = TlsConnector::from(tls_config);
+
+    let tcp_stream = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .unwrap()
+        .unwrap();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_stream = connector.connect(server_name, tcp_stream).await.unwrap();
+
+    let auth = Request::from_command(
+        id(1),
+        Command::Auth {
+            username: "vaylix".to_string(),
+            password: "vaylix".to_string(),
+        },
+    )
+    .unwrap();
+    let encoded = transport::encode_request(&auth).unwrap();
+    tls_stream.write_all(&encoded).await.unwrap();
+    tls_stream.flush().await.unwrap();
+    let response = transport::read_response_from_async(&mut tls_stream)
+        .await
+        .unwrap();
+    assert_eq!(response.status, Status::Ok);
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enforces_rate_limits_over_the_network() {
+    let root = temp_dir("rate-limit");
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
+        },
+    )
+    .unwrap();
+
+    let mut runtime = runtime(None);
+    runtime.guards.requests_per_second = 1;
+    runtime.guards.request_burst = 1;
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime)
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let mut stream = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .unwrap()
+        .unwrap();
+    authenticate(&mut stream).await;
+
+    let request = Request::from_command(
+        id(2),
+        Command::Get {
+            key: "missing".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &request).await.unwrap();
+    let response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(response.status, Status::Error);
+    let error = response.decode_error().unwrap();
+    assert_eq!(error.code, "SRV-012");
 
     server_task.abort();
     fs::remove_dir_all(root).ok();

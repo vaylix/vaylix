@@ -2,13 +2,15 @@ use crate::{EngineError, Result};
 use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
-use std::io::Write;
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::Path;
 
 /// Metadata persisted alongside snapshots to describe the durable baseline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
+    /// Durable storage envelope version for snapshot and WAL compatibility.
+    pub storage_format_version: u32,
     /// Engine schema version captured by the snapshot.
     pub engine_version: u32,
     /// Highest WAL sequence number included in the snapshot.
@@ -64,6 +66,7 @@ mod tests {
         let path = temp_path("manifest");
         let temp_path = temp_path("manifest-tmp");
         let manifest = Manifest {
+            storage_format_version: 1,
             engine_version: 2,
             last_snapshot_sequence: 44,
             last_snapshot_at_ms: 999,

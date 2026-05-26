@@ -1,6 +1,8 @@
 use crate::helper::ClientHelper;
 use crate::paths::Paths;
 use command::{COMMANDS, Command, Parser};
+use rustls::pki_types::ServerName;
+use rustls::{ClientConfig as TlsClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustyline::Editor;
 use rustyline::config::{Builder, CompletionType, EditMode};
 use rustyline::error::ReadlineError;
@@ -8,7 +10,10 @@ use rustyline::history::DefaultHistory;
 use serde_json::json;
 use std::io::Write;
 use std::net::TcpStream;
+use std::path::PathBuf;
+use std::sync::Arc;
 use transport::{Request, Response, Status, read_response_from, write_request_to};
+use uuid::Uuid;
 
 use crate::error::{ClientError, Result};
 
@@ -25,17 +30,48 @@ pub enum OutputMode {
 pub struct ClientConfig {
     pub host: String,
     pub port: u16,
+    pub ssl: bool,
+    pub tls_ca_cert: Option<PathBuf>,
     pub username: Option<String>,
     pub password: Option<String>,
     pub output: OutputMode,
 }
 
+enum ClientStream {
+    Tcp(TcpStream),
+    Tls(Box<StreamOwned<ClientConnection, TcpStream>>),
+}
+
+impl std::io::Read for ClientStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl std::io::Write for ClientStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Tcp(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Tcp(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
 /// Interactive CLI client for talking to a Vaylix server.
 pub struct Client {
     editor: Editor<ClientHelper, rustyline::history::DefaultHistory>,
-    stream: TcpStream,
+    stream: ClientStream,
     paths: Paths,
-    next_request_id: u32,
     output: OutputMode,
 }
 
@@ -55,7 +91,17 @@ impl Client {
         let helper = ClientHelper::new();
         let paths = Paths::new()?;
         log_event("INFO", "client.startup", &format!("connecting to {addr}"));
-        let stream = TcpStream::connect(addr)?;
+        let tcp_stream = TcpStream::connect(addr)?;
+        let stream = if config.ssl {
+            log_event("INFO", "client.tls", "tls enabled for client connection");
+            ClientStream::Tls(Box::new(connect_tls(
+                tcp_stream,
+                &config.host,
+                config.tls_ca_cert.as_deref(),
+            )?))
+        } else {
+            ClientStream::Tcp(tcp_stream)
+        };
         log_event("INFO", "client.startup", "connection established");
 
         let mut editor = Editor::<ClientHelper, DefaultHistory>::with_config(rustyline_config)?;
@@ -66,7 +112,6 @@ impl Client {
             editor,
             stream,
             paths,
-            next_request_id: 1,
             output: config.output,
         };
 
@@ -131,16 +176,8 @@ impl Client {
     }
 
     fn execute(&mut self, command: Command) -> Result<()> {
-        let request_id = self.next_request_id();
+        let request_id = Uuid::now_v7();
         let request = Request::from_command(request_id, command.clone())?;
-        log_event(
-            "INFO",
-            "client.request",
-            &format!(
-                "sending request_id={request_id} opcode={:?}",
-                request.opcode
-            ),
-        );
         write_request_to(&mut self.stream, &request)?;
         self.stream.flush()?;
 
@@ -153,29 +190,51 @@ impl Client {
             });
         }
 
-        log_event(
-            "INFO",
-            "client.response",
-            &format!(
-                "received response request_id={} status={:?}",
-                response.request_id, response.status
-            ),
-        );
         println!("{}", render_response(&command, &response, self.output)?);
 
         Ok(())
     }
+}
 
-    fn next_request_id(&mut self) -> u32 {
-        let current = self.next_request_id;
-        self.next_request_id = self.next_request_id.wrapping_add(1);
+fn connect_tls(
+    stream: TcpStream,
+    host: &str,
+    ca_cert: Option<&std::path::Path>,
+) -> Result<StreamOwned<ClientConnection, TcpStream>> {
+    let tls_config = build_tls_client_config(ca_cert)?;
+    let server_name = ServerName::try_from(host.to_string())
+        .map_err(|_| std::io::Error::other("invalid TLS server name"))?;
+    let connection =
+        ClientConnection::new(tls_config, server_name).map_err(std::io::Error::other)?;
+    Ok(StreamOwned::new(connection, stream))
+}
 
-        if self.next_request_id == 0 {
-            self.next_request_id = 1;
+fn build_tls_client_config(ca_cert: Option<&std::path::Path>) -> Result<Arc<TlsClientConfig>> {
+    let mut roots = RootCertStore::empty();
+
+    if let Some(ca_cert) = ca_cert {
+        let cert_bytes = std::fs::read(ca_cert)?;
+        let mut reader = cert_bytes.as_slice();
+        for cert in rustls_pemfile::certs(&mut reader) {
+            roots
+                .add(cert.map_err(std::io::Error::other)?)
+                .map_err(std::io::Error::other)?;
         }
-
-        current
+    } else {
+        let native = rustls_native_certs::load_native_certs();
+        for cert in native.certs {
+            roots.add(cert).map_err(std::io::Error::other)?;
+        }
+        if !native.errors.is_empty() && roots.is_empty() {
+            return Err(std::io::Error::other("no native root certificates available").into());
+        }
     }
+
+    Ok(Arc::new(
+        TlsClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
 }
 
 fn help_text() -> String {
@@ -189,10 +248,10 @@ fn help_text() -> String {
 }
 
 fn render_response(command: &Command, response: &Response, output: OutputMode) -> Result<String> {
-    if let Ok(value) = response.decode_value() {
-        if value == "QUEUED" {
-            return Ok(value);
-        }
+    if let Ok(value) = response.decode_value()
+        && value == "QUEUED"
+    {
+        return Ok(value);
     }
 
     match response.status {
@@ -269,15 +328,18 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
 }
 
 fn render_entries(entries: &[(String, String)], output: OutputMode) -> Result<String> {
+    let mut sorted = entries.to_vec();
+    sorted.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
     match output {
-        OutputMode::Plain => Ok(entries
+        OutputMode::Plain => Ok(sorted
             .iter()
             .map(|(key, value)| format!("{key}={value}"))
             .collect::<Vec<_>>()
             .join(", ")),
-        OutputMode::Table => Ok(render_table(entries)),
+        OutputMode::Table => Ok(render_table(&sorted)),
         OutputMode::Json => Ok(serde_json::to_string_pretty(
-            &entries
+            &sorted
                 .iter()
                 .map(|(key, value)| json!({ "key": key, "value": value }))
                 .collect::<Vec<_>>(),
@@ -333,15 +395,20 @@ fn log_event(level: &str, component: &str, message: &str) {
 mod tests {
     use command::{Command, Expiration, SetCondition, SetOptions};
     use transport::{Response, Status};
+    use uuid::Uuid;
 
     use super::{ClientConfig, OutputMode, help_text, render_response, render_table};
+
+    fn id(value: u128) -> Uuid {
+        Uuid::from_u128(value)
+    }
 
     #[test]
     fn renders_serious_v1_response_types() {
         assert_eq!(
             render_response(
                 &Command::Ping { message: None },
-                &Response::value(1, "PONG").unwrap(),
+                &Response::value(id(1), "PONG").unwrap(),
                 OutputMode::Plain,
             )
             .unwrap(),
@@ -351,7 +418,8 @@ mod tests {
         assert_eq!(
             render_response(
                 &Command::Exec,
-                &Response::strings(2, &[Some("OK".to_string()), Some("1".to_string())]).unwrap(),
+                &Response::strings(id(2), &[Some("OK".to_string()), Some("1".to_string())])
+                    .unwrap(),
                 OutputMode::Plain,
             )
             .unwrap(),
@@ -370,7 +438,7 @@ mod tests {
                         return_previous: false,
                     },
                 },
-                &Response::boolean(7, true),
+                &Response::boolean(id(7), true),
                 OutputMode::Plain,
             )
             .unwrap(),
@@ -381,8 +449,11 @@ mod tests {
     #[test]
     fn renders_table_and_json_for_entries() {
         let response = Response::entries(
-            1,
-            &[("name".to_string(), "alice".to_string()), ("city".to_string(), "paris".to_string())],
+            id(1),
+            &[
+                ("name".to_string(), "alice".to_string()),
+                ("city".to_string(), "paris".to_string()),
+            ],
         )
         .unwrap();
 
@@ -403,7 +474,7 @@ mod tests {
                     value: "alice".to_string(),
                     options: SetOptions::default(),
                 },
-                &Response::ok(1),
+                &Response::ok(id(1)),
                 OutputMode::Plain,
             )
             .unwrap(),
@@ -415,7 +486,7 @@ mod tests {
                 &Command::Get {
                     key: "missing".to_string()
                 },
-                &Response::not_found(2),
+                &Response::not_found(id(2)),
                 OutputMode::Plain,
             )
             .unwrap(),
@@ -426,11 +497,11 @@ mod tests {
             render_response(
                 &Command::Count,
                 &Response::new(
-                    3,
+                    id(3),
                     Status::Error,
-                    Response::error(3, "SRV-400", "Bad Request", "bad request")
+                    Response::error(id(3), "SRV-400", "Bad Request", "bad request")
                         .unwrap()
-                        .payload
+                        .payload,
                 ),
                 OutputMode::Plain,
             )
@@ -441,8 +512,8 @@ mod tests {
 
     #[test]
     fn rejects_rendering_for_local_commands() {
-        assert!(render_response(&Command::Help, &Response::ok(1), OutputMode::Plain).is_err());
-        assert!(render_response(&Command::Exit, &Response::ok(1), OutputMode::Plain).is_err());
+        assert!(render_response(&Command::Help, &Response::ok(id(1)), OutputMode::Plain).is_err());
+        assert!(render_response(&Command::Exit, &Response::ok(id(1)), OutputMode::Plain).is_err());
     }
 
     #[test]
@@ -465,10 +536,13 @@ mod tests {
         let config = ClientConfig {
             host: "127.0.0.1".to_string(),
             port: 9173,
+            ssl: true,
+            tls_ca_cert: None,
             username: Some("u".to_string()),
             password: Some("p".to_string()),
             output: OutputMode::Json,
         };
         assert_eq!(config.output, OutputMode::Json);
+        assert!(config.ssl);
     }
 }

@@ -62,7 +62,7 @@ impl<'a> Lexer<'a> {
         let mut value = String::new();
         let mut escaped = false;
 
-        while let Some((_, ch)) = self.chars.next() {
+        for (_, ch) in self.chars.by_ref() {
             if escaped {
                 match ch {
                     '"' => value.push('"'),

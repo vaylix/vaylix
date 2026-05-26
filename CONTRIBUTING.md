@@ -1,262 +1,105 @@
 # Contributing to Vaylix
 
-Thanks for your interest in contributing.
+Vaylix is a systems project. Contributions are expected to be explicit, test-backed, and honest about operational tradeoffs.
 
-Vaylix is a long-term systems programming project focused on understanding database internals from first principles: storage engines, WAL recovery, transport protocols, persistence, concurrency, networking, and distributed systems architecture.
+## Before Opening a PR
 
-The project intentionally prioritizes architectural clarity over feature velocity.
+- read [README.md](README.md)
+- read [LLM.md](LLM.md)
+- search for existing issues or open discussions
+- open a design discussion first for protocol, persistence-format, auth, TLS, or architectural changes
 
----
+## Core Rules
 
-## Before Contributing
+- keep the engine independent from sockets, framing, and transport byte parsing
+- keep wire compatibility changes intentional
+- keep error boundaries explicit and code-bearing
+- keep persistence format changes versioned and tested
+- update `LLM.md` whenever architecture or operational behavior changes
+- update `README.md` whenever user-facing setup or runtime behavior changes
 
-Please:
+## Local Development
 
-- Read the README first
-- Check existing issues and pull requests
-- Open a discussion before making large architectural changes
-- Keep changes focused and incremental
-
-Large refactors without discussion will likely not be merged.
-
----
-
-## Development Setup
-
-Clone the repository:
+Build:
 
 ```bash
-git clone https://github.com/vaylix/vaylix.git
-cd vaylix
+cargo build --workspace
 ```
 
-Build the workspace:
+Format:
 
 ```bash
-cargo build
+cargo fmt --check
 ```
 
-Run the server:
+Lint:
 
 ```bash
-cargo run -p server -- --bind 127.0.0.1 --port 9173
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Run the client:
+Test:
 
 ```bash
-cargo run -p client
+cargo test --workspace
 ```
 
-Run tests:
+## What Reviewers Expect
 
-```bash
-cargo test
-```
+- small, coherent changes
+- matching tests for new behavior
+- documentation updates when behavior changes
+- compatibility notes for protocol or persistence changes
+- direct handling of failure cases, not just happy-path code
 
-Format the codebase:
+## High-Risk Change Areas
 
-```bash
-cargo fmt
-```
+These require extra care:
+- transport protocol changes
+- TLS and authentication changes
+- request/response compatibility changes
+- WAL, snapshot, manifest, or storage-encryption changes
+- transaction semantics
+- workflow and release automation changes
 
-Run Clippy:
+## Testing Expectations
 
-```bash
-cargo clippy --all-targets --all-features
-```
+At minimum, relevant changes should include:
+- unit tests for the changed logic
+- integration tests when networking, auth, or TLS behavior changes
+- corruption or recovery tests when persistence changes
 
----
+If test coverage is intentionally incomplete, state that clearly in the PR description.
 
-## Workspace Structure
+## Documentation Discipline
 
-```text
-crates/
-├── engine/
-├── transport/
-├── server/
-└── client/
-```
+Do not let docs drift.
 
-### engine
+If you change:
+- commands
+- CLI flags
+- connection string semantics
+- protocol behavior
+- persistence behavior
+- security behavior
+- release or CI workflows
 
-Contains:
+then update the relevant top-level docs in the same PR.
 
-- storage engine
-- WAL
-- snapshots
-- execution
-- state management
+## Security Expectations
 
-The engine must remain transport-agnostic.
+- never commit secrets, private keys, tokens, or environment files
+- use non-sensitive sample credentials only
+- treat auth, TLS, and persistence-encryption code as high-review areas
 
----
+## Current Project Reality
 
-### transport
+Contributors should not overstate current capability. The codebase is still:
+- single-node
+- string-value only
+- without replication or sharding
+- without full ACID isolation guarantees
+- without audit logging
+- without transport compression
 
-Contains:
-
-- framing
-- binary protocol
-- request/response codecs
-- transport errors
-- protocol abstractions
-
-Both the client and server depend on this crate.
-
----
-
-### server
-
-Contains:
-
-- TCP listener
-- client session handling
-- request routing
-- engine orchestration
-
----
-
-### client
-
-Contains:
-
-- REPL
-- terminal UX
-- remote transport client
-
----
-
-## Architectural Principles
-
-### Keep Layers Separate
-
-The engine should never deal with:
-
-- raw TCP sockets
-- framing
-- byte parsing
-- protocol transport concerns
-
-Networking belongs in transport/server.
-
----
-
-### Avoid Premature Complexity
-
-Prefer:
-
-- explicit code
-- simple abstractions
-- understandable control flow
-- incremental evolution
-
-Avoid introducing:
-
-- unnecessary macros
-- deep trait hierarchies
-- framework-heavy abstractions
-- speculative distributed systems logic
-
----
-
-### Preserve Protocol Stability
-
-Transport changes affect:
-
-- client compatibility
-- future replication
-- protocol versioning
-- wire format guarantees
-
-Be careful when modifying transport semantics.
-
----
-
-### Keep Error Boundaries Clean
-
-Avoid mixing:
-
-- transport errors
-- WAL errors
-- parser errors
-- engine errors
-
-Each layer should own its own failure semantics.
-
----
-
-## Pull Request Guidelines
-
-Please keep pull requests:
-
-- focused
-- well-scoped
-- formatted
-- documented when necessary
-
-Include:
-
-- rationale for architectural changes
-- performance implications if relevant
-- protocol compatibility notes if transport changes are involved
-
----
-
-## Commit Style
-
-Recommended examples:
-
-```text
-engine: add WAL checksum validation
-transport: implement framed request decoding
-server: add client idle timeout handling
-client: improve rustyline completion behavior
-```
-
-Small, descriptive commits are preferred over large monolithic ones.
-
----
-
-## Reporting Bugs
-
-When opening an issue, include:
-
-- operating system
-- Rust version
-- reproduction steps
-- logs/output if relevant
-- protocol payload examples if transport-related
-
----
-
-## Roadmap Areas
-
-Areas currently being explored:
-
-- Vaylix Transport Protocol (VTP)
-- binary framing
-- WAL durability
-- snapshot recovery
-- concurrent client coordination
-- async networking with Tokio
-- protocol versioning
-- replication streams
-- observability and tracing
-
----
-
-## Philosophy
-
-Vaylix exists primarily as a systems learning project.
-
-The goal is not just to build a database, but to understand:
-
-- why storage engines are layered
-- why WAL exists
-- how transport protocols evolve
-- how databases recover from crashes
-- why distributed systems become difficult
-- how concurrency changes storage semantics
-
-Architectural clarity matters more than rapid feature growth.
+Work that improves those areas is welcome, but it should be described as implementation work toward the roadmap, not as already-delivered capability.

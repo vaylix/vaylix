@@ -214,6 +214,12 @@ impl EngineState {
     }
 }
 
+impl Default for EngineState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

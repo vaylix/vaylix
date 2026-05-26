@@ -20,6 +20,10 @@ pub struct Paths {
     pub manifest_tmp_path: PathBuf,
     /// Write-ahead log path.
     pub wal_path: PathBuf,
+    /// Storage keyring path used for server-managed encryption keys.
+    pub keyring_path: PathBuf,
+    /// Temporary keyring path used for atomic updates.
+    pub keyring_tmp_path: PathBuf,
 }
 
 impl Paths {
@@ -42,6 +46,8 @@ impl Paths {
             manifest_path: data_dir.join("manifest.bin"),
             manifest_tmp_path: data_dir.join("manifest.bin.tmp"),
             wal_path: data_dir.join("wal.log"),
+            keyring_path: data_dir.join("keyring.bin"),
+            keyring_tmp_path: data_dir.join("keyring.bin.tmp"),
             data_dir,
         })
     }
@@ -67,5 +73,7 @@ mod tests {
         assert!(paths.manifest_path.ends_with("manifest.bin"));
         assert!(paths.manifest_tmp_path.ends_with("manifest.bin.tmp"));
         assert!(paths.wal_path.ends_with("wal.log"));
+        assert!(paths.keyring_path.ends_with("keyring.bin"));
+        assert!(paths.keyring_tmp_path.ends_with("keyring.bin.tmp"));
     }
 }

@@ -6,8 +6,8 @@ use crate::engine::{
 use crate::error::Result;
 use crate::paths::Paths;
 use crate::store::{
-    Manifest, WalEntry, WalOperation, append, deserialize, load, load_manifest, replay, save,
-    save_manifest, serialize, truncate,
+    Manifest, WalEntry, WalOperation, append, deserialize, keyring, load, load_manifest, replay,
+    save, save_manifest, serialize, truncate,
 };
 use crc32fast::hash;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +39,7 @@ impl Engine {
 
     /// Creates a new engine using an explicit filesystem layout and caller-provided options.
     pub fn from_paths_with_options(paths: Paths, options: EngineOptions) -> Result<Self> {
-        let loaded = load(&paths.snapshot_path)?;
+        let loaded = load(&paths.snapshot_path, options.keyring.as_ref())?;
 
         let mut state = match &loaded {
             Some(loaded) => deserialize(loaded)?,
@@ -47,12 +47,17 @@ impl Engine {
         };
 
         if let Some(manifest) = load_manifest(&paths.manifest_path)? {
-            if let Some(snapshot) = &loaded {
-                if hash(snapshot) != manifest.snapshot_checksum {
-                    return Err(crate::EngineError::ChecksumMismatch {
-                        resource: "snapshot",
-                    });
-                }
+            if manifest.storage_format_version != 1 {
+                return Err(crate::EngineError::UnsupportedStorageFormat {
+                    resource: "manifest",
+                });
+            }
+            if let Some(snapshot) = &loaded
+                && hash(snapshot) != manifest.snapshot_checksum
+            {
+                return Err(crate::EngineError::ChecksumMismatch {
+                    resource: "snapshot",
+                });
             }
             state.metadata.last_snapshot_at_ms = Some(manifest.last_snapshot_at_ms);
             state.metadata.last_applied_sequence = state
@@ -61,7 +66,7 @@ impl Engine {
                 .max(manifest.last_snapshot_sequence);
         }
 
-        for entry in replay(&paths.wal_path)? {
+        for entry in replay(&paths.wal_path, options.keyring.as_ref())? {
             state.apply_entry(&entry)?;
         }
 
@@ -79,7 +84,12 @@ impl Engine {
 
     fn append_and_apply(&mut self, operations: Vec<WalOperation>) -> Result<()> {
         let entry = self.next_entry(operations);
-        append(&entry, &self.paths.wal_path, self.options.wal_sync)?;
+        append(
+            &entry,
+            &self.paths.wal_path,
+            self.options.wal_sync,
+            self.options.keyring.as_ref(),
+        )?;
         self.state.apply_entry(&entry)?;
         Ok(())
     }
@@ -127,6 +137,22 @@ impl Engine {
             (
                 "wal_sync_policy".to_string(),
                 self.options.wal_sync.as_str().to_string(),
+            ),
+            (
+                "storage_encryption".to_string(),
+                if self.options.keyring.is_some() {
+                    "enabled".to_string()
+                } else {
+                    "disabled".to_string()
+                },
+            ),
+            (
+                "storage_key_id".to_string(),
+                self.options
+                    .keyring
+                    .as_ref()
+                    .map(|keyring| keyring.active.id.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
             ),
         ]
     }
@@ -189,13 +215,13 @@ impl StorageEngine for Engine {
                     expires_at_ms,
                 });
             }
-        } else if options.keep_ttl {
-            if let Some(expires_at_ms) = previous_expiration {
-                operations.push(WalOperation::Expire {
-                    key: key.clone(),
-                    expires_at_ms,
-                });
-            }
+        } else if options.keep_ttl
+            && let Some(expires_at_ms) = previous_expiration
+        {
+            operations.push(WalOperation::Expire {
+                key: key.clone(),
+                expires_at_ms,
+            });
         }
 
         self.append_and_apply(operations)?;
@@ -507,6 +533,14 @@ impl StorageEngine for Engine {
     fn snapshot(&mut self) -> Result<()> {
         self.state.purge_expired(self.now());
 
+        if let Some(keyring) = self.options.keyring.as_mut() {
+            let _ = keyring::rotate_if_due(
+                &self.paths.keyring_path,
+                &self.paths.keyring_tmp_path,
+                keyring,
+            )?;
+        }
+
         let sequence = self.state.metadata.last_applied_sequence;
         let snapshot_started_at_ms = self.now();
 
@@ -518,9 +552,11 @@ impl StorageEngine for Engine {
             &serialized,
             &self.paths.snapshot_path,
             &self.paths.snapshot_tmp_path,
+            self.options.keyring.as_ref(),
         )?;
 
         let manifest = Manifest {
+            storage_format_version: 1,
             engine_version: durable_state.metadata.version,
             last_snapshot_sequence: sequence,
             last_snapshot_at_ms: snapshot_started_at_ms,
@@ -576,17 +612,39 @@ fn wildcard_matches(pattern: &str, text: &str) -> bool {
 mod tests {
     use super::Engine;
     use crate::{
-        EngineOptions, Expiration, Paths, SetCondition, SetOptions, StorageEngine, WalSyncPolicy,
+        EngineOptions, Expiration, Paths, SetCondition, SetOptions, StorageEngine, StorageKey,
+        StorageKeyring, WalSyncPolicy,
     };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use uuid::Uuid;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("veyra-engine-{name}-{unique}"))
+        let path = std::env::temp_dir().join(format!("veyra-engine-{name}-{unique}"));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
+    fn test_keyring(secret: &str) -> StorageKeyring {
+        StorageKeyring {
+            active: StorageKey {
+                id: Uuid::from_u128(1),
+                secret: secret.to_string(),
+                created_at_ms: now_ms(),
+            },
+            previous: Vec::new(),
+        }
     }
 
     fn engine() -> (Engine, PathBuf) {
@@ -597,6 +655,7 @@ mod tests {
                 paths,
                 EngineOptions {
                     wal_sync: WalSyncPolicy::Flush,
+                    keyring: Some(test_keyring("test-data-key")),
                 },
             )
             .unwrap(),
@@ -707,9 +766,35 @@ mod tests {
         assert!(root.join("manifest.bin").exists());
 
         let paths = Paths::from_data_dir(&root).unwrap();
-        let mut reloaded = Engine::from_paths(paths).unwrap();
+        let mut reloaded = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+            },
+        )
+        .unwrap();
         assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
 
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_wrong_data_key_on_recovery() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("wrong-data-key")),
+            },
+        );
+
+        assert!(reopened.is_err());
         fs::remove_dir_all(root).ok();
     }
 

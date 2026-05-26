@@ -1,3 +1,5 @@
+use crate::config::StorageKeyring;
+use crate::store::crypto::{decrypt, encrypt};
 use crate::{EngineError, Result, WalSyncPolicy};
 use crc32fast::hash;
 use postcard::{Error, from_bytes, to_allocvec};
@@ -50,21 +52,26 @@ impl WalEntry {
 }
 
 /// Appends a WAL entry durably to disk.
-pub fn append(entry: &WalEntry, path: &Path, sync_policy: WalSyncPolicy) -> Result<()> {
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .append(true)
-        .open(path)?;
+pub fn append(
+    entry: &WalEntry,
+    path: &Path,
+    sync_policy: WalSyncPolicy,
+    keyring: Option<&StorageKeyring>,
+) -> Result<()> {
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
     let bytes = to_allocvec(entry).map_err(EngineError::WalSerialize)?;
-    let length = u32::try_from(bytes.len())
+    let durable_bytes = match keyring {
+        Some(keyring) => encrypt(keyring.active(), "wal entry", &bytes)?,
+        None => bytes,
+    };
+    let length = u32::try_from(durable_bytes.len())
         .map_err(|_| EngineError::Io(std::io::Error::other("wal entry too large")))?;
 
-    let checksum = hash(&bytes);
+    let checksum = hash(&durable_bytes);
     file.write_all(&length.to_le_bytes())?;
     file.write_all(&checksum.to_le_bytes())?;
-    file.write_all(&bytes)?;
+    file.write_all(&durable_bytes)?;
     match sync_policy {
         WalSyncPolicy::Buffered => {}
         WalSyncPolicy::Flush => {
@@ -79,7 +86,7 @@ pub fn append(entry: &WalEntry, path: &Path, sync_policy: WalSyncPolicy) -> Resu
 }
 
 /// Replays the WAL from disk, tolerating a truncated tail entry.
-pub fn replay(path: &Path) -> Result<Vec<WalEntry>> {
+pub fn replay(path: &Path, keyring: Option<&StorageKeyring>) -> Result<Vec<WalEntry>> {
     let mut file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
@@ -123,7 +130,12 @@ pub fn replay(path: &Path) -> Result<Vec<WalEntry>> {
             });
         }
 
-        let entry: WalEntry = match from_bytes(&entry_buf) {
+        let plain_bytes = match keyring {
+            Some(keyring) => decrypt(keyring, "wal entry", &entry_buf)?,
+            None => entry_buf,
+        };
+
+        let entry: WalEntry = match from_bytes(&plain_bytes) {
             Ok(value) => value,
             Err(Error::DeserializeUnexpectedEnd) => break,
             Err(err) => return Err(EngineError::WalDeserialize(err)),
@@ -149,11 +161,14 @@ pub fn truncate(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::store::crypto::encrypt;
+    use crate::{StorageKey, StorageKeyring};
     use crc32fast::hash;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     use postcard::to_allocvec;
 
@@ -166,6 +181,17 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("veyra-{name}-{unique}.wal"))
+    }
+
+    fn keyring(secret: &str) -> StorageKeyring {
+        StorageKeyring {
+            active: StorageKey {
+                id: Uuid::from_u128(1),
+                secret: secret.to_string(),
+                created_at_ms: 1,
+            },
+            previous: Vec::new(),
+        }
     }
 
     fn sample_entry(sequence: u64) -> WalEntry {
@@ -182,8 +208,15 @@ mod tests {
     #[test]
     fn appends_and_replays_entries() {
         let path = temp_path("wal-round-trip");
+        let keyring = keyring("wal-key");
 
-        append(&sample_entry(1), &path, WalSyncPolicy::Flush).unwrap();
+        append(
+            &sample_entry(1),
+            &path,
+            WalSyncPolicy::Flush,
+            Some(&keyring),
+        )
+        .unwrap();
         append(
             &WalEntry::new(
                 2,
@@ -199,10 +232,11 @@ mod tests {
             ),
             &path,
             WalSyncPolicy::Flush,
+            Some(&keyring),
         )
         .unwrap();
 
-        let entries = replay(&path).unwrap();
+        let entries = replay(&path, Some(&keyring)).unwrap();
 
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].sequence, 1);
@@ -214,8 +248,15 @@ mod tests {
     #[test]
     fn replay_ignores_truncated_tail() {
         let path = temp_path("wal-truncated");
+        let keyring = keyring("wal-key");
 
-        append(&sample_entry(1), &path, WalSyncPolicy::Flush).unwrap();
+        append(
+            &sample_entry(1),
+            &path,
+            WalSyncPolicy::Flush,
+            Some(&keyring),
+        )
+        .unwrap();
 
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(&10_u32.to_le_bytes()).unwrap();
@@ -223,7 +264,7 @@ mod tests {
         file.write_all(b"short").unwrap();
         file.flush().unwrap();
 
-        let entries = replay(&path).unwrap();
+        let entries = replay(&path, Some(&keyring)).unwrap();
         assert_eq!(entries.len(), 1);
 
         fs::remove_file(path).ok();
@@ -232,6 +273,7 @@ mod tests {
     #[test]
     fn replay_stops_on_invalid_length_or_corrupt_entry() {
         let invalid_length_path = temp_path("wal-invalid-length");
+        let keyring = keyring("wal-key");
         let mut invalid_length_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -241,7 +283,11 @@ mod tests {
         invalid_length_file.write_all(&0_u32.to_le_bytes()).unwrap();
         invalid_length_file.flush().unwrap();
 
-        assert!(replay(&invalid_length_path).unwrap().is_empty());
+        assert!(
+            replay(&invalid_length_path, Some(&keyring))
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_file(&invalid_length_path).ok();
 
         let corrupt_path = temp_path("wal-corrupt");
@@ -251,30 +297,49 @@ mod tests {
             .truncate(true)
             .open(&corrupt_path)
             .unwrap();
-        let valid = to_allocvec(&sample_entry(1)).unwrap();
+        let valid = encrypt(
+            keyring.active(),
+            "wal entry",
+            &to_allocvec(&sample_entry(1)).unwrap(),
+        )
+        .unwrap();
         corrupt_file
             .write_all(&(valid.len() as u32).to_le_bytes())
             .unwrap();
         corrupt_file.write_all(&hash(&valid).to_le_bytes()).unwrap();
         corrupt_file.write_all(&valid).unwrap();
-        let mut corrupt = to_allocvec(&sample_entry(2)).unwrap();
+        let mut corrupt = encrypt(
+            keyring.active(),
+            "wal entry",
+            &to_allocvec(&sample_entry(2)).unwrap(),
+        )
+        .unwrap();
         *corrupt.last_mut().unwrap() = 0xff;
         corrupt_file
             .write_all(&(corrupt.len() as u32).to_le_bytes())
             .unwrap();
-        corrupt_file.write_all(&hash(&valid).to_le_bytes()).unwrap();
+        corrupt_file
+            .write_all(&hash(&corrupt).to_le_bytes())
+            .unwrap();
         corrupt_file.write_all(&corrupt).unwrap();
         corrupt_file.flush().unwrap();
 
-        assert!(replay(&corrupt_path).is_err());
+        assert!(replay(&corrupt_path, Some(&keyring)).is_err());
         fs::remove_file(&corrupt_path).ok();
     }
 
     #[test]
     fn truncates_wal_file() {
         let path = temp_path("wal-truncate");
+        let keyring = keyring("wal-key");
 
-        append(&sample_entry(1), &path, WalSyncPolicy::Flush).unwrap();
+        append(
+            &sample_entry(1),
+            &path,
+            WalSyncPolicy::Flush,
+            Some(&keyring),
+        )
+        .unwrap();
         truncate(&path).unwrap();
 
         let metadata = fs::metadata(&path).unwrap();
@@ -286,6 +351,19 @@ mod tests {
     #[test]
     fn replay_missing_file_returns_empty_log() {
         let path = temp_path("wal-missing");
-        assert!(replay(&path).unwrap().is_empty());
+        let keyring = keyring("wal-key");
+        assert!(replay(&path, Some(&keyring)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_with_wrong_key_fails() {
+        let path = temp_path("wal-wrong-key");
+        let right = keyring("right-key");
+        let wrong = keyring("wrong-key");
+        append(&sample_entry(1), &path, WalSyncPolicy::Flush, Some(&right)).unwrap();
+
+        assert!(replay(&path, Some(&wrong)).is_err());
+
+        fs::remove_file(path).ok();
     }
 }
