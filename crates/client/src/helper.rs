@@ -6,7 +6,7 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context, Helper};
 use std::borrow::Cow;
 
-use crate::command::{COMMANDS, command_info};
+use veyra_core::{COMMANDS, command_info};
 
 #[derive(Helper)]
 pub struct VeyraHelper {
