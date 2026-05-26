@@ -14,7 +14,7 @@ pub struct Client {
     paths: Paths,
 }
 
-const PROMPT: &str = "veyra> ";
+const PROMPT: &str = "vaylix> ";
 
 impl Client {
     pub fn new(host: String, port: u16) -> Result<Self> {

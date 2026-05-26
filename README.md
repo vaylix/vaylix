@@ -1,12 +1,12 @@
-# Veyra
+# Vaylix
 
-Veyra is an experimental key-value database written in Rust.
+Vaylix is an experimental key-value database written in Rust.
 
 The project began as a systems programming exercise focused on understanding database internals from first principles: storage engines, write-ahead logging, snapshots, protocol design, concurrency, and distributed systems architecture.
 
-Veyra is currently evolving from a REPL-driven in-memory database into a persistent storage engine with WAL-based recovery and a future TCP client/server architecture.
+Vaylix is currently evolving from a REPL-driven in-memory database into a persistent storage engine with WAL-based recovery and a future TCP client/server architecture.
 
-> Veyra is intentionally built in layers. The goal is not just to build a database, but to understand why databases are designed the way they are.
+> Vaylix is intentionally built in layers. The goal is not just to build a database, but to understand why databases are designed the way they are.
 
 ---
 
@@ -43,19 +43,19 @@ Veyra is currently evolving from a REPL-driven in-memory database into a persist
 ## Example
 
 ```text
-veyra> set name "John Doe"
+vaylix> set name "John Doe"
 OK
 
-veyra> get name
+vaylix> get name
 John Doe
 
-veyra> exists name
+vaylix> exists name
 true
 
-veyra> count
+vaylix> count
 1
 
-veyra> snapshot
+vaylix> snapshot
 OK
 ```
 
@@ -80,7 +80,7 @@ exit
 
 ## Storage Architecture
 
-Veyra currently uses a hybrid persistence model:
+Vaylix currently uses a hybrid persistence model:
 
 - Writes are appended to a write-ahead log (WAL)
 - Snapshots periodically checkpoint the full engine state
@@ -115,7 +115,7 @@ Planned work includes:
 
 ## Limitations
 
-Veyra is experimental software and is not production-ready.
+Vaylix is experimental software and is not production-ready.
 
 Current limitations include:
 
@@ -147,7 +147,7 @@ cargo run
 
 ## Philosophy
 
-Veyra is designed as a long-term systems programming project.
+Vaylix is designed as a long-term systems programming project.
 
 The focus is on understanding:
 
