@@ -1,12 +1,12 @@
 # Vaylix
 
-Vaylix is an experimental key-value database written in Rust.
+Vaylix is a transport-oriented database engine written in Rust.
 
-The project began as a systems programming exercise focused on understanding database internals from first principles: storage engines, write-ahead logging, snapshots, protocol design, concurrency, and distributed systems architecture.
+The project focuses on understanding database internals from first principles: storage engines, write-ahead logging, binary protocols, persistence, concurrency, networking, and distributed systems architecture.
 
-Vaylix is currently evolving from a REPL-driven in-memory database into a persistent storage engine with WAL-based recovery and a future TCP client/server architecture.
+Vaylix is built as a layered system with a dedicated storage engine, WAL-based recovery, a modular client/server architecture, and an evolving binary transport layer.
 
-> Vaylix is intentionally built in layers. The goal is not just to build a database, but to understand why databases are designed the way they are.
+> The goal is not just to build a database, but to understand why databases are designed the way they are.
 
 ---
 
@@ -14,7 +14,7 @@ Vaylix is currently evolving from a REPL-driven in-memory database into a persis
 
 ### Query Engine
 
-- Interactive REPL built with Rustyline
+- Interactive remote client built with Rustyline
 - Custom lexer and parser
 - Quoted string parsing
 - Command validation and completion
@@ -29,34 +29,45 @@ Vaylix is currently evolving from a REPL-driven in-memory database into a persis
 - Crash recovery through WAL replay
 - Binary serialization using Postcard
 - Multi-key delete support
+- Snapshot + WAL recovery model
+- Configurable WAL durability modes
 
 ### Architecture
 
-- Modular engine/storage separation
-- Snapshot + WAL recovery model
-- Structured command pipeline
-- Extensible protocol layer for future TCP support
+- Dedicated engine, transport, server, and client crates
+- Layered transport abstraction shared between client and server
+- Snapshot + WAL persistence architecture
+- Binary framed protocol foundation
+- Modular request/response transport design
 - Filesystem abstraction for OS-specific paths
+- Docker and multi-architecture release support
 
 ---
 
 ## Example
 
 ```text
+$ vaylix
+
+        ■ ■ ■
+
+    ████████████
+      ████████
+        ████
+          ██
+           █
+
+        Vaylix
+ transport-oriented storage
+
 vaylix> set name "John Doe"
 OK
 
 vaylix> get name
 John Doe
 
-vaylix> exists name
-true
-
 vaylix> count
 1
-
-vaylix> snapshot
-OK
 ```
 
 ---
@@ -99,7 +110,7 @@ This provides:
 
 Planned work includes:
 
-- TCP server/client protocol
+- Stable Vaylix Transport Protocol (VTP)
 - Concurrent client handling
 - Async networking with Tokio
 - Automatic snapshot checkpointing
@@ -107,9 +118,12 @@ Planned work includes:
 - Replication experiments
 - Namespace support
 - Transaction support
-- Binary wire protocol
+- Protocol versioning and compression
 - Storage engine optimizations
 - Distributed systems experiments
+- TLS support
+- Replication transport streams
+- Observability and tracing
 
 ---
 
@@ -119,13 +133,13 @@ Vaylix is experimental software and is not production-ready.
 
 Current limitations include:
 
-- Single-process architecture
 - No authentication or access control
 - No replication or clustering
 - No transaction isolation guarantees
 - No concurrent write coordination
 - Limited corruption recovery
 - No benchmarking or performance tuning yet
+- Limited multi-client coordination
 
 ---
 
@@ -135,12 +149,48 @@ Current limitations include:
 cargo build --release
 ```
 
+Build specific workspace packages:
+
+```bash
+cargo build --release -p server
+cargo build --release -p client
+```
+
 ---
 
 ## Running
 
+Start the server:
+
 ```bash
-cargo run
+cargo run -p server -- --bind 127.0.0.1 --port 9173
+```
+
+Start the client:
+
+```bash
+cargo run -p client
+```
+
+---
+
+## Docker
+
+Run the latest container:
+
+```bash
+docker run \
+  -p 9173:9173 \
+  ghcr.io/vaylix/vaylix:latest
+```
+
+Configure runtime settings:
+
+```bash
+docker run \
+  -e VAYLIX_PORT=9173 \
+  -e VAYLIX_MAX_CONNECTIONS=512 \
+  ghcr.io/vaylix/vaylix:latest
 ```
 
 ---
@@ -154,9 +204,10 @@ The focus is on understanding:
 - How databases recover from crashes
 - Why WAL exists
 - How storage engines separate durability from state transitions
-- How protocols and networking layers evolve
+- How transport protocols evolve over time
 - How concurrency changes storage semantics
 - Why distributed systems become difficult at scale
+- Why transport abstraction matters in distributed systems
 
 The architecture is expected to evolve aggressively over time.
 
