@@ -2,15 +2,6 @@ use clap::Parser;
 use server::{Args, Server, WalSyncMode};
 use transport::CodecOptions;
 
-const BANNER: &str = r#"        
-        ■ ■ ■
-    ████████████
-      ████████
-         ██
-Vaylix Database Server
-
-"#;
-
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(err) = try_main().await {
@@ -20,8 +11,6 @@ async fn main() {
 }
 
 async fn try_main() -> server::Result<()> {
-    println!("{BANNER}");
-
     let args = Args::parse();
     let auth_config = server::auth::AuthConfig::new(args.user, args.password)?;
     let paths = match args.data_dir {

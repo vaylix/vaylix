@@ -14,15 +14,6 @@ use url::Url;
 const DEFAULT_USERNAME: &str = "vaylix";
 const DEFAULT_PASSWORD: &str = "vaylix";
 
-const BANNER: &str = r#"        
-        ■ ■ ■
-    ████████████
-      ████████
-         ██
-Vaylix Database Client
-
-"#;
-
 fn main() {
     if let Err(err) = try_main() {
         eprintln!("[{}] {}: {err}", err.code(), err.name());
@@ -31,8 +22,6 @@ fn main() {
 }
 
 fn try_main() -> error::Result<()> {
-    println!("{BANNER}");
-
     let args = Args::parse();
     let config = parse_client_config(args)?;
     let mut client = Client::new(config)?;
