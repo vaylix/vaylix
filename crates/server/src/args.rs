@@ -36,15 +36,15 @@ impl From<CompressionModeArg> for CompressionMode {
 #[command(name = "vaylix", about = "Vaylix database server")]
 pub struct Args {
     /// Address to bind to
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, env = "VAYLIX_BIND", default_value = "127.0.0.1")]
     pub bind: String,
 
     /// Port to bind to
-    #[arg(long, default_value_t = 9173)]
+    #[arg(long, env = "VAYLIX_PORT", default_value_t = 9173)]
     pub port: u16,
 
     /// Maximum number of concurrent client sessions.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, env = "VAYLIX_MAX_CONNECTIONS", default_value_t = 256)]
     pub max_connections: usize,
 
     /// Background snapshot interval in seconds. Disabled when omitted.
@@ -76,7 +76,12 @@ pub struct Args {
     pub data_dir: Option<PathBuf>,
 
     /// WAL durability mode for each committed write.
-    #[arg(long, value_enum, default_value_t = WalSyncMode::Flush)]
+    #[arg(
+        long,
+        env = "VAYLIX_WAL_SYNC",
+        value_enum,
+        default_value_t = WalSyncMode::Flush
+    )]
     pub wal_sync: WalSyncMode,
 
     /// Username required for authenticated access.

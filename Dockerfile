@@ -6,14 +6,6 @@ FROM rust:1.95.0-bookworm AS builder
 
 WORKDIR /app
 
-ENV VAYLIX_BIND=0.0.0.0
-ENV VAYLIX_PORT=9173
-ENV VAYLIX_MAX_CONNECTIONS=256
-ENV VAYLIX_WAL_SYNC=flush
-ENV VAYLIX_DATA_DIR=/var/lib/vaylix
-ENV VAYLIX_USER=vaylix
-ENV VAYLIX_PASSWORD=vaylix
-
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
 
@@ -28,6 +20,14 @@ RUN cargo build --release -p server
 # =========================
 
 FROM debian:bookworm-slim
+
+ENV VAYLIX_BIND=0.0.0.0
+ENV VAYLIX_PORT=9173
+ENV VAYLIX_MAX_CONNECTIONS=256
+ENV VAYLIX_WAL_SYNC=flush
+ENV VAYLIX_DATA_DIR=/var/lib/vaylix
+ENV VAYLIX_USER=vaylix
+ENV VAYLIX_PASSWORD=vaylix
 
 WORKDIR /app
 
@@ -44,11 +44,4 @@ EXPOSE 9173
 
 VOLUME ["/var/lib/vaylix"]
 
-CMD sh -c 'vaylix \
-  --bind "$VAYLIX_BIND" \
-  --port "$VAYLIX_PORT" \
-  --max-connections "$VAYLIX_MAX_CONNECTIONS" \
-  --wal-sync "$VAYLIX_WAL_SYNC" \
-  --data-dir "$VAYLIX_DATA_DIR" \
-  --user "$VAYLIX_USER" \
-  --password "$VAYLIX_PASSWORD"'
+CMD ["vaylix"]
