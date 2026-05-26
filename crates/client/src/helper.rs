@@ -1,3 +1,4 @@
+use engine::{COMMANDS, command_info};
 use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -6,14 +7,12 @@ use rustyline::validate::{ValidationContext, ValidationResult, Validator};
 use rustyline::{Context, Helper};
 use std::borrow::Cow;
 
-use veyra_core::{COMMANDS, command_info};
-
 #[derive(Helper)]
-pub struct VeyraHelper {
+pub struct ClientHelper {
     commands: Vec<String>,
 }
 
-impl VeyraHelper {
+impl ClientHelper {
     pub fn new() -> Self {
         Self {
             commands: COMMANDS
@@ -24,7 +23,7 @@ impl VeyraHelper {
     }
 }
 
-impl Completer for VeyraHelper {
+impl Completer for ClientHelper {
     type Candidate = Pair;
 
     fn complete(
@@ -57,7 +56,7 @@ impl Completer for VeyraHelper {
     }
 }
 
-impl Hinter for VeyraHelper {
+impl Hinter for ClientHelper {
     type Hint = String;
 
     fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
@@ -78,7 +77,7 @@ impl Hinter for VeyraHelper {
     }
 }
 
-impl Highlighter for VeyraHelper {
+impl Highlighter for ClientHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
         let mut parts = line.splitn(2, ' ');
         let command = parts.next().unwrap_or("");
@@ -99,7 +98,7 @@ impl Highlighter for VeyraHelper {
     }
 }
 
-impl Validator for VeyraHelper {
+impl Validator for ClientHelper {
     fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
         let input = ctx.input().trim();
 

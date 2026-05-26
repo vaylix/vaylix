@@ -3,13 +3,13 @@ use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
 
-pub struct VeyraPaths {
+pub struct Paths {
     pub history_path: PathBuf,
     pub snapshot_path: PathBuf,
     pub wal_path: PathBuf,
 }
 
-impl VeyraPaths {
+impl Paths {
     pub fn new() -> Result<Self> {
         let dirs = ProjectDirs::from("dev", "veyra", "veyra")
             .ok_or_else(|| anyhow!("Could not determine project directories"))?;

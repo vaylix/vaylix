@@ -1,4 +1,6 @@
+use crate::helper::ClientHelper;
 use anyhow::Result;
+use engine::{Parser, Paths};
 use rustyline::Editor;
 use rustyline::config::{Builder, CompletionType, EditMode};
 use rustyline::error::ReadlineError;
@@ -6,30 +8,29 @@ use rustyline::history::DefaultHistory;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpStream;
 
-use crate::helper::VeyraHelper;
-use veyra_core::{Parser, VeyraPaths};
-
 pub struct Client {
-    editor: Editor<VeyraHelper, rustyline::history::DefaultHistory>,
+    editor: Editor<ClientHelper, rustyline::history::DefaultHistory>,
     stream: TcpStream,
-    paths: VeyraPaths,
+    paths: Paths,
 }
 
 const PROMPT: &str = "veyra> ";
 
 impl Client {
-    pub fn new() -> Result<Self> {
+    pub fn new(host: String, port: u16) -> Result<Self> {
         let config = Builder::new()
             .completion_type(CompletionType::List)
             .edit_mode(EditMode::Emacs)
             .auto_add_history(true)
             .build();
 
-        let helper = VeyraHelper::new();
-        let paths = VeyraPaths::new()?;
-        let stream = TcpStream::connect("127.0.0.1:6379")?;
+        let addr = format!("{}:{}", host, port);
 
-        let mut editor = Editor::<VeyraHelper, DefaultHistory>::with_config(config)?;
+        let helper = ClientHelper::new();
+        let paths = Paths::new()?;
+        let stream = TcpStream::connect(addr)?;
+
+        let mut editor = Editor::<ClientHelper, DefaultHistory>::with_config(config)?;
 
         editor.set_helper(Some(helper));
         editor.load_history(&paths.history_path).ok();

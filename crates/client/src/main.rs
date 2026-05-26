@@ -1,11 +1,15 @@
+mod args;
 mod client;
 mod helper;
 
 use anyhow::Result;
-pub use client::Client;
+use args::Args;
+use clap::Parser;
+use client::Client;
 
 fn main() -> Result<()> {
-    let mut client = Client::new()?;
+    let args = Args::parse();
+    let mut client = Client::new(args.host, args.port)?;
     client.run()?;
 
     Ok(())

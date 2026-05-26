@@ -1,17 +1,17 @@
 use crate::engine::{EngineState, StorageEngine};
-use crate::paths::VeyraPaths;
+use crate::paths::Paths;
 use crate::store::{WalEntry, append, replay};
 use crate::store::{deserialize, load, save, serialize, truncate};
 use anyhow::Result;
 
 pub struct Engine {
     state: EngineState,
-    paths: VeyraPaths,
+    paths: Paths,
 }
 
 impl Engine {
     pub fn new() -> Result<Self> {
-        let paths = VeyraPaths::new()?;
+        let paths = Paths::new()?;
 
         let loaded = load(&paths.snapshot_path)?;
 
