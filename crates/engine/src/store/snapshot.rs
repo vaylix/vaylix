@@ -1,23 +1,26 @@
 use crate::Result;
 use std::{
-    fs::{read, write},
-    io::ErrorKind,
-    path::PathBuf,
+    fs::{self, File},
+    io::{ErrorKind, Write},
+    path::Path,
 };
 
-pub fn save(data: &[u8], path: &PathBuf) -> Result<()> {
-    write(path, data)?;
-
+/// Saves snapshot bytes atomically using a temporary file and rename.
+pub fn save(data: &[u8], path: &Path, temp_path: &Path) -> Result<()> {
+    let mut file = File::create(temp_path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    fs::rename(temp_path, path)?;
+    File::open(path)?.sync_all()?;
     Ok(())
 }
 
-pub fn load(path: &PathBuf) -> Result<Option<Vec<u8>>> {
-    match read(path) {
+/// Loads raw snapshot bytes when a snapshot exists.
+pub fn load(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(err) => match err.kind() {
-            ErrorKind::NotFound => Ok(None),
-            _ => Err(err.into()),
-        },
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -40,14 +43,16 @@ mod tests {
     #[test]
     fn saves_and_loads_snapshot_bytes() {
         let path = temp_path("snapshot");
+        let temp_path = temp_path("snapshot-tmp");
         let payload = b"snapshot-bytes";
 
-        save(payload, &path).unwrap();
+        save(payload, &path, &temp_path).unwrap();
         let loaded = load(&path).unwrap();
 
         assert_eq!(loaded.as_deref(), Some(payload.as_slice()));
 
         fs::remove_file(path).ok();
+        fs::remove_file(temp_path).ok();
     }
 
     #[test]

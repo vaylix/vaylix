@@ -1,25 +1,137 @@
+/// Metadata used by the client REPL for completion and inline help.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandInfo {
     pub name: &'static str,
     pub usage: &'static str,
 }
 
+/// Conditional write behavior for `SET`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetCondition {
+    /// Only write when the key does not exist.
+    Nx,
+    /// Only write when the key already exists.
+    Xx,
+}
+
+/// Expiration policy expressed in seconds or milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expiration {
+    /// Expiration in whole seconds.
+    Ex(u64),
+    /// Expiration in milliseconds.
+    Px(u64),
+}
+
+/// Extended modifiers supported by the `SET` command.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SetOptions {
+    /// Conditional write requirement.
+    pub condition: Option<SetCondition>,
+    /// TTL to attach to the value.
+    pub expiration: Option<Expiration>,
+    /// Preserve the current TTL on overwrite.
+    pub keep_ttl: bool,
+    /// Return the previous value instead of a plain status.
+    pub return_previous: bool,
+}
+
 pub const COMMANDS: &[CommandInfo] = &[
+    CommandInfo {
+        name: "auth",
+        usage: "auth <username> <password>",
+    },
+    CommandInfo {
+        name: "ping",
+        usage: "ping [message]",
+    },
     CommandInfo {
         name: "get",
         usage: "get <key>",
     },
     CommandInfo {
         name: "set",
-        usage: "set <key> <value>",
+        usage: "set <key> <value> [nx|xx] [ex <seconds>|px <millis>] [keepttl] [get]",
+    },
+    CommandInfo {
+        name: "setnx",
+        usage: "setnx <key> <value>",
+    },
+    CommandInfo {
+        name: "getdel",
+        usage: "getdel <key>",
+    },
+    CommandInfo {
+        name: "getex",
+        usage: "getex <key> [ex <seconds>|px <millis>|persist]",
+    },
+    CommandInfo {
+        name: "mget",
+        usage: "mget <key> [key ...]",
+    },
+    CommandInfo {
+        name: "mset",
+        usage: "mset <key> <value> [key value ...]",
+    },
+    CommandInfo {
+        name: "del",
+        usage: "del <key> [key ...]",
     },
     CommandInfo {
         name: "delete",
-        usage: "delete <key> [key...]",
+        usage: "delete <key> [key ...]",
     },
     CommandInfo {
         name: "exists",
         usage: "exists <key>",
+    },
+    CommandInfo {
+        name: "incr",
+        usage: "incr <key>",
+    },
+    CommandInfo {
+        name: "decr",
+        usage: "decr <key>",
+    },
+    CommandInfo {
+        name: "expire",
+        usage: "expire <key> <seconds>",
+    },
+    CommandInfo {
+        name: "ttl",
+        usage: "ttl <key>",
+    },
+    CommandInfo {
+        name: "persist",
+        usage: "persist <key>",
+    },
+    CommandInfo {
+        name: "rename",
+        usage: "rename <source> <destination>",
+    },
+    CommandInfo {
+        name: "renamenx",
+        usage: "renamenx <source> <destination>",
+    },
+    CommandInfo {
+        name: "scan",
+        usage: "scan <cursor> [match <pattern>] [count <n>]",
+    },
+    CommandInfo {
+        name: "dbsize",
+        usage: "dbsize",
+    },
+    CommandInfo {
+        name: "count",
+        usage: "count",
+    },
+    CommandInfo {
+        name: "info",
+        usage: "info",
+    },
+    CommandInfo {
+        name: "metrics",
+        usage: "metrics",
     },
     CommandInfo {
         name: "list",
@@ -30,8 +142,28 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "clear",
     },
     CommandInfo {
-        name: "count",
-        usage: "count",
+        name: "flushdb",
+        usage: "flushdb",
+    },
+    CommandInfo {
+        name: "save",
+        usage: "save",
+    },
+    CommandInfo {
+        name: "snapshot",
+        usage: "snapshot",
+    },
+    CommandInfo {
+        name: "multi",
+        usage: "multi",
+    },
+    CommandInfo {
+        name: "exec",
+        usage: "exec",
+    },
+    CommandInfo {
+        name: "discard",
+        usage: "discard",
     },
     CommandInfo {
         name: "help",
@@ -41,25 +173,95 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "exit",
         usage: "exit",
     },
-    CommandInfo {
-        name: "snapshot",
-        usage: "snapshot",
-    },
 ];
 
 pub fn command_info(name: &str) -> Option<&'static CommandInfo> {
-    COMMANDS.iter().find(|command| command.name == name)
+    COMMANDS
+        .iter()
+        .find(|command| command.name.eq_ignore_ascii_case(name))
 }
 
+/// Parsed client command independent of transport framing and engine internals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Get { key: String },
-    Set { key: String, value: String },
-    Delete { keys: Vec<String> },
-    Exists { key: String },
+    Auth {
+        username: String,
+        password: String,
+    },
+    Ping {
+        message: Option<String>,
+    },
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+        options: SetOptions,
+    },
+    SetNx {
+        key: String,
+        value: String,
+    },
+    GetDel {
+        key: String,
+    },
+    GetEx {
+        key: String,
+        expiration: Option<Expiration>,
+        persist: bool,
+    },
+    MGet {
+        keys: Vec<String>,
+    },
+    MSet {
+        entries: Vec<(String, String)>,
+    },
+    Delete {
+        keys: Vec<String>,
+    },
+    Exists {
+        key: String,
+    },
+    Incr {
+        key: String,
+    },
+    Decr {
+        key: String,
+    },
+    Expire {
+        key: String,
+        seconds: u64,
+    },
+    Ttl {
+        key: String,
+    },
+    Persist {
+        key: String,
+    },
+    Rename {
+        source: String,
+        destination: String,
+    },
+    RenameNx {
+        source: String,
+        destination: String,
+    },
+    Scan {
+        cursor: u64,
+        pattern: Option<String>,
+        count: Option<u16>,
+    },
+    DbSize,
+    Info,
+    Metrics,
     List,
     Clear,
     Count,
+    Save,
+    Multi,
+    Exec,
+    Discard,
     Help,
     Exit,
     Snapshot,

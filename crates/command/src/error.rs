@@ -10,6 +10,18 @@ pub enum CommandError {
     UnknownCommand { command: String },
     #[error("usage: {usage}")]
     InvalidArity { usage: String },
+    #[error("invalid integer for {field}: {value}")]
+    InvalidInteger { field: &'static str, value: String },
+    #[error("invalid option for {command}: {option}")]
+    InvalidOption {
+        command: &'static str,
+        option: String,
+    },
+    #[error("conflicting options for {command}: {detail}")]
+    ConflictingOptions {
+        command: &'static str,
+        detail: &'static str,
+    },
     #[error("expected opening quote")]
     ExpectedOpeningQuote,
     #[error("unterminated quoted string starting at byte {start}")]
@@ -22,8 +34,11 @@ impl CommandError {
             Self::EmptyCommand => "CMD-001",
             Self::UnknownCommand { .. } => "CMD-002",
             Self::InvalidArity { .. } => "CMD-003",
-            Self::ExpectedOpeningQuote => "CMD-004",
-            Self::UnterminatedQuotedString { .. } => "CMD-005",
+            Self::InvalidInteger { .. } => "CMD-004",
+            Self::InvalidOption { .. } => "CMD-005",
+            Self::ConflictingOptions { .. } => "CMD-006",
+            Self::ExpectedOpeningQuote => "CMD-007",
+            Self::UnterminatedQuotedString { .. } => "CMD-008",
         }
     }
 
@@ -32,6 +47,9 @@ impl CommandError {
             Self::EmptyCommand => "Empty Command",
             Self::UnknownCommand { .. } => "Unknown Command",
             Self::InvalidArity { .. } => "Invalid Command Arity",
+            Self::InvalidInteger { .. } => "Invalid Integer Argument",
+            Self::InvalidOption { .. } => "Invalid Command Option",
+            Self::ConflictingOptions { .. } => "Conflicting Command Options",
             Self::ExpectedOpeningQuote => "Expected Opening Quote",
             Self::UnterminatedQuotedString { .. } => "Unterminated Quoted String",
         }

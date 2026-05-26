@@ -2,6 +2,7 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::{Result, TransportError};
 
+/// Structured remote error metadata returned for failed requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorPayload {
     pub code: String,
@@ -9,6 +10,14 @@ pub struct ErrorPayload {
     pub message: String,
 }
 
+/// Cursor-based scan result returned from the server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanPayload {
+    pub next_cursor: u64,
+    pub keys: Vec<String>,
+}
+
+/// Machine-readable status code for a transport response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Status {
@@ -36,6 +45,7 @@ impl TryFrom<u8> for Status {
     }
 }
 
+/// A decoded server response without outer frame bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     pub request_id: u32,
@@ -44,6 +54,7 @@ pub struct Response {
 }
 
 impl Response {
+    /// Builds a raw response from its request id, status, and payload.
     pub fn new(request_id: u32, status: Status, payload: Vec<u8>) -> Self {
         Self {
             request_id,
@@ -52,14 +63,17 @@ impl Response {
         }
     }
 
+    /// Builds an empty successful response.
     pub fn ok(request_id: u32) -> Self {
         Self::new(request_id, Status::Ok, Vec::new())
     }
 
+    /// Builds a not-found response for a missing key.
     pub fn not_found(request_id: u32) -> Self {
         Self::new(request_id, Status::NotFound, Vec::new())
     }
 
+    /// Builds a structured error response.
     pub fn error(request_id: u32, code: &str, name: &str, message: &str) -> Result<Self> {
         Ok(Self::new(
             request_id,
@@ -68,20 +82,31 @@ impl Response {
         ))
     }
 
+    /// Builds a response containing a single string value.
     pub fn value(request_id: u32, value: &str) -> Result<Self> {
         Ok(Self::new(request_id, Status::Ok, encode_string_u32(value)?))
     }
 
+    /// Builds a response containing a boolean value.
     pub fn boolean(request_id: u32, value: bool) -> Self {
         Self::new(request_id, Status::Ok, vec![u8::from(value)])
     }
 
+    /// Builds a response containing an unsigned count value.
     pub fn count(request_id: u32, count: u64) -> Self {
         let mut buf = BytesMut::with_capacity(8);
         buf.put_u64(count);
         Self::new(request_id, Status::Ok, buf.to_vec())
     }
 
+    /// Builds a response containing a signed integer value.
+    pub fn integer(request_id: u32, value: i64) -> Self {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_i64(value);
+        Self::new(request_id, Status::Ok, buf.to_vec())
+    }
+
+    /// Builds a response containing a list of key/value pairs.
     pub fn entries(request_id: u32, entries: &[(String, String)]) -> Result<Self> {
         let entry_count =
             u32::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
@@ -91,6 +116,40 @@ impl Response {
         for (key, value) in entries {
             put_string_u16(&mut buf, key)?;
             put_string_u32(&mut buf, value)?;
+        }
+
+        Ok(Self::new(request_id, Status::Ok, buf.to_vec()))
+    }
+
+    /// Builds a response containing a list of optional string values.
+    pub fn strings(request_id: u32, values: &[Option<String>]) -> Result<Self> {
+        let value_count =
+            u32::try_from(values.len()).map_err(|_| TransportError::CorruptedPayload)?;
+        let mut buf = BytesMut::new();
+        buf.put_u32(value_count);
+
+        for value in values {
+            match value {
+                Some(value) => {
+                    buf.put_u8(1);
+                    put_string_u32(&mut buf, value)?;
+                }
+                None => buf.put_u8(0),
+            }
+        }
+
+        Ok(Self::new(request_id, Status::Ok, buf.to_vec()))
+    }
+
+    /// Builds a cursor-based scan response.
+    pub fn scan(request_id: u32, next_cursor: u64, keys: &[String]) -> Result<Self> {
+        let key_count = u32::try_from(keys.len()).map_err(|_| TransportError::CorruptedPayload)?;
+        let mut buf = BytesMut::new();
+        buf.put_u64(next_cursor);
+        buf.put_u32(key_count);
+
+        for key in keys {
+            put_string_u16(&mut buf, key)?;
         }
 
         Ok(Self::new(request_id, Status::Ok, buf.to_vec()))
@@ -125,8 +184,19 @@ impl Response {
 
         let count = buf.get_u64();
         ensure_empty(buf)?;
-
         Ok(count)
+    }
+
+    pub fn decode_integer(&self) -> Result<i64> {
+        let mut buf = self.payload.as_slice();
+
+        if buf.remaining() < 8 {
+            return Err(TransportError::UnexpectedEof);
+        }
+
+        let value = buf.get_i64();
+        ensure_empty(buf)?;
+        Ok(value)
     }
 
     pub fn decode_entries(&self) -> Result<Vec<(String, String)>> {
@@ -146,8 +216,53 @@ impl Response {
         }
 
         ensure_empty(buf)?;
-
         Ok(entries)
+    }
+
+    pub fn decode_strings(&self) -> Result<Vec<Option<String>>> {
+        let mut buf = self.payload.as_slice();
+
+        if buf.remaining() < 4 {
+            return Err(TransportError::UnexpectedEof);
+        }
+
+        let value_count = buf.get_u32() as usize;
+        let mut values = Vec::with_capacity(value_count);
+
+        for _ in 0..value_count {
+            if buf.remaining() < 1 {
+                return Err(TransportError::UnexpectedEof);
+            }
+
+            match buf.get_u8() {
+                0 => values.push(None),
+                1 => values.push(Some(read_string_u32(&mut buf)?)),
+                _ => return Err(TransportError::CorruptedPayload),
+            }
+        }
+
+        ensure_empty(buf)?;
+        Ok(values)
+    }
+
+    pub fn decode_scan(&self) -> Result<ScanPayload> {
+        let mut buf = self.payload.as_slice();
+
+        if buf.remaining() < 12 {
+            return Err(TransportError::UnexpectedEof);
+        }
+
+        let next_cursor = buf.get_u64();
+        let key_count = buf.get_u32() as usize;
+        let mut keys = Vec::with_capacity(key_count);
+
+        for _ in 0..key_count {
+            keys.push(read_string_u16(&mut buf)?);
+        }
+
+        ensure_empty(buf)?;
+
+        Ok(ScanPayload { next_cursor, keys })
     }
 }
 
@@ -252,8 +367,11 @@ mod tests {
         let count = Response::count(3, 42);
         assert_eq!(count.decode_count().unwrap(), 42);
 
+        let integer = Response::integer(4, -2);
+        assert_eq!(integer.decode_integer().unwrap(), -2);
+
         let entries = Response::entries(
-            4,
+            5,
             &[
                 ("name".to_string(), "alice".to_string()),
                 ("city".to_string(), "paris".to_string()),
@@ -267,6 +385,21 @@ mod tests {
                 ("city".to_string(), "paris".to_string())
             ]
         );
+
+        let strings = Response::strings(
+            6,
+            &[Some("alice".to_string()), None, Some("paris".to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            strings.decode_strings().unwrap(),
+            vec![Some("alice".to_string()), None, Some("paris".to_string())]
+        );
+
+        let scan = Response::scan(7, 10, &["one".to_string(), "two".to_string()]).unwrap();
+        let decoded = scan.decode_scan().unwrap();
+        assert_eq!(decoded.next_cursor, 10);
+        assert_eq!(decoded.keys, vec!["one".to_string(), "two".to_string()]);
     }
 
     #[test]
@@ -293,10 +426,10 @@ mod tests {
             Err(TransportError::UnexpectedEof)
         ));
 
-        let entries_response = Response::new(1, Status::Ok, vec![0, 0, 0, 1, 0, 3, b'f', b'o']);
+        let strings_response = Response::new(1, Status::Ok, vec![0, 0, 0, 1, 2]);
         assert!(matches!(
-            entries_response.decode_entries(),
-            Err(TransportError::UnexpectedEof)
+            strings_response.decode_strings(),
+            Err(TransportError::CorruptedPayload)
         ));
     }
 }

@@ -3,5 +3,5 @@ pub mod state;
 pub mod traits;
 
 pub use core::Engine;
-pub use state::EngineState;
-pub use traits::StorageEngine;
+pub use state::{EngineMetadata, EngineState};
+pub use traits::{Expiration, ScanPage, SetCondition, SetOptions, SetOutcome, StorageEngine};

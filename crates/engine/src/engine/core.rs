@@ -1,116 +1,754 @@
-use crate::engine::{EngineState, StorageEngine};
+use crate::EngineMetadata;
+use crate::config::EngineOptions;
+use crate::engine::{
+    EngineState, Expiration, ScanPage, SetCondition, SetOptions, SetOutcome, StorageEngine,
+};
 use crate::error::Result;
 use crate::paths::Paths;
-use crate::store::{WalEntry, append, replay};
-use crate::store::{deserialize, load, save, serialize, truncate};
+use crate::store::{
+    Manifest, WalEntry, WalOperation, append, deserialize, load, load_manifest, replay, save,
+    save_manifest, serialize, truncate,
+};
+use crc32fast::hash;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+const DEFAULT_SCAN_COUNT: usize = 10;
+
+/// Core string-to-string storage engine backed by snapshots and a write-ahead log.
 pub struct Engine {
     state: EngineState,
     paths: Paths,
+    options: EngineOptions,
 }
 
 impl Engine {
+    /// Creates a new engine using the default filesystem layout and default options.
     pub fn new() -> Result<Self> {
-        let paths = Paths::new()?;
+        Self::from_paths_with_options(Paths::new()?, EngineOptions::default())
+    }
 
+    /// Creates a new engine using the default filesystem layout and caller-provided options.
+    pub fn with_options(options: EngineOptions) -> Result<Self> {
+        Self::from_paths_with_options(Paths::new()?, options)
+    }
+
+    /// Creates a new engine using an explicit filesystem layout and default options.
+    pub fn from_paths(paths: Paths) -> Result<Self> {
+        Self::from_paths_with_options(paths, EngineOptions::default())
+    }
+
+    /// Creates a new engine using an explicit filesystem layout and caller-provided options.
+    pub fn from_paths_with_options(paths: Paths, options: EngineOptions) -> Result<Self> {
         let loaded = load(&paths.snapshot_path)?;
 
-        let mut state = match loaded {
-            Some(loaded) => deserialize(&loaded)?,
+        let mut state = match &loaded {
+            Some(loaded) => deserialize(loaded)?,
             None => EngineState::new(),
         };
 
-        let entries = replay(&paths.wal_path)?;
-
-        for entry in entries {
-            state.apply(entry);
+        if let Some(manifest) = load_manifest(&paths.manifest_path)? {
+            if let Some(snapshot) = &loaded {
+                if hash(snapshot) != manifest.snapshot_checksum {
+                    return Err(crate::EngineError::ChecksumMismatch {
+                        resource: "snapshot",
+                    });
+                }
+            }
+            state.metadata.last_snapshot_at_ms = Some(manifest.last_snapshot_at_ms);
+            state.metadata.last_applied_sequence = state
+                .metadata
+                .last_applied_sequence
+                .max(manifest.last_snapshot_sequence);
         }
 
-        Ok(Self { state, paths })
+        for entry in replay(&paths.wal_path)? {
+            state.apply_entry(&entry)?;
+        }
+
+        Ok(Self {
+            state,
+            paths,
+            options,
+        })
+    }
+
+    /// Returns immutable access to the in-memory state for diagnostics and tests.
+    pub fn state(&self) -> &EngineState {
+        &self.state
+    }
+
+    fn append_and_apply(&mut self, operations: Vec<WalOperation>) -> Result<()> {
+        let entry = self.next_entry(operations);
+        append(&entry, &self.paths.wal_path, self.options.wal_sync)?;
+        self.state.apply_entry(&entry)?;
+        Ok(())
+    }
+
+    fn next_entry(&self, operations: Vec<WalOperation>) -> WalEntry {
+        WalEntry::new(
+            self.state.metadata.last_applied_sequence + 1,
+            now_millis(),
+            operations,
+        )
+    }
+
+    fn now(&self) -> u64 {
+        now_millis()
+    }
+
+    fn info_entries(&self, metadata: &EngineMetadata, key_count: usize) -> Vec<(String, String)> {
+        let wal_size = std::fs::metadata(&self.paths.wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        vec![
+            ("engine_version".to_string(), metadata.version.to_string()),
+            (
+                "created_at_ms".to_string(),
+                metadata.created_at_ms.to_string(),
+            ),
+            (
+                "updated_at_ms".to_string(),
+                metadata.updated_at_ms.to_string(),
+            ),
+            (
+                "last_snapshot_at_ms".to_string(),
+                metadata
+                    .last_snapshot_at_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            (
+                "last_applied_sequence".to_string(),
+                metadata.last_applied_sequence.to_string(),
+            ),
+            ("key_count".to_string(), key_count.to_string()),
+            ("wal_size_bytes".to_string(), wal_size.to_string()),
+            (
+                "wal_sync_policy".to_string(),
+                self.options.wal_sync.as_str().to_string(),
+            ),
+        ]
+    }
+
+    fn resolve_expiration(now_ms: u64, expiration: Expiration) -> u64 {
+        match expiration {
+            Expiration::Seconds(seconds) => now_ms.saturating_add(seconds.saturating_mul(1_000)),
+            Expiration::Milliseconds(milliseconds) => now_ms.saturating_add(milliseconds),
+        }
+    }
+
+    fn maybe_get_existing_value(&mut self, key: &str) -> Option<String> {
+        self.state.purge_expired(self.now());
+        self.state.data.get(key).cloned()
     }
 }
 
 impl StorageEngine for Engine {
-    fn get(&self, key: &str) -> Result<Option<String>> {
-        let value = self.state.data.get(key).cloned();
-
-        Ok(value)
+    fn get(&mut self, key: &str) -> Result<Option<String>> {
+        Ok(self.state.get_live(key, self.now()))
     }
 
-    fn set(&mut self, key: String, value: String) -> Result<()> {
-        let entry = WalEntry::Set { key, value };
+    fn set_with_options(
+        &mut self,
+        key: String,
+        value: String,
+        options: SetOptions,
+    ) -> Result<SetOutcome> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
 
-        append(&entry, &self.paths.wal_path)?;
+        let previous = self.state.data.get(&key).cloned();
+        let previous_expiration = self.state.expirations.get(&key).copied();
 
-        self.state.apply(entry);
-
-        Ok(())
-    }
-
-    fn delete(&mut self, key: &str) -> Result<()> {
-        let entry = WalEntry::Delete {
-            key: key.to_string(),
+        let allowed = match options.condition {
+            Some(SetCondition::Nx) => previous.is_none(),
+            Some(SetCondition::Xx) => previous.is_some(),
+            None => true,
         };
 
-        append(&entry, &self.paths.wal_path)?;
-
-        self.state.apply(entry);
-
-        Ok(())
-    }
-
-    fn delete_many(&mut self, keys: &[String]) -> Result<()> {
-        for key in keys {
-            let entry = WalEntry::Delete {
-                key: key.to_string(),
-            };
-
-            append(&entry, &self.paths.wal_path)?;
-
-            self.state.apply(entry);
+        if !allowed {
+            return Ok(SetOutcome {
+                applied: false,
+                previous,
+            });
         }
 
-        Ok(())
+        let mut operations = vec![WalOperation::Set {
+            key: key.clone(),
+            value,
+        }];
+
+        if let Some(expiration) = options.expiration {
+            let expires_at_ms = Self::resolve_expiration(now_ms, expiration);
+            if expires_at_ms <= now_ms {
+                operations.push(WalOperation::Delete { key: key.clone() });
+            } else {
+                operations.push(WalOperation::Expire {
+                    key: key.clone(),
+                    expires_at_ms,
+                });
+            }
+        } else if options.keep_ttl {
+            if let Some(expires_at_ms) = previous_expiration {
+                operations.push(WalOperation::Expire {
+                    key: key.clone(),
+                    expires_at_ms,
+                });
+            }
+        }
+
+        self.append_and_apply(operations)?;
+
+        Ok(SetOutcome {
+            applied: true,
+            previous,
+        })
     }
 
-    fn exists(&self, key: &str) -> Result<bool> {
-        let value_exists = self.state.data.contains_key(key);
-
-        Ok(value_exists)
+    fn get_del(&mut self, key: &str) -> Result<Option<String>> {
+        let previous = self.maybe_get_existing_value(key);
+        if previous.is_some() {
+            self.append_and_apply(vec![WalOperation::Delete {
+                key: key.to_string(),
+            }])?;
+        }
+        Ok(previous)
     }
 
-    fn count(&self) -> Result<usize> {
-        let count = self.state.data.len();
-        Ok(count)
+    fn get_ex(
+        &mut self,
+        key: &str,
+        expiration: Option<Expiration>,
+        persist: bool,
+    ) -> Result<Option<String>> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+
+        let previous = self.state.data.get(key).cloned();
+        if previous.is_none() {
+            return Ok(None);
+        }
+
+        let operation = if let Some(expiration) = expiration {
+            let expires_at_ms = Self::resolve_expiration(now_ms, expiration);
+            if expires_at_ms <= now_ms {
+                Some(WalOperation::Delete {
+                    key: key.to_string(),
+                })
+            } else {
+                Some(WalOperation::Expire {
+                    key: key.to_string(),
+                    expires_at_ms,
+                })
+            }
+        } else if persist && self.state.expirations.contains_key(key) {
+            Some(WalOperation::Persist {
+                key: key.to_string(),
+            })
+        } else {
+            None
+        };
+
+        if let Some(operation) = operation {
+            self.append_and_apply(vec![operation])?;
+        }
+
+        Ok(previous)
+    }
+
+    fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<String>>> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+
+        Ok(keys
+            .iter()
+            .map(|key| self.state.data.get(key).cloned())
+            .collect())
+    }
+
+    fn mset(&mut self, entries: &[(String, String)]) -> Result<()> {
+        let operations = entries
+            .iter()
+            .map(|(key, value)| WalOperation::Set {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect();
+
+        self.append_and_apply(operations)
+    }
+
+    fn delete(&mut self, key: &str) -> Result<bool> {
+        Ok(self.delete_many(&[key.to_string()])? > 0)
+    }
+
+    fn delete_many(&mut self, keys: &[String]) -> Result<usize> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+
+        let removed = keys
+            .iter()
+            .filter(|key| self.state.data.contains_key(key.as_str()))
+            .count();
+
+        if removed == 0 {
+            return Ok(0);
+        }
+
+        let operations = keys
+            .iter()
+            .map(|key| WalOperation::Delete { key: key.clone() })
+            .collect();
+        self.append_and_apply(operations)?;
+
+        Ok(removed)
+    }
+
+    fn exists(&mut self, key: &str) -> Result<bool> {
+        Ok(self.state.has_live_key(key, self.now()))
+    }
+
+    fn incr(&mut self, key: &str) -> Result<i64> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+        let current = self
+            .state
+            .data
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        let parsed =
+            current
+                .parse::<i64>()
+                .map_err(|_| crate::EngineError::InvalidIntegerValue {
+                    key: key.to_string(),
+                    value: current.clone(),
+                })?;
+        let next = parsed
+            .checked_add(1)
+            .ok_or_else(|| crate::EngineError::NumericOverflow {
+                key: key.to_string(),
+            })?;
+
+        self.append_and_apply(vec![WalOperation::CheckInteger {
+            key: key.to_string(),
+            delta: 1,
+        }])?;
+
+        Ok(next)
+    }
+
+    fn decr(&mut self, key: &str) -> Result<i64> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+        let current = self
+            .state
+            .data
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| "0".to_string());
+        let parsed =
+            current
+                .parse::<i64>()
+                .map_err(|_| crate::EngineError::InvalidIntegerValue {
+                    key: key.to_string(),
+                    value: current.clone(),
+                })?;
+        let next = parsed
+            .checked_sub(1)
+            .ok_or_else(|| crate::EngineError::NumericOverflow {
+                key: key.to_string(),
+            })?;
+
+        self.append_and_apply(vec![WalOperation::CheckInteger {
+            key: key.to_string(),
+            delta: -1,
+        }])?;
+
+        Ok(next)
+    }
+
+    fn expire(&mut self, key: &str, seconds: u64) -> Result<bool> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+
+        if !self.state.data.contains_key(key) {
+            return Ok(false);
+        }
+
+        if seconds == 0 {
+            self.append_and_apply(vec![WalOperation::Delete {
+                key: key.to_string(),
+            }])?;
+            return Ok(true);
+        }
+
+        let expires_at_ms = now_ms.saturating_add(seconds.saturating_mul(1_000));
+        self.append_and_apply(vec![WalOperation::Expire {
+            key: key.to_string(),
+            expires_at_ms,
+        }])?;
+        Ok(true)
+    }
+
+    fn ttl(&mut self, key: &str) -> Result<i64> {
+        Ok(self.state.ttl_for(key, self.now()))
+    }
+
+    fn persist(&mut self, key: &str) -> Result<bool> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+
+        if !self.state.data.contains_key(key) || !self.state.expirations.contains_key(key) {
+            return Ok(false);
+        }
+
+        self.append_and_apply(vec![WalOperation::Persist {
+            key: key.to_string(),
+        }])?;
+        Ok(true)
+    }
+
+    fn rename(&mut self, source: &str, destination: String) -> Result<bool> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+
+        let Some(value) = self.state.data.get(source).cloned() else {
+            return Ok(false);
+        };
+        let source_ttl = self.state.expirations.get(source).copied();
+
+        let mut operations = vec![
+            WalOperation::Delete {
+                key: source.to_string(),
+            },
+            WalOperation::Set {
+                key: destination.clone(),
+                value,
+            },
+        ];
+        if let Some(expires_at_ms) = source_ttl {
+            operations.push(WalOperation::Expire {
+                key: destination,
+                expires_at_ms,
+            });
+        }
+        self.append_and_apply(operations)?;
+        Ok(true)
+    }
+
+    fn rename_nx(&mut self, source: &str, destination: String) -> Result<bool> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+        if self.state.data.contains_key(&destination) {
+            return Ok(false);
+        }
+        self.rename(source, destination)
+    }
+
+    fn db_size(&mut self) -> Result<usize> {
+        self.state.purge_expired(self.now());
+        Ok(self.state.data.len())
+    }
+
+    fn scan(&mut self, cursor: u64, pattern: Option<&str>, count: Option<u16>) -> Result<ScanPage> {
+        let mut keys = self.state.live_keys(self.now());
+        if let Some(pattern) = pattern {
+            keys.retain(|key| wildcard_matches(pattern, key));
+        }
+
+        if keys.is_empty() {
+            return Ok(ScanPage {
+                next_cursor: 0,
+                keys: Vec::new(),
+            });
+        }
+
+        let start = usize::try_from(cursor).unwrap_or(usize::MAX);
+        if start >= keys.len() {
+            return Ok(ScanPage {
+                next_cursor: 0,
+                keys: Vec::new(),
+            });
+        }
+
+        let limit = usize::from(count.unwrap_or(DEFAULT_SCAN_COUNT as u16)).max(1);
+        let end = (start + limit).min(keys.len());
+        let next_cursor = if end >= keys.len() { 0 } else { end as u64 };
+
+        Ok(ScanPage {
+            next_cursor,
+            keys: keys[start..end].to_vec(),
+        })
+    }
+
+    fn list(&mut self) -> Result<Vec<(String, String)>> {
+        Ok(self.state.live_entries(self.now()))
+    }
+
+    fn info(&mut self) -> Result<Vec<(String, String)>> {
+        self.state.purge_expired(self.now());
+        Ok(self.info_entries(&self.state.metadata, self.state.data.len()))
+    }
+
+    fn sweep_expired(&mut self) -> Result<usize> {
+        Ok(self.state.purge_expired(self.now()))
     }
 
     fn clear(&mut self) -> Result<()> {
-        let entry = WalEntry::Clear;
+        if self.state.data.is_empty() && self.state.expirations.is_empty() {
+            return Ok(());
+        }
 
-        append(&entry, &self.paths.wal_path)?;
-
-        self.state.apply(entry);
-
-        Ok(())
+        self.append_and_apply(vec![WalOperation::Clear])
     }
 
-    fn list(&self) -> Result<Vec<(String, String)>> {
-        let key_value: Vec<(String, String)> = self
-            .state
-            .data
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
+    fn snapshot(&mut self) -> Result<()> {
+        self.state.purge_expired(self.now());
 
-        Ok(key_value)
-    }
+        let sequence = self.state.metadata.last_applied_sequence;
+        let snapshot_started_at_ms = self.now();
 
-    fn snapshot(&self) -> Result<()> {
-        let serialized = serialize(&self.state)?;
-        save(&serialized, &self.paths.snapshot_path)?;
+        let mut durable_state = self.state.clone();
+        durable_state.mark_snapshot(snapshot_started_at_ms, sequence);
+
+        let serialized = serialize(&durable_state)?;
+        save(
+            &serialized,
+            &self.paths.snapshot_path,
+            &self.paths.snapshot_tmp_path,
+        )?;
+
+        let manifest = Manifest {
+            engine_version: durable_state.metadata.version,
+            last_snapshot_sequence: sequence,
+            last_snapshot_at_ms: snapshot_started_at_ms,
+            snapshot_size_bytes: serialized.len() as u64,
+            snapshot_checksum: hash(&serialized),
+        };
+        save_manifest(
+            &manifest,
+            &self.paths.manifest_path,
+            &self.paths.manifest_tmp_path,
+        )?;
 
         truncate(&self.paths.wal_path)?;
+        self.state = durable_state;
 
         Ok(())
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis() as u64
+}
+
+fn wildcard_matches(pattern: &str, text: &str) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let text_chars: Vec<char> = text.chars().collect();
+    let mut dp = vec![vec![false; text_chars.len() + 1]; pattern_chars.len() + 1];
+    dp[0][0] = true;
+
+    for row in 1..=pattern_chars.len() {
+        if pattern_chars[row - 1] == '*' {
+            dp[row][0] = dp[row - 1][0];
+        }
+    }
+
+    for row in 1..=pattern_chars.len() {
+        for col in 1..=text_chars.len() {
+            dp[row][col] = match pattern_chars[row - 1] {
+                '*' => dp[row - 1][col] || dp[row][col - 1],
+                '?' => dp[row - 1][col - 1],
+                value => dp[row - 1][col - 1] && value == text_chars[col - 1],
+            };
+        }
+    }
+
+    dp[pattern_chars.len()][text_chars.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Engine;
+    use crate::{
+        EngineOptions, Expiration, Paths, SetCondition, SetOptions, StorageEngine, WalSyncPolicy,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("veyra-engine-{name}-{unique}"))
+    }
+
+    fn engine() -> (Engine, PathBuf) {
+        let root = temp_dir("root");
+        let paths = Paths::from_data_dir(&root).unwrap();
+        (
+            Engine::from_paths_with_options(
+                paths,
+                EngineOptions {
+                    wal_sync: WalSyncPolicy::Flush,
+                },
+            )
+            .unwrap(),
+            root,
+        )
+    }
+
+    #[test]
+    fn supports_serious_v1_string_commands() {
+        let (mut engine, root) = engine();
+
+        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        assert_eq!(engine.get("name").unwrap(), Some("alice".to_string()));
+        assert!(
+            !engine
+                .set_nx("name".to_string(), "bob".to_string())
+                .unwrap()
+        );
+        assert!(
+            engine
+                .set_nx("city".to_string(), "paris".to_string())
+                .unwrap()
+        );
+        assert_eq!(
+            engine.mget(&["name".into(), "missing".into()]).unwrap(),
+            vec![Some("alice".into()), None]
+        );
+        engine
+            .mset(&[
+                ("one".to_string(), "1".to_string()),
+                ("two".to_string(), "2".to_string()),
+            ])
+            .unwrap();
+        assert_eq!(engine.db_size().unwrap(), 4);
+        assert_eq!(engine.incr("counter").unwrap(), 1);
+        assert_eq!(engine.decr("counter").unwrap(), 0);
+        assert!(engine.exists("city").unwrap());
+        assert_eq!(
+            engine
+                .delete_many(&["city".into(), "missing".into()])
+                .unwrap(),
+            1
+        );
+        assert_eq!(engine.count().unwrap(), 4);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn supports_set_getdel_getex_and_scan_match() {
+        let (mut engine, root) = engine();
+
+        engine
+            .set("user:1".to_string(), "alice".to_string())
+            .unwrap();
+        let outcome = engine
+            .set_with_options(
+                "user:1".to_string(),
+                "bob".to_string(),
+                SetOptions {
+                    condition: Some(SetCondition::Xx),
+                    expiration: Some(Expiration::Seconds(60)),
+                    keep_ttl: false,
+                },
+            )
+            .unwrap();
+        assert!(outcome.applied);
+        assert_eq!(outcome.previous, Some("alice".to_string()));
+
+        assert_eq!(engine.get_del("user:1").unwrap(), Some("bob".to_string()));
+        assert_eq!(engine.get("user:1").unwrap(), None);
+
+        engine
+            .set("user:2".to_string(), "carol".to_string())
+            .unwrap();
+        assert_eq!(
+            engine
+                .get_ex("user:2", Some(Expiration::Milliseconds(1_500)), false)
+                .unwrap(),
+            Some("carol".to_string())
+        );
+        assert!(engine.ttl("user:2").unwrap() > 0);
+
+        engine
+            .mset(&[
+                ("user:alpha".to_string(), "1".to_string()),
+                ("sys:beta".to_string(), "2".to_string()),
+                ("user:gamma".to_string(), "3".to_string()),
+            ])
+            .unwrap();
+
+        let page = engine.scan(0, Some("user:*"), Some(10)).unwrap();
+        assert_eq!(page.keys, vec!["user:2", "user:alpha", "user:gamma"]);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn snapshot_persists_state_and_flushes_wal() {
+        let (mut engine, root) = engine();
+
+        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.snapshot().unwrap();
+
+        let wal_len = fs::metadata(root.join("wal.log")).unwrap().len();
+        assert_eq!(wal_len, 0);
+        assert!(root.join("snapshot.bin").exists());
+        assert!(root.join("manifest.bin").exists());
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let mut reloaded = Engine::from_paths(paths).unwrap();
+        assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ttl_and_persist_behave_consistently() {
+        let (mut engine, root) = engine();
+
+        engine
+            .set("session".to_string(), "abc".to_string())
+            .unwrap();
+        assert_eq!(engine.ttl("session").unwrap(), -1);
+        assert!(engine.expire("session", 60).unwrap());
+        assert!(engine.ttl("session").unwrap() > 0);
+        assert!(engine.persist("session").unwrap());
+        assert_eq!(engine.ttl("session").unwrap(), -1);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn scan_is_cursor_based() {
+        let (mut engine, root) = engine();
+
+        engine
+            .mset(&[
+                ("a".to_string(), "1".to_string()),
+                ("b".to_string(), "2".to_string()),
+                ("c".to_string(), "3".to_string()),
+            ])
+            .unwrap();
+
+        let first = engine.scan(0, None, Some(2)).unwrap();
+        assert_eq!(first.keys, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(first.next_cursor, 2);
+
+        let second = engine.scan(first.next_cursor, None, Some(2)).unwrap();
+        assert_eq!(second.keys, vec!["c".to_string()]);
+        assert_eq!(second.next_cursor, 0);
+
+        fs::remove_dir_all(root).ok();
     }
 }

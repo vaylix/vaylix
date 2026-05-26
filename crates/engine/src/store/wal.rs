@@ -1,24 +1,56 @@
-use crate::{EngineError, Result};
+use crate::{EngineError, Result, WalSyncPolicy};
+use crc32fast::hash;
 use postcard::{Error, from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::OpenOptions,
     io::{ErrorKind, Read, Write},
-    path::PathBuf,
+    path::Path,
 };
 
-const MAX_WAL_ENTRY_SIZE: u32 = 1024 * 1024;
+const MAX_WAL_ENTRY_SIZE: u32 = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WalEntry {
+/// A single operation captured by the write-ahead log.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WalOperation {
+    /// Insert or replace a key/value pair.
     Set { key: String, value: String },
-
+    /// Delete a key and any associated expiration.
     Delete { key: String },
-
+    /// Attach an absolute expiration timestamp to a key.
+    Expire { key: String, expires_at_ms: u64 },
+    /// Remove any expiration from a key.
+    Persist { key: String },
+    /// Clear the entire database.
     Clear,
+    /// Validate and update a numeric string value atomically.
+    CheckInteger { key: String, delta: i64 },
 }
 
-pub fn append(entry: &WalEntry, path: &PathBuf) -> Result<()> {
+/// A durable atomic batch of storage mutations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WalEntry {
+    /// Monotonic sequence number assigned by the engine.
+    pub sequence: u64,
+    /// Entry creation time in unix milliseconds.
+    pub created_at_ms: u64,
+    /// Mutations applied atomically as one logical unit.
+    pub operations: Vec<WalOperation>,
+}
+
+impl WalEntry {
+    /// Builds a new WAL entry.
+    pub fn new(sequence: u64, created_at_ms: u64, operations: Vec<WalOperation>) -> Self {
+        Self {
+            sequence,
+            created_at_ms,
+            operations,
+        }
+    }
+}
+
+/// Appends a WAL entry durably to disk.
+pub fn append(entry: &WalEntry, path: &Path, sync_policy: WalSyncPolicy) -> Result<()> {
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -26,29 +58,32 @@ pub fn append(entry: &WalEntry, path: &PathBuf) -> Result<()> {
         .open(path)?;
 
     let bytes = to_allocvec(entry).map_err(EngineError::WalSerialize)?;
+    let length = u32::try_from(bytes.len())
+        .map_err(|_| EngineError::Io(std::io::Error::other("wal entry too large")))?;
 
-    let length = bytes.len() as u32;
-
+    let checksum = hash(&bytes);
     file.write_all(&length.to_le_bytes())?;
-
+    file.write_all(&checksum.to_le_bytes())?;
     file.write_all(&bytes)?;
-
-    file.flush()?;
+    match sync_policy {
+        WalSyncPolicy::Buffered => {}
+        WalSyncPolicy::Flush => {
+            file.flush()?;
+        }
+        WalSyncPolicy::SyncData => {
+            file.sync_data()?;
+        }
+    }
 
     Ok(())
 }
 
-pub fn replay(path: &PathBuf) -> Result<Vec<WalEntry>> {
+/// Replays the WAL from disk, tolerating a truncated tail entry.
+pub fn replay(path: &Path) -> Result<Vec<WalEntry>> {
     let mut file = match OpenOptions::new().read(true).open(path) {
         Ok(file) => file,
-
-        Err(err) => {
-            if err.kind() == ErrorKind::NotFound {
-                return Ok(Vec::new());
-            }
-
-            return Err(err.into());
-        }
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
     };
 
     let mut entries = Vec::new();
@@ -57,47 +92,41 @@ pub fn replay(path: &PathBuf) -> Result<Vec<WalEntry>> {
         let mut length_buf = [0u8; 4];
 
         match file.read_exact(&mut length_buf) {
-            Ok(_) => {}
-
-            Err(err) => {
-                if err.kind() == std::io::ErrorKind::UnexpectedEof {
-                    break;
-                }
-
-                return Err(err.into());
-            }
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
         }
 
         let length = u32::from_le_bytes(length_buf);
-
         if length == 0 || length > MAX_WAL_ENTRY_SIZE {
             break;
         }
 
+        let mut checksum_buf = [0u8; 4];
+        match file.read_exact(&mut checksum_buf) {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
+        }
+        let expected_checksum = u32::from_le_bytes(checksum_buf);
+
         let mut entry_buf = vec![0u8; length as usize];
-
         match file.read_exact(&mut entry_buf) {
-            Ok(_) => {}
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::UnexpectedEof => break,
+            Err(err) => return Err(err.into()),
+        }
 
-            Err(err) => {
-                if err.kind() == ErrorKind::UnexpectedEof {
-                    break;
-                }
-
-                return Err(err.into());
-            }
+        if hash(&entry_buf) != expected_checksum {
+            return Err(EngineError::ChecksumMismatch {
+                resource: "wal entry",
+            });
         }
 
         let entry: WalEntry = match from_bytes(&entry_buf) {
             Ok(value) => value,
-
-            Err(Error::DeserializeUnexpectedEnd) => {
-                break;
-            }
-
-            Err(err) => {
-                return Err(EngineError::WalDeserialize(err));
-            }
+            Err(Error::DeserializeUnexpectedEnd) => break,
+            Err(err) => return Err(EngineError::WalDeserialize(err)),
         };
 
         entries.push(entry);
@@ -106,16 +135,21 @@ pub fn replay(path: &PathBuf) -> Result<Vec<WalEntry>> {
     Ok(entries)
 }
 
-pub fn truncate(path: &PathBuf) -> Result<()> {
-    let file = OpenOptions::new().create(true).write(true).open(path)?;
+/// Truncates the WAL after a durable snapshot has been written.
+pub fn truncate(path: &Path) -> Result<()> {
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(path)?;
 
     file.set_len(0)?;
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    use crc32fast::hash;
     use std::fs::{self, OpenOptions};
     use std::io::Write;
     use std::path::PathBuf;
@@ -123,7 +157,8 @@ mod tests {
 
     use postcard::to_allocvec;
 
-    use super::{WalEntry, append, replay, truncate};
+    use super::{WalEntry, WalOperation, append, replay, truncate};
+    use crate::WalSyncPolicy;
 
     fn temp_path(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -133,36 +168,45 @@ mod tests {
         std::env::temp_dir().join(format!("veyra-{name}-{unique}.wal"))
     }
 
+    fn sample_entry(sequence: u64) -> WalEntry {
+        WalEntry::new(
+            sequence,
+            111,
+            vec![WalOperation::Set {
+                key: "name".to_string(),
+                value: "alice".to_string(),
+            }],
+        )
+    }
+
     #[test]
     fn appends_and_replays_entries() {
         let path = temp_path("wal-round-trip");
 
+        append(&sample_entry(1), &path, WalSyncPolicy::Flush).unwrap();
         append(
-            &WalEntry::Set {
-                key: "name".to_string(),
-                value: "alice".to_string(),
-            },
+            &WalEntry::new(
+                2,
+                112,
+                vec![
+                    WalOperation::Delete {
+                        key: "old".to_string(),
+                    },
+                    WalOperation::Persist {
+                        key: "persisted".to_string(),
+                    },
+                ],
+            ),
             &path,
+            WalSyncPolicy::Flush,
         )
         .unwrap();
-        append(
-            &WalEntry::Delete {
-                key: "old".to_string(),
-            },
-            &path,
-        )
-        .unwrap();
-        append(&WalEntry::Clear, &path).unwrap();
 
         let entries = replay(&path).unwrap();
 
-        assert_eq!(entries.len(), 3);
-        assert!(matches!(
-            &entries[0],
-            WalEntry::Set { key, value } if key == "name" && value == "alice"
-        ));
-        assert!(matches!(&entries[1], WalEntry::Delete { key } if key == "old"));
-        assert!(matches!(&entries[2], WalEntry::Clear));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].sequence, 1);
+        assert_eq!(entries[1].sequence, 2);
 
         fs::remove_file(path).ok();
     }
@@ -171,17 +215,11 @@ mod tests {
     fn replay_ignores_truncated_tail() {
         let path = temp_path("wal-truncated");
 
-        append(
-            &WalEntry::Set {
-                key: "name".to_string(),
-                value: "alice".to_string(),
-            },
-            &path,
-        )
-        .unwrap();
+        append(&sample_entry(1), &path, WalSyncPolicy::Flush).unwrap();
 
         let mut file = OpenOptions::new().append(true).open(&path).unwrap();
         file.write_all(&10_u32.to_le_bytes()).unwrap();
+        file.write_all(&123_u32.to_le_bytes()).unwrap();
         file.write_all(b"short").unwrap();
         file.flush().unwrap();
 
@@ -213,13 +251,19 @@ mod tests {
             .truncate(true)
             .open(&corrupt_path)
             .unwrap();
-        let valid = to_allocvec(&WalEntry::Clear).unwrap();
+        let valid = to_allocvec(&sample_entry(1)).unwrap();
         corrupt_file
             .write_all(&(valid.len() as u32).to_le_bytes())
             .unwrap();
+        corrupt_file.write_all(&hash(&valid).to_le_bytes()).unwrap();
         corrupt_file.write_all(&valid).unwrap();
-        corrupt_file.write_all(&1_u32.to_le_bytes()).unwrap();
-        corrupt_file.write_all(&[99]).unwrap();
+        let mut corrupt = to_allocvec(&sample_entry(2)).unwrap();
+        *corrupt.last_mut().unwrap() = 0xff;
+        corrupt_file
+            .write_all(&(corrupt.len() as u32).to_le_bytes())
+            .unwrap();
+        corrupt_file.write_all(&hash(&valid).to_le_bytes()).unwrap();
+        corrupt_file.write_all(&corrupt).unwrap();
         corrupt_file.flush().unwrap();
 
         assert!(replay(&corrupt_path).is_err());
@@ -230,14 +274,7 @@ mod tests {
     fn truncates_wal_file() {
         let path = temp_path("wal-truncate");
 
-        append(
-            &WalEntry::Set {
-                key: "name".to_string(),
-                value: "alice".to_string(),
-            },
-            &path,
-        )
-        .unwrap();
+        append(&sample_entry(1), &path, WalSyncPolicy::Flush).unwrap();
         truncate(&path).unwrap();
 
         let metadata = fs::metadata(&path).unwrap();
