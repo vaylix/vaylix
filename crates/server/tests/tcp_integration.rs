@@ -6,15 +6,17 @@ use command::{Command, Expiration, SetCondition, SetOptions};
 use engine::{Engine, EngineOptions, Paths, WalSyncPolicy};
 use rcgen::generate_simple_self_signed;
 use rustls::pki_types::ServerName;
+use rustls::pki_types::pem::PemObject;
 use rustls::{ClientConfig, RootCertStore};
 use server::Server;
+use server::audit::AuditLogger;
 use server::auth::AuthConfig;
 use server::server::{ServerGuards, ServerRuntimeConfig};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
-use transport::{Request, Status, read_response_from_async, write_request_to_async};
+use transport::{CodecOptions, Request, Status, read_response_from_async, write_request_to_async};
 use uuid::Uuid;
 
 fn temp_dir(name: &str) -> PathBuf {
@@ -62,6 +64,7 @@ async fn authenticate(stream: &mut TcpStream) {
 }
 
 fn runtime(snapshot_interval: Option<Duration>) -> ServerRuntimeConfig {
+    let audit_path = temp_dir("audit").join("audit.log");
     ServerRuntimeConfig {
         snapshot_interval,
         expiration_sweep_interval: None,
@@ -77,6 +80,8 @@ fn runtime(snapshot_interval: Option<Duration>) -> ServerRuntimeConfig {
             request_burst: 400,
         },
         tls_config: None,
+        transport: CodecOptions::default(),
+        audit_logger: std::sync::Arc::new(AuditLogger::open(&audit_path).unwrap()),
     }
 }
 
@@ -313,7 +318,7 @@ async fn accepts_tls_connections_when_enabled() {
     let server_task = tokio::spawn(async move { server.start().await });
 
     let mut roots = RootCertStore::empty();
-    let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+    let cert_der = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .next()
         .unwrap()
         .unwrap();

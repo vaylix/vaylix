@@ -30,6 +30,8 @@ pub enum EngineError {
     InvalidIntegerValue { key: String, value: String },
     #[error("numeric overflow for key '{key}'")]
     NumericOverflow { key: String },
+    #[error("{0}")]
+    UnsupportedCommand(String),
 }
 
 impl EngineError {
@@ -48,6 +50,7 @@ impl EngineError {
             Self::WalDeserialize(_) => "ENG-011",
             Self::InvalidIntegerValue { .. } => "ENG-012",
             Self::NumericOverflow { .. } => "ENG-013",
+            Self::UnsupportedCommand(_) => "ENG-014",
         }
     }
 
@@ -66,6 +69,7 @@ impl EngineError {
             Self::WalDeserialize(_) => "WAL Deserialization Failure",
             Self::InvalidIntegerValue { .. } => "Invalid Integer Value",
             Self::NumericOverflow { .. } => "Numeric Overflow",
+            Self::UnsupportedCommand(_) => "Unsupported Command",
         }
     }
 }

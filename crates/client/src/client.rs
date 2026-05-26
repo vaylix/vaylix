@@ -2,6 +2,7 @@ use crate::helper::ClientHelper;
 use crate::paths::Paths;
 use command::{COMMANDS, Command, Parser};
 use rustls::pki_types::ServerName;
+use rustls::pki_types::{CertificateDer, pem::PemObject};
 use rustls::{ClientConfig as TlsClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use rustyline::Editor;
 use rustyline::config::{Builder, CompletionType, EditMode};
@@ -12,7 +13,9 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
-use transport::{Request, Response, Status, read_response_from, write_request_to};
+use transport::{
+    CodecOptions, Request, Response, Status, read_response_from, write_request_to_with_options,
+};
 use uuid::Uuid;
 
 use crate::error::{ClientError, Result};
@@ -35,6 +38,7 @@ pub struct ClientConfig {
     pub username: Option<String>,
     pub password: Option<String>,
     pub output: OutputMode,
+    pub transport: CodecOptions,
 }
 
 enum ClientStream {
@@ -73,6 +77,7 @@ pub struct Client {
     stream: ClientStream,
     paths: Paths,
     output: OutputMode,
+    transport: CodecOptions,
 }
 
 const PROMPT: &str = "vaylix> ";
@@ -113,6 +118,7 @@ impl Client {
             stream,
             paths,
             output: config.output,
+            transport: config.transport,
         };
 
         if let (Some(username), Some(password)) = (config.username, config.password) {
@@ -178,7 +184,7 @@ impl Client {
     fn execute(&mut self, command: Command) -> Result<()> {
         let request_id = Uuid::now_v7();
         let request = Request::from_command(request_id, command.clone())?;
-        write_request_to(&mut self.stream, &request)?;
+        write_request_to_with_options(&mut self.stream, &request, self.transport)?;
         self.stream.flush()?;
 
         let response = read_response_from(&mut self.stream)?;
@@ -213,9 +219,7 @@ fn build_tls_client_config(ca_cert: Option<&std::path::Path>) -> Result<Arc<TlsC
     let mut roots = RootCertStore::empty();
 
     if let Some(ca_cert) = ca_cert {
-        let cert_bytes = std::fs::read(ca_cert)?;
-        let mut reader = cert_bytes.as_slice();
-        for cert in rustls_pemfile::certs(&mut reader) {
+        for cert in CertificateDer::pem_file_iter(ca_cert).map_err(std::io::Error::other)? {
             roots
                 .add(cert.map_err(std::io::Error::other)?)
                 .map_err(std::io::Error::other)?;
@@ -394,7 +398,7 @@ fn log_event(level: &str, component: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use command::{Command, Expiration, SetCondition, SetOptions};
-    use transport::{Response, Status};
+    use transport::{CodecOptions, Response, Status};
     use uuid::Uuid;
 
     use super::{ClientConfig, OutputMode, help_text, render_response, render_table};
@@ -541,6 +545,7 @@ mod tests {
             username: Some("u".to_string()),
             password: Some("p".to_string()),
             output: OutputMode::Json,
+            transport: CodecOptions::default(),
         };
         assert_eq!(config.output, OutputMode::Json);
         assert!(config.ssl);

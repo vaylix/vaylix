@@ -1,11 +1,27 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+use transport::CompressionMode;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum OutputModeArg {
     Plain,
     Table,
     Json,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CompressionModeArg {
+    None,
+    Zstd,
+}
+
+impl From<CompressionModeArg> for CompressionMode {
+    fn from(value: CompressionModeArg) -> Self {
+        match value {
+            CompressionModeArg::None => CompressionMode::None,
+            CompressionModeArg::Zstd => CompressionMode::Zstd,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -42,4 +58,12 @@ pub struct Args {
     /// Output rendering mode.
     #[arg(long, value_enum, default_value_t = OutputModeArg::Plain)]
     pub output: OutputModeArg,
+
+    /// Compression mode to use for outbound transport frames.
+    #[arg(long, value_enum, default_value_t = CompressionModeArg::None)]
+    pub compression: CompressionModeArg,
+
+    /// Minimum payload size before outbound transport compression is attempted.
+    #[arg(long, default_value_t = 256)]
+    pub compression_threshold_bytes: usize,
 }

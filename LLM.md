@@ -14,6 +14,8 @@ The current implementation is a single-node, string-to-string key/value database
 - a Tokio multi-client server
 - authenticated client connections
 - encrypted-at-rest WAL and snapshots
+- append-only audit logging
+- optional frame-level zstd compression
 - deterministic command parsing and explicit error codes
 
 The long-term target is broader:
@@ -60,6 +62,7 @@ Current state:
 - writes are durable through WAL + snapshot
 - command execution within the engine is serialized through a dedicated engine worker
 - session transactions are queued with `MULTI` / `EXEC` / `DISCARD`
+- `EXEC` commits as one atomic WAL-backed batch on a single node
 
 Not yet true:
 - MVCC
@@ -134,6 +137,7 @@ Supported query parameters:
 - `ssl=true`
 - `output=plain|table|json`
 - `ca_cert=/path/to/ca.pem`
+- `compression=none|zstd`
 
 CLI flags override URL-derived values when both are provided.
 
@@ -173,6 +177,26 @@ Current model:
 
 This is meant to keep persistence concerns under server control rather than exposing raw key material as a CLI requirement.
 
+## Audit Logging
+
+Audit logging is implemented as append-only JSON lines under the data directory by default.
+
+- default path: `<data-dir>/audit.log`
+- optional override: `--audit-log-path`
+
+Each event records:
+- timestamp
+- connection id
+- peer address
+- authenticated username if present
+- request id
+- opcode name
+- response status
+- error code when applicable
+- latency in milliseconds
+
+Passwords and payload contents are not written to the audit log.
+
 ## Scalability Direction
 
 Current state:
@@ -189,23 +213,16 @@ Do not document distributed support as implemented today. It is a roadmap constr
 
 ## Compression Direction
 
-Transport compression is not implemented today.
+Transport compression is implemented as an outbound frame-level setting:
+- mode: `none` or `zstd`
+- configurable compression threshold in bytes
+- readers decompress automatically based on the frame flag
+- frame checksums validate the on-wire compressed payload
 
-Planned approach:
-- negotiate or flag compression at the frame level
-- apply it only above a payload threshold
-- keep checksums and framing valid over the compressed envelope
-- prefer it for large responses and replication streams, not tiny point requests
-
-## Audit Direction
-
-Audit capabilities are not implemented today.
-
-Planned approach:
-- append-only audit log separate from the primary WAL
-- include authenticated user, peer address, request ID, command class, outcome, and timestamp
-- keep audit entries immutable and easy to ship to external collectors
-- never mix audit semantics with user data persistence semantics
+Still missing:
+- compression negotiation
+- compression policy coordination between peers
+- replication-stream tuning
 
 ## Abuse Controls and Runtime Guards
 
@@ -265,10 +282,8 @@ Release workflow goal:
 
 ## Current Gaps
 
-- full ACID semantics are not implemented yet
+- full distributed ACID semantics are not implemented
 - no replication or sharding yet
-- no audit log yet
-- no transport compression yet
 - no ACL or multi-user authorization model
 - no online backup/restore tool in the current tree
 - TLS is optional rather than mandatory

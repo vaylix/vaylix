@@ -9,6 +9,20 @@ pub struct ScanPage {
     pub keys: Vec<String>,
 }
 
+/// Result of evaluating one command inside an atomic transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionResult {
+    Ok,
+    NotFound,
+    Value(String),
+    Boolean(bool),
+    Count(u64),
+    Integer(i64),
+    Entries(Vec<(String, String)>),
+    Strings(Vec<Option<String>>),
+    Scan(ScanPage),
+}
+
 /// Conditional write behavior for `SET`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetCondition {

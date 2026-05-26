@@ -22,6 +22,10 @@ pub enum TransportError {
     CorruptedPayload,
     #[error("frame checksum mismatch")]
     ChecksumMismatch,
+    #[error("unsupported frame flags: 0x{0:02x}")]
+    UnsupportedFlags(u8),
+    #[error("frame compression failure")]
+    CompressionFailure,
     #[error("invalid utf-8 in payload")]
     InvalidUtf8(#[from] std::string::FromUtf8Error),
     #[error("i/o error: {0}")]
@@ -40,8 +44,10 @@ impl TransportError {
             Self::UnexpectedEof => "TRN-007",
             Self::CorruptedPayload => "TRN-008",
             Self::ChecksumMismatch => "TRN-009",
-            Self::InvalidUtf8(_) => "TRN-010",
-            Self::Io(_) => "TRN-011",
+            Self::UnsupportedFlags(_) => "TRN-010",
+            Self::CompressionFailure => "TRN-011",
+            Self::InvalidUtf8(_) => "TRN-012",
+            Self::Io(_) => "TRN-013",
         }
     }
 
@@ -56,6 +62,8 @@ impl TransportError {
             Self::UnexpectedEof => "Unexpected End Of Frame",
             Self::CorruptedPayload => "Corrupted Payload",
             Self::ChecksumMismatch => "Checksum Mismatch",
+            Self::UnsupportedFlags(_) => "Unsupported Frame Flags",
+            Self::CompressionFailure => "Compression Failure",
             Self::InvalidUtf8(_) => "Invalid UTF-8 Payload",
             Self::Io(_) => "Transport I/O Failure",
         }

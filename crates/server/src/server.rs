@@ -11,7 +11,7 @@ use command::{
 };
 use engine::{
     Engine, EngineOptions, Expiration, Paths, ScanPage, SetCondition, SetOptions, SetOutcome,
-    StorageEngine,
+    StorageEngine, TransactionResult,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
@@ -19,10 +19,12 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_rustls::TlsAcceptor;
 use transport::{
-    Request, Response, Status, TransportError, read_request_from_async, write_response_to_async,
+    CodecOptions, Request, Response, Status, TransportError, read_request_from_async,
+    write_response_to_async_with_options,
 };
 use uuid::Uuid;
 
+use crate::audit::{AuditEvent, AuditLogger};
 use crate::auth::AuthConfig;
 use crate::error::{Result, ServerError};
 use crate::metrics::Metrics;
@@ -48,6 +50,8 @@ pub struct ServerRuntimeConfig {
     pub auth_config: AuthConfig,
     pub guards: ServerGuards,
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
+    pub transport: CodecOptions,
+    pub audit_logger: Arc<AuditLogger>,
 }
 
 enum EngineRequest {
@@ -59,7 +63,7 @@ enum EngineRequest {
     ExecuteBatch {
         request_id: Uuid,
         commands: Vec<Command>,
-        respond_to: oneshot::Sender<Result<Vec<std::result::Result<Response, ServerError>>>>,
+        respond_to: oneshot::Sender<Result<Vec<TransactionResult>>>,
     },
     Info {
         respond_to: oneshot::Sender<Result<Vec<(String, String)>>>,
@@ -95,11 +99,11 @@ impl EngineHandle {
                         commands,
                         respond_to,
                     } => {
-                        let mut responses = Vec::with_capacity(commands.len());
-                        for command in commands {
-                            responses.push(execute_command(&mut engine, Uuid::now_v7(), command));
-                        }
-                        let _ = respond_to.send(Ok(responses));
+                        let _ = respond_to.send(
+                            engine
+                                .execute_transaction(&commands)
+                                .map_err(ServerError::from),
+                        );
                     }
                     EngineRequest::Info { respond_to } => {
                         let _ = respond_to.send(engine.info().map_err(ServerError::from));
@@ -133,7 +137,7 @@ impl EngineHandle {
         &self,
         request_id: Uuid,
         commands: Vec<Command>,
-    ) -> Result<Vec<std::result::Result<Response, ServerError>>> {
+    ) -> Result<Vec<TransactionResult>> {
         let (send, recv) = oneshot::channel();
         self.sender
             .send(EngineRequest::ExecuteBatch {
@@ -237,6 +241,17 @@ impl SessionState {
     fn in_transaction(&self) -> bool {
         !self.transaction_queue.is_empty()
     }
+}
+
+struct AuditContext<'a> {
+    connection_id: u64,
+    peer_addr: Option<SocketAddr>,
+    session: &'a SessionState,
+    request_id: Uuid,
+    opcode: &'a str,
+    status: Status,
+    error_code: Option<String>,
+    latency_ms: u128,
 }
 
 impl Server {
@@ -530,6 +545,7 @@ where
             Err(TransportError::UnexpectedEof) => break,
             Err(err) => return Err(err.into()),
         };
+        let started_at = Instant::now();
 
         if !session.rate_limiter.allow() {
             let response = error_response(
@@ -538,7 +554,20 @@ where
                 ServerError::RateLimitExceeded.name(),
                 &ServerError::RateLimitExceeded.to_string(),
             );
-            write_response_to_async(&mut stream, &response).await?;
+            write_response_to_async_with_options(&mut stream, &response, runtime.transport).await?;
+            record_audit_event(
+                &runtime.audit_logger,
+                AuditContext {
+                    connection_id,
+                    peer_addr,
+                    session: &session,
+                    request_id: request.request_id,
+                    opcode: "RATE_LIMIT",
+                    status: response.status,
+                    error_code: Some(ServerError::RateLimitExceeded.code().to_string()),
+                    latency_ms: started_at.elapsed().as_millis(),
+                },
+            );
             continue;
         }
 
@@ -559,14 +588,42 @@ where
             Ok(command) => command,
             Err(err) => {
                 let response = error_response(request_id, err.code(), err.name(), &err.to_string());
-                write_response_to_async(&mut stream, &response).await?;
+                write_response_to_async_with_options(&mut stream, &response, runtime.transport)
+                    .await?;
+                record_audit_event(
+                    &runtime.audit_logger,
+                    AuditContext {
+                        connection_id,
+                        peer_addr,
+                        session: &session,
+                        request_id,
+                        opcode: "DECODE",
+                        status: response.status,
+                        error_code: Some(err.code().to_string()),
+                        latency_ms: started_at.elapsed().as_millis(),
+                    },
+                );
                 continue;
             }
         };
+        let opcode = opcode_name(&command);
 
         if let Err(err) = validate_command(&command, &runtime.guards) {
             let response = error_response(request_id, err.code(), err.name(), &err.to_string());
-            write_response_to_async(&mut stream, &response).await?;
+            write_response_to_async_with_options(&mut stream, &response, runtime.transport).await?;
+            record_audit_event(
+                &runtime.audit_logger,
+                AuditContext {
+                    connection_id,
+                    peer_addr,
+                    session: &session,
+                    request_id,
+                    opcode,
+                    status: response.status,
+                    error_code: Some(err.code().to_string()),
+                    latency_ms: started_at.elapsed().as_millis(),
+                },
+            );
             continue;
         }
 
@@ -584,7 +641,25 @@ where
             Err(err) => error_response(request_id, err.code(), err.name(), &err.to_string()),
         };
 
-        write_response_to_async(&mut stream, &response).await?;
+        let audit_error = if response.status == Status::Error {
+            response.decode_error().ok().map(|payload| payload.code)
+        } else {
+            None
+        };
+        write_response_to_async_with_options(&mut stream, &response, runtime.transport).await?;
+        record_audit_event(
+            &runtime.audit_logger,
+            AuditContext {
+                connection_id,
+                peer_addr,
+                session: &session,
+                request_id,
+                opcode,
+                status: response.status,
+                error_code: audit_error,
+                latency_ms: started_at.elapsed().as_millis(),
+            },
+        );
     }
 
     Ok(())
@@ -758,21 +833,13 @@ async fn handle_transaction_command(
             if matches!(queued.first(), Some(Command::Multi)) {
                 queued.remove(0);
             }
-            let responses = engine.execute_batch(request_id, queued.clone()).await?;
-            let mut rendered = Vec::with_capacity(responses.len());
-            for (queued_command, response) in queued.iter().zip(responses) {
-                match response {
-                    Ok(response) => rendered.push(Some(render_transaction_response(
-                        queued_command,
-                        &response,
-                    )?)),
-                    Err(err) => rendered.push(Some(format!(
-                        "ERROR [{}] {}: {}",
-                        err.code(),
-                        err.name(),
-                        err
-                    ))),
-                }
+            for command in &queued {
+                validate_transaction_command(command)?;
+            }
+            let results = engine.execute_batch(request_id, queued.clone()).await?;
+            let mut rendered = Vec::with_capacity(results.len());
+            for (queued_command, result) in queued.iter().zip(results) {
+                rendered.push(Some(render_transaction_result(queued_command, result)?));
             }
             metrics
                 .transactions_committed
@@ -785,6 +852,7 @@ async fn handle_transaction_command(
                 return Err(ServerError::QuotaExceeded);
             }
             validate_command(&other, &runtime.guards)?;
+            validate_transaction_command(&other)?;
             session.transaction_queue.push(other);
             Ok(Response::value(request_id, "QUEUED")?)
         }
@@ -896,67 +964,45 @@ where
     }
 }
 
-fn render_transaction_response(command: &Command, response: &Response) -> Result<String> {
-    match response.status {
-        Status::NotFound => Ok("NOT_FOUND".to_string()),
-        Status::Error => {
-            let error = response.decode_error()?;
-            Ok(format!(
-                "ERROR [{}] {}: {}",
-                error.code, error.name, error.message
-            ))
-        }
-        Status::Ok => match command {
-            Command::Ping { .. }
-            | Command::Get { .. }
-            | Command::GetDel { .. }
-            | Command::GetEx { .. } => response.decode_value().map_err(ServerError::from),
-            Command::Set { options, .. } => {
-                if options.return_previous {
-                    response.decode_value().map_err(ServerError::from)
-                } else if options.condition.is_some() {
-                    Ok(response.decode_bool()?.to_string())
-                } else {
-                    Ok("OK".to_string())
-                }
-            }
-            Command::SetNx { .. }
-            | Command::Exists { .. }
-            | Command::Expire { .. }
-            | Command::Persist { .. }
-            | Command::Rename { .. }
-            | Command::RenameNx { .. } => Ok(response.decode_bool()?.to_string()),
-            Command::MSet { .. } | Command::Clear | Command::Save | Command::Snapshot => {
-                Ok("OK".to_string())
-            }
-            Command::MGet { .. } => Ok(response
-                .decode_strings()?
-                .into_iter()
-                .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
-                .collect::<Vec<_>>()
-                .join(", ")),
-            Command::Delete { .. } | Command::DbSize | Command::Count => {
-                Ok(response.decode_count()?.to_string())
-            }
-            Command::Incr { .. } | Command::Decr { .. } | Command::Ttl { .. } => {
-                Ok(response.decode_integer()?.to_string())
-            }
-            Command::Scan { .. } => {
-                let scan = response.decode_scan()?;
-                Ok(format!(
-                    "cursor={}, keys=[{}]",
-                    scan.next_cursor,
-                    scan.keys.join(", ")
-                ))
-            }
-            Command::Info | Command::Metrics | Command::List => Ok(response
-                .decode_entries()?
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect::<Vec<_>>()
-                .join(", ")),
-            _ => Ok("OK".to_string()),
-        },
+fn render_transaction_result(_command: &Command, result: TransactionResult) -> Result<String> {
+    match result {
+        TransactionResult::Ok => Ok("OK".to_string()),
+        TransactionResult::NotFound => Ok("NOT_FOUND".to_string()),
+        TransactionResult::Value(value) => Ok(value),
+        TransactionResult::Boolean(value) => Ok(value.to_string()),
+        TransactionResult::Count(value) => Ok(value.to_string()),
+        TransactionResult::Integer(value) => Ok(value.to_string()),
+        TransactionResult::Entries(entries) => Ok(entries
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(", ")),
+        TransactionResult::Strings(values) => Ok(values
+            .into_iter()
+            .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ")),
+        TransactionResult::Scan(scan) => Ok(format!(
+            "cursor={}, keys=[{}]",
+            scan.next_cursor,
+            scan.keys.join(", ")
+        )),
+    }
+}
+
+fn validate_transaction_command(command: &Command) -> Result<()> {
+    match command {
+        Command::Info
+        | Command::Metrics
+        | Command::Save
+        | Command::Snapshot
+        | Command::Auth { .. }
+        | Command::Help
+        | Command::Exit
+        | Command::Multi
+        | Command::Exec
+        | Command::Discard => Err(ServerError::UnsupportedRemoteCommand),
+        _ => Ok(()),
     }
 }
 
@@ -1024,6 +1070,68 @@ fn log_connection_event(
     }
 }
 
+fn opcode_name(command: &Command) -> &'static str {
+    match command {
+        Command::Auth { .. } => "AUTH",
+        Command::Ping { .. } => "PING",
+        Command::Get { .. } => "GET",
+        Command::GetDel { .. } => "GETDEL",
+        Command::GetEx { .. } => "GETEX",
+        Command::Set { .. } => "SET",
+        Command::SetNx { .. } => "SETNX",
+        Command::MGet { .. } => "MGET",
+        Command::MSet { .. } => "MSET",
+        Command::Delete { .. } => "DEL",
+        Command::Exists { .. } => "EXISTS",
+        Command::Incr { .. } => "INCR",
+        Command::Decr { .. } => "DECR",
+        Command::Expire { .. } => "EXPIRE",
+        Command::Ttl { .. } => "TTL",
+        Command::Persist { .. } => "PERSIST",
+        Command::Rename { .. } => "RENAME",
+        Command::RenameNx { .. } => "RENAMENX",
+        Command::Scan { .. } => "SCAN",
+        Command::DbSize => "DBSIZE",
+        Command::Info => "INFO",
+        Command::Metrics => "METRICS",
+        Command::List => "LIST",
+        Command::Clear => "CLEAR",
+        Command::Count => "COUNT",
+        Command::Save => "SAVE",
+        Command::Snapshot => "SNAPSHOT",
+        Command::Multi => "MULTI",
+        Command::Exec => "EXEC",
+        Command::Discard => "DISCARD",
+        Command::Help => "HELP",
+        Command::Exit => "EXIT",
+    }
+}
+
+fn record_audit_event(logger: &AuditLogger, context: AuditContext<'_>) {
+    let _ = logger.record(&AuditEvent {
+        timestamp_ms: current_time_millis(),
+        connection_id: context.connection_id,
+        peer: context.peer_addr.map(|addr| addr.to_string()),
+        username: context.session.authenticated_user.clone(),
+        request_id: context.request_id.to_string(),
+        opcode: context.opcode.to_string(),
+        status: match context.status {
+            Status::Ok => "ok".to_string(),
+            Status::Error => "error".to_string(),
+            Status::NotFound => "not_found".to_string(),
+        },
+        error_code: context.error_code,
+        latency_ms: context.latency_ms,
+    });
+}
+
+fn current_time_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_millis() as u64
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1033,6 +1141,7 @@ mod tests {
         RateLimiter, ServerGuards, SessionState, error_response, execute_command, handle_auth,
         handle_transaction_command, validate_command,
     };
+    use crate::audit::AuditLogger;
     use crate::auth::AuthConfig;
     use crate::metrics::Metrics;
     use crate::server::{EngineHandle, ServerRuntimeConfig};
@@ -1044,7 +1153,7 @@ mod tests {
         Engine, Expiration, Paths, Result, ScanPage, SetCondition, SetOptions, SetOutcome,
         StorageEngine, StorageKey, StorageKeyring, WalSyncPolicy,
     };
-    use transport::{Response, Status};
+    use transport::{CodecOptions, Response, Status};
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -1090,6 +1199,7 @@ mod tests {
     }
 
     fn runtime() -> ServerRuntimeConfig {
+        let audit_path = temp_dir("audit").join("audit.log");
         ServerRuntimeConfig {
             snapshot_interval: None,
             expiration_sweep_interval: None,
@@ -1097,6 +1207,8 @@ mod tests {
             auth_config: AuthConfig::new("dbuser".to_string(), "secret".to_string()).unwrap(),
             guards: guards(),
             tls_config: None,
+            transport: CodecOptions::default(),
+            audit_logger: Arc::new(AuditLogger::open(&audit_path).unwrap()),
         }
     }
 

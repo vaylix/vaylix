@@ -5,17 +5,21 @@ pub mod constants;
 pub mod error;
 pub mod frame;
 pub mod opcode;
+pub mod options;
 pub mod request;
 pub mod response;
 
 pub use codec::{
-    decode_request, decode_response, encode_request, encode_response, read_request_from,
-    read_request_from_async, read_response_from, read_response_from_async, write_request_to,
-    write_request_to_async, write_response_to, write_response_to_async,
+    decode_request, decode_response, encode_request, encode_request_with_options, encode_response,
+    encode_response_with_options, read_request_from, read_request_from_async, read_response_from,
+    read_response_from_async, write_request_to, write_request_to_async,
+    write_request_to_async_with_options, write_request_to_with_options, write_response_to,
+    write_response_to_async, write_response_to_async_with_options, write_response_to_with_options,
 };
 pub use constants::{FLAGS_NONE, MAGIC, MAGIC_BYTES, MAX_FRAME_LEN, VERSION};
 pub use error::{Result, TransportError};
 pub use frame::FrameHeader;
 pub use opcode::Opcode;
+pub use options::{CodecOptions, CompressionMode};
 pub use request::Request;
 pub use response::{ErrorPayload, Response, ScanPayload, Status};

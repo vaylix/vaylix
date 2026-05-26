@@ -98,8 +98,6 @@ Contributors should not overstate current capability. The codebase is still:
 - single-node
 - string-value only
 - without replication or sharding
-- without full ACID isolation guarantees
-- without audit logging
-- without transport compression
+- without distributed ACID guarantees
 
 Work that improves those areas is welcome, but it should be described as implementation work toward the roadmap, not as already-delivered capability.

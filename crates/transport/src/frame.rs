@@ -1,6 +1,8 @@
 use bytes::{Buf, BufMut, BytesMut};
 
-use crate::constants::{FLAGS_NONE, HEADER_LEN, MAGIC, MAX_FRAME_LEN, VERSION};
+use crate::constants::{
+    FLAG_COMPRESSED_ZSTD, FLAGS_NONE, HEADER_LEN, MAGIC, MAX_FRAME_LEN, VERSION,
+};
 use crate::error::{Result, TransportError};
 
 /// Header metadata for a framed transport packet.
@@ -70,6 +72,10 @@ impl FrameHeader {
                 length: length as usize,
                 max: MAX_FRAME_LEN,
             });
+        }
+
+        if flags & !FLAG_COMPRESSED_ZSTD != 0 {
+            return Err(TransportError::UnsupportedFlags(flags));
         }
 
         Ok(Self {

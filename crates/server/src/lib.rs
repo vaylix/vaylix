@@ -1,4 +1,5 @@
 pub mod args;
+pub mod audit;
 pub mod auth;
 pub mod error;
 pub mod metrics;

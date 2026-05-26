@@ -21,13 +21,14 @@ Implemented today:
 - request rate limiting and command quotas
 - REPL client with `plain`, `table`, and `json` output
 - session transaction commands: `MULTI`, `EXEC`, `DISCARD`
+- atomic single-node `EXEC` commits
+- append-only audit logging
+- optional zstd transport compression
 
 Not implemented yet:
 - replication
 - sharding
-- full ACID isolation semantics
-- audit logging
-- transport compression
+- distributed ACID semantics
 
 ## Workspace
 
@@ -94,6 +95,17 @@ cargo run -p client -- \
   --tls-ca-cert ./certs/ca.crt
 ```
 
+Enable outbound transport compression:
+
+```bash
+cargo run -p server -- \
+  --compression zstd \
+  --compression-threshold-bytes 256
+
+cargo run -p client -- \
+  --url 'vaylix://vaylix:vaylix@127.0.0.1:9173?compression=zstd'
+```
+
 ## Docker Persistence
 
 The server stores durable state under `/var/lib/vaylix`. Mount that path for persistence:
@@ -107,13 +119,14 @@ docker run \
   ghcr.io/<owner>/vaylix:latest
 ```
 
-The data directory contains the snapshot, WAL, manifest, and server-managed storage keyring.
+The data directory contains the snapshot, WAL, manifest, server-managed storage keyring, and `audit.log`.
 
 ## Security and Operational Notes
 
 - Authentication is mandatory.
 - TLS is supported but opt-in.
 - At-rest encryption is managed by the server; there is no raw `--data-key` flag.
+- Audit logging is enabled by default under the data directory.
 - Development defaults are convenient, not production-safe.
 
 ## Quality Gates
@@ -134,7 +147,7 @@ Vaylix is being shaped for a larger future system. That means current changes sh
 - replication
 - sharding
 - stronger transactional guarantees
-- audit logging
-- transport compression
+- richer audit pipelines
+- transport compression negotiation
 
 The authoritative project context lives in [LLM.md](LLM.md).

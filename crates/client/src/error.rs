@@ -19,6 +19,8 @@ pub enum ClientError {
     ResponseIdMismatch { expected: Uuid, actual: Uuid },
     #[error("local command should not receive a response")]
     LocalCommandResponse,
+    #[error("invalid client configuration: {0}")]
+    InvalidConfiguration(&'static str),
 }
 
 impl ClientError {
@@ -31,6 +33,7 @@ impl ClientError {
             Self::ProjectDirsUnavailable => "CLI-005",
             Self::ResponseIdMismatch { .. } => "CLI-006",
             Self::LocalCommandResponse => "CLI-007",
+            Self::InvalidConfiguration(_) => "CLI-008",
         }
     }
 
@@ -43,6 +46,7 @@ impl ClientError {
             Self::ProjectDirsUnavailable => "Project Directories Unavailable",
             Self::ResponseIdMismatch { .. } => "Response Id Mismatch",
             Self::LocalCommandResponse => "Local Command Response",
+            Self::InvalidConfiguration(_) => "Invalid Client Configuration",
         }
     }
 }

@@ -1,5 +1,6 @@
 use clap::Parser;
 use server::{Args, Server, WalSyncMode};
+use transport::CodecOptions;
 
 const BANNER: &str = r#"        
         ■ ■ ■
@@ -47,8 +48,16 @@ async fn try_main() -> server::Result<()> {
             .ok_or(server::ServerError::TlsConfiguration)?;
         Some(server::tls::load_server_config(cert, key)?)
     } else {
+        if args.tls_cert.is_some() || args.tls_key.is_some() {
+            return Err(server::ServerError::TlsConfiguration);
+        }
         None
     };
+    let audit_log_path = args
+        .audit_log_path
+        .clone()
+        .unwrap_or_else(|| paths.data_dir.join("audit.log"));
+    let audit_logger = server::audit::AuditLogger::open(&audit_log_path)?;
     let runtime = server::server::ServerRuntimeConfig {
         snapshot_interval: args
             .snapshot_interval_seconds
@@ -70,6 +79,11 @@ async fn try_main() -> server::Result<()> {
             request_burst: args.request_burst,
         },
         tls_config,
+        transport: CodecOptions {
+            compression: args.compression.into(),
+            compression_threshold_bytes: args.compression_threshold_bytes,
+        },
+        audit_logger: std::sync::Arc::new(audit_logger),
     };
     let server = Server::new(
         args.bind,

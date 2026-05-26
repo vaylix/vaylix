@@ -1,5 +1,6 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+use transport::CompressionMode;
 
 use crate::auth::{DEFAULT_PASSWORD, DEFAULT_USERNAME};
 
@@ -12,6 +13,22 @@ pub enum WalSyncMode {
     Flush,
     /// Force the kernel to sync written data after each append.
     Sync,
+}
+
+/// CLI-friendly transport compression modes.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CompressionModeArg {
+    None,
+    Zstd,
+}
+
+impl From<CompressionModeArg> for CompressionMode {
+    fn from(value: CompressionModeArg) -> Self {
+        match value {
+            CompressionModeArg::None => CompressionMode::None,
+            CompressionModeArg::Zstd => CompressionMode::Zstd,
+        }
+    }
 }
 
 /// Command-line arguments for the Vaylix server binary.
@@ -47,11 +64,11 @@ pub struct Args {
     pub ssl: bool,
 
     /// PEM-encoded TLS certificate chain used when SSL is enabled.
-    #[arg(long)]
+    #[arg(long, requires = "ssl")]
     pub tls_cert: Option<PathBuf>,
 
     /// PEM-encoded PKCS#8 or RSA private key used when SSL is enabled.
-    #[arg(long)]
+    #[arg(long, requires = "ssl")]
     pub tls_key: Option<PathBuf>,
 
     /// Optional data directory override. This is the directory that should be mounted in containers.
@@ -97,4 +114,16 @@ pub struct Args {
     /// Burst size for the per-connection request limiter.
     #[arg(long, default_value_t = 400)]
     pub request_burst: u32,
+
+    /// Compression mode used for outbound transport frames.
+    #[arg(long, value_enum, default_value_t = CompressionModeArg::None)]
+    pub compression: CompressionModeArg,
+
+    /// Minimum payload size before outbound transport compression is attempted.
+    #[arg(long, default_value_t = 256)]
+    pub compression_threshold_bytes: usize,
+
+    /// Optional audit log path override. Defaults to <data-dir>/audit.log.
+    #[arg(long)]
+    pub audit_log_path: Option<PathBuf>,
 }

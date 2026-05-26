@@ -2,6 +2,7 @@ use crate::EngineMetadata;
 use crate::config::EngineOptions;
 use crate::engine::{
     EngineState, Expiration, ScanPage, SetCondition, SetOptions, SetOutcome, StorageEngine,
+    TransactionResult,
 };
 use crate::error::Result;
 use crate::paths::Paths;
@@ -9,6 +10,7 @@ use crate::store::{
     Manifest, WalEntry, WalOperation, append, deserialize, keyring, load, load_manifest, replay,
     save, save_manifest, serialize, truncate,
 };
+use command::Command;
 use crc32fast::hash;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -167,6 +169,389 @@ impl Engine {
     fn maybe_get_existing_value(&mut self, key: &str) -> Option<String> {
         self.state.purge_expired(self.now());
         self.state.data.get(key).cloned()
+    }
+
+    fn map_command_expiration(expiration: Option<command::Expiration>) -> Option<Expiration> {
+        expiration.map(|expiration| match expiration {
+            command::Expiration::Ex(value) => Expiration::Seconds(value),
+            command::Expiration::Px(value) => Expiration::Milliseconds(value),
+        })
+    }
+
+    fn map_command_set_options(options: command::SetOptions) -> SetOptions {
+        SetOptions {
+            condition: options.condition.map(|condition| match condition {
+                command::SetCondition::Nx => SetCondition::Nx,
+                command::SetCondition::Xx => SetCondition::Xx,
+            }),
+            expiration: Self::map_command_expiration(options.expiration),
+            keep_ttl: options.keep_ttl,
+        }
+    }
+
+    /// Executes a queue of data commands as one serializable single-node transaction.
+    pub fn execute_transaction(&mut self, commands: &[Command]) -> Result<Vec<TransactionResult>> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+        let mut working = self.state.clone();
+        let mut operations = Vec::new();
+        let mut results = Vec::with_capacity(commands.len());
+
+        for command in commands {
+            results.push(self.evaluate_transaction_command(
+                &mut working,
+                now_ms,
+                &mut operations,
+                command,
+            )?);
+        }
+
+        if operations.is_empty() {
+            self.state = working;
+            return Ok(results);
+        }
+
+        let entry = self.next_entry(operations);
+        append(
+            &entry,
+            &self.paths.wal_path,
+            self.options.wal_sync,
+            self.options.keyring.as_ref(),
+        )?;
+        self.state.apply_entry(&entry)?;
+
+        Ok(results)
+    }
+
+    fn evaluate_transaction_command(
+        &self,
+        state: &mut EngineState,
+        now_ms: u64,
+        operations: &mut Vec<WalOperation>,
+        command: &Command,
+    ) -> Result<TransactionResult> {
+        state.purge_expired(now_ms);
+
+        match command {
+            Command::Ping { message } => Ok(TransactionResult::Value(
+                message.clone().unwrap_or_else(|| "PONG".to_string()),
+            )),
+            Command::Get { key } => Ok(match state.data.get(key).cloned() {
+                Some(value) => TransactionResult::Value(value),
+                None => TransactionResult::NotFound,
+            }),
+            Command::GetDel { key } => {
+                let value = state.data.remove(key);
+                state.expirations.remove(key);
+                match value {
+                    Some(value) => {
+                        operations.push(WalOperation::Delete { key: key.clone() });
+                        Ok(TransactionResult::Value(value))
+                    }
+                    None => Ok(TransactionResult::NotFound),
+                }
+            }
+            Command::GetEx {
+                key,
+                expiration,
+                persist,
+            } => {
+                let Some(value) = state.data.get(key).cloned() else {
+                    return Ok(TransactionResult::NotFound);
+                };
+                if let Some(expiration) = Self::map_command_expiration(*expiration) {
+                    let expires_at_ms = Self::resolve_expiration(now_ms, expiration);
+                    if expires_at_ms <= now_ms {
+                        state.data.remove(key);
+                        state.expirations.remove(key);
+                        operations.push(WalOperation::Delete { key: key.clone() });
+                    } else {
+                        state.expirations.insert(key.clone(), expires_at_ms);
+                        operations.push(WalOperation::Expire {
+                            key: key.clone(),
+                            expires_at_ms,
+                        });
+                    }
+                } else if *persist && state.expirations.remove(key).is_some() {
+                    operations.push(WalOperation::Persist { key: key.clone() });
+                }
+                Ok(TransactionResult::Value(value))
+            }
+            Command::Set {
+                key,
+                value,
+                options,
+            } => {
+                let previous = state.data.get(key).cloned();
+                let previous_expiration = state.expirations.get(key).copied();
+                let mapped = Self::map_command_set_options(options.clone());
+                let allowed = match mapped.condition {
+                    Some(SetCondition::Nx) => previous.is_none(),
+                    Some(SetCondition::Xx) => previous.is_some(),
+                    None => true,
+                };
+                if !allowed {
+                    return Ok(if options.return_previous {
+                        TransactionResult::NotFound
+                    } else if options.condition.is_some() {
+                        TransactionResult::Boolean(false)
+                    } else {
+                        TransactionResult::Ok
+                    });
+                }
+
+                state.data.insert(key.clone(), value.clone());
+                state.expirations.remove(key);
+                operations.push(WalOperation::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+
+                if let Some(expiration) = mapped.expiration {
+                    let expires_at_ms = Self::resolve_expiration(now_ms, expiration);
+                    if expires_at_ms <= now_ms {
+                        state.data.remove(key);
+                        state.expirations.remove(key);
+                        operations.push(WalOperation::Delete { key: key.clone() });
+                    } else {
+                        state.expirations.insert(key.clone(), expires_at_ms);
+                        operations.push(WalOperation::Expire {
+                            key: key.clone(),
+                            expires_at_ms,
+                        });
+                    }
+                } else if mapped.keep_ttl
+                    && let Some(expires_at_ms) = previous_expiration
+                {
+                    state.expirations.insert(key.clone(), expires_at_ms);
+                    operations.push(WalOperation::Expire {
+                        key: key.clone(),
+                        expires_at_ms,
+                    });
+                }
+
+                Ok(if options.return_previous {
+                    previous
+                        .map(TransactionResult::Value)
+                        .unwrap_or(TransactionResult::NotFound)
+                } else if options.condition.is_some() {
+                    TransactionResult::Boolean(true)
+                } else {
+                    TransactionResult::Ok
+                })
+            }
+            Command::SetNx { key, value } => {
+                if state.data.contains_key(key) {
+                    return Ok(TransactionResult::Boolean(false));
+                }
+                state.data.insert(key.clone(), value.clone());
+                state.expirations.remove(key);
+                operations.push(WalOperation::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                });
+                Ok(TransactionResult::Boolean(true))
+            }
+            Command::MGet { keys } => Ok(TransactionResult::Strings(
+                keys.iter()
+                    .map(|key| state.data.get(key).cloned())
+                    .collect(),
+            )),
+            Command::MSet { entries } => {
+                for (key, value) in entries {
+                    state.data.insert(key.clone(), value.clone());
+                    state.expirations.remove(key);
+                    operations.push(WalOperation::Set {
+                        key: key.clone(),
+                        value: value.clone(),
+                    });
+                }
+                Ok(TransactionResult::Ok)
+            }
+            Command::Delete { keys } => {
+                let mut removed = 0_u64;
+                for key in keys {
+                    if state.data.remove(key).is_some() {
+                        removed += 1;
+                        state.expirations.remove(key);
+                        operations.push(WalOperation::Delete { key: key.clone() });
+                    }
+                }
+                Ok(TransactionResult::Count(removed))
+            }
+            Command::Exists { key } => Ok(TransactionResult::Boolean(state.data.contains_key(key))),
+            Command::Incr { key } => {
+                let current = state
+                    .data
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_string());
+                let parsed = current.parse::<i64>().map_err(|_| {
+                    crate::EngineError::InvalidIntegerValue {
+                        key: key.clone(),
+                        value: current.clone(),
+                    }
+                })?;
+                let next = parsed
+                    .checked_add(1)
+                    .ok_or_else(|| crate::EngineError::NumericOverflow { key: key.clone() })?;
+                state.data.insert(key.clone(), next.to_string());
+                state.expirations.remove(key);
+                operations.push(WalOperation::CheckInteger {
+                    key: key.clone(),
+                    delta: 1,
+                });
+                Ok(TransactionResult::Integer(next))
+            }
+            Command::Decr { key } => {
+                let current = state
+                    .data
+                    .get(key)
+                    .cloned()
+                    .unwrap_or_else(|| "0".to_string());
+                let parsed = current.parse::<i64>().map_err(|_| {
+                    crate::EngineError::InvalidIntegerValue {
+                        key: key.clone(),
+                        value: current.clone(),
+                    }
+                })?;
+                let next = parsed
+                    .checked_sub(1)
+                    .ok_or_else(|| crate::EngineError::NumericOverflow { key: key.clone() })?;
+                state.data.insert(key.clone(), next.to_string());
+                state.expirations.remove(key);
+                operations.push(WalOperation::CheckInteger {
+                    key: key.clone(),
+                    delta: -1,
+                });
+                Ok(TransactionResult::Integer(next))
+            }
+            Command::Expire { key, seconds } => {
+                if !state.data.contains_key(key) {
+                    return Ok(TransactionResult::Boolean(false));
+                }
+                if *seconds == 0 {
+                    state.data.remove(key);
+                    state.expirations.remove(key);
+                    operations.push(WalOperation::Delete { key: key.clone() });
+                    return Ok(TransactionResult::Boolean(true));
+                }
+                let expires_at_ms = now_ms.saturating_add(seconds.saturating_mul(1_000));
+                state.expirations.insert(key.clone(), expires_at_ms);
+                operations.push(WalOperation::Expire {
+                    key: key.clone(),
+                    expires_at_ms,
+                });
+                Ok(TransactionResult::Boolean(true))
+            }
+            Command::Ttl { key } => Ok(TransactionResult::Integer(state.ttl_for(key, now_ms))),
+            Command::Persist { key } => {
+                let removed =
+                    state.expirations.remove(key).is_some() && state.data.contains_key(key);
+                if removed {
+                    operations.push(WalOperation::Persist { key: key.clone() });
+                }
+                Ok(TransactionResult::Boolean(removed))
+            }
+            Command::Rename {
+                source,
+                destination,
+            } => {
+                let Some(value) = state.data.remove(source) else {
+                    return Ok(TransactionResult::Boolean(false));
+                };
+                let source_ttl = state.expirations.remove(source);
+                state.data.insert(destination.clone(), value.clone());
+                state.expirations.remove(destination);
+                operations.push(WalOperation::Delete {
+                    key: source.clone(),
+                });
+                operations.push(WalOperation::Set {
+                    key: destination.clone(),
+                    value,
+                });
+                if let Some(expires_at_ms) = source_ttl {
+                    state.expirations.insert(destination.clone(), expires_at_ms);
+                    operations.push(WalOperation::Expire {
+                        key: destination.clone(),
+                        expires_at_ms,
+                    });
+                }
+                Ok(TransactionResult::Boolean(true))
+            }
+            Command::RenameNx {
+                source,
+                destination,
+            } => {
+                if state.data.contains_key(destination) {
+                    return Ok(TransactionResult::Boolean(false));
+                }
+                self.evaluate_transaction_command(
+                    state,
+                    now_ms,
+                    operations,
+                    &Command::Rename {
+                        source: source.clone(),
+                        destination: destination.clone(),
+                    },
+                )
+            }
+            Command::Scan {
+                cursor,
+                pattern,
+                count,
+            } => {
+                let mut keys = state.live_keys(now_ms);
+                if let Some(pattern) = pattern.as_deref() {
+                    keys.retain(|key| wildcard_matches(pattern, key));
+                }
+                if keys.is_empty() {
+                    return Ok(TransactionResult::Scan(ScanPage {
+                        next_cursor: 0,
+                        keys: Vec::new(),
+                    }));
+                }
+                let start = usize::try_from(*cursor).unwrap_or(usize::MAX);
+                if start >= keys.len() {
+                    return Ok(TransactionResult::Scan(ScanPage {
+                        next_cursor: 0,
+                        keys: Vec::new(),
+                    }));
+                }
+                let limit = usize::from(count.unwrap_or(DEFAULT_SCAN_COUNT as u16)).max(1);
+                let end = (start + limit).min(keys.len());
+                let next_cursor = if end >= keys.len() { 0 } else { end as u64 };
+                Ok(TransactionResult::Scan(ScanPage {
+                    next_cursor,
+                    keys: keys[start..end].to_vec(),
+                }))
+            }
+            Command::DbSize | Command::Count => {
+                Ok(TransactionResult::Count(state.data.len() as u64))
+            }
+            Command::List => Ok(TransactionResult::Entries(state.live_entries(now_ms))),
+            Command::Clear => {
+                if state.data.is_empty() && state.expirations.is_empty() {
+                    return Ok(TransactionResult::Ok);
+                }
+                state.data.clear();
+                state.expirations.clear();
+                operations.push(WalOperation::Clear);
+                Ok(TransactionResult::Ok)
+            }
+            Command::Info
+            | Command::Metrics
+            | Command::Save
+            | Command::Snapshot
+            | Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::Auth { .. }
+            | Command::Help
+            | Command::Exit => Err(crate::EngineError::UnsupportedCommand(
+                "command is not supported inside transactions".to_string(),
+            )),
+        }
     }
 }
 
@@ -615,6 +1000,7 @@ mod tests {
         EngineOptions, Expiration, Paths, SetCondition, SetOptions, StorageEngine, StorageKey,
         StorageKeyring, WalSyncPolicy,
     };
+    use command::Command;
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -833,6 +1219,26 @@ mod tests {
         let second = engine.scan(first.next_cursor, None, Some(2)).unwrap();
         assert_eq!(second.keys, vec!["c".to_string()]);
         assert_eq!(second.next_cursor, 0);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn execute_transaction_is_atomic_on_failure() {
+        let (mut engine, root) = engine();
+        let commands = vec![
+            Command::Set {
+                key: "counter".to_string(),
+                value: "abc".to_string(),
+                options: command::SetOptions::default(),
+            },
+            Command::Incr {
+                key: "counter".to_string(),
+            },
+        ];
+
+        assert!(engine.execute_transaction(&commands).is_err());
+        assert_eq!(engine.get("counter").unwrap(), None);
 
         fs::remove_dir_all(root).ok();
     }

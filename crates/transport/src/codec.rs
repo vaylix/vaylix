@@ -5,21 +5,28 @@ use crc32fast::hash;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::constants::{FLAG_COMPRESSED_ZSTD, FLAGS_NONE};
 use crate::constants::{HEADER_LEN, MAX_FRAME_LEN};
 use crate::error::{Result, TransportError};
 use crate::frame::FrameHeader;
 use crate::opcode::Opcode;
+use crate::options::{CodecOptions, CompressionMode};
 use crate::request::Request;
 use crate::response::{Response, Status};
 
 /// Encodes a request into a framed binary packet.
 pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
+    encode_request_with_options(request, CodecOptions::default())
+}
+
+/// Encodes a request into a framed binary packet using caller-provided write options.
+pub fn encode_request_with_options(request: &Request, options: CodecOptions) -> Result<Vec<u8>> {
     let mut body = BytesMut::with_capacity(17 + request.payload.len());
     body.extend_from_slice(request.request_id.as_bytes());
     body.put_u8(request.opcode.into());
     body.extend_from_slice(&request.payload);
 
-    encode_frame(&body)
+    encode_frame(&body, options)
 }
 
 /// Decodes a framed binary packet into a request.
@@ -30,12 +37,17 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request> {
 
 /// Encodes a response into a framed binary packet.
 pub fn encode_response(response: &Response) -> Result<Vec<u8>> {
+    encode_response_with_options(response, CodecOptions::default())
+}
+
+/// Encodes a response into a framed binary packet using caller-provided write options.
+pub fn encode_response_with_options(response: &Response, options: CodecOptions) -> Result<Vec<u8>> {
     let mut body = BytesMut::with_capacity(17 + response.payload.len());
     body.extend_from_slice(response.request_id.as_bytes());
     body.put_u8(response.status.into());
     body.extend_from_slice(&response.payload);
 
-    encode_frame(&body)
+    encode_frame(&body, options)
 }
 
 /// Decodes a framed binary packet into a response.
@@ -58,7 +70,16 @@ pub async fn read_request_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Re
 
 /// Writes a single framed request to a blocking writer.
 pub fn write_request_to<W: Write>(writer: &mut W, request: &Request) -> Result<()> {
-    let encoded = encode_request(request)?;
+    write_request_to_with_options(writer, request, CodecOptions::default())
+}
+
+/// Writes a single framed request to a blocking writer using caller-provided write options.
+pub fn write_request_to_with_options<W: Write>(
+    writer: &mut W,
+    request: &Request,
+    options: CodecOptions,
+) -> Result<()> {
+    let encoded = encode_request_with_options(request, options)?;
     writer.write_all(&encoded)?;
     Ok(())
 }
@@ -68,7 +89,16 @@ pub async fn write_request_to_async<W: AsyncWrite + Unpin>(
     writer: &mut W,
     request: &Request,
 ) -> Result<()> {
-    let encoded = encode_request(request)?;
+    write_request_to_async_with_options(writer, request, CodecOptions::default()).await
+}
+
+/// Writes a single framed request to an async writer using caller-provided write options.
+pub async fn write_request_to_async_with_options<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    request: &Request,
+    options: CodecOptions,
+) -> Result<()> {
+    let encoded = encode_request_with_options(request, options)?;
     writer.write_all(&encoded).await?;
     writer.flush().await?;
     Ok(())
@@ -88,7 +118,16 @@ pub async fn read_response_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> R
 
 /// Writes a single framed response to a blocking writer.
 pub fn write_response_to<W: Write>(writer: &mut W, response: &Response) -> Result<()> {
-    let encoded = encode_response(response)?;
+    write_response_to_with_options(writer, response, CodecOptions::default())
+}
+
+/// Writes a single framed response to a blocking writer using caller-provided write options.
+pub fn write_response_to_with_options<W: Write>(
+    writer: &mut W,
+    response: &Response,
+    options: CodecOptions,
+) -> Result<()> {
+    let encoded = encode_response_with_options(response, options)?;
     writer.write_all(&encoded)?;
     Ok(())
 }
@@ -98,13 +137,22 @@ pub async fn write_response_to_async<W: AsyncWrite + Unpin>(
     writer: &mut W,
     response: &Response,
 ) -> Result<()> {
-    let encoded = encode_response(response)?;
+    write_response_to_async_with_options(writer, response, CodecOptions::default()).await
+}
+
+/// Writes a single framed response to an async writer using caller-provided write options.
+pub async fn write_response_to_async_with_options<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    response: &Response,
+    options: CodecOptions,
+) -> Result<()> {
+    let encoded = encode_response_with_options(response, options)?;
     writer.write_all(&encoded).await?;
     writer.flush().await?;
     Ok(())
 }
 
-fn encode_frame(body: &[u8]) -> Result<Vec<u8>> {
+fn encode_frame(body: &[u8], options: CodecOptions) -> Result<Vec<u8>> {
     if body.len() > MAX_FRAME_LEN {
         return Err(TransportError::FrameTooLarge {
             length: body.len(),
@@ -112,11 +160,13 @@ fn encode_frame(body: &[u8]) -> Result<Vec<u8>> {
         });
     }
 
-    let checksum = hash(body);
-    let header = FrameHeader::new(body.len() as u32, checksum)?;
-    let mut frame = BytesMut::with_capacity(HEADER_LEN + body.len());
+    let (flags, payload) = maybe_compress(body, options)?;
+    let checksum = hash(&payload);
+    let mut header = FrameHeader::new(payload.len() as u32, checksum)?;
+    header.flags = flags;
+    let mut frame = BytesMut::with_capacity(HEADER_LEN + payload.len());
     header.encode(&mut frame);
-    frame.extend_from_slice(body);
+    frame.extend_from_slice(&payload);
 
     Ok(frame.to_vec())
 }
@@ -143,7 +193,7 @@ fn decode_frame(frame: &[u8]) -> Result<Vec<u8>> {
         return Err(TransportError::ChecksumMismatch);
     }
 
-    Ok(payload)
+    maybe_decompress(&header, payload)
 }
 
 fn read_frame_from<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
@@ -162,7 +212,7 @@ fn read_frame_from<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
         return Err(TransportError::ChecksumMismatch);
     }
 
-    Ok(payload)
+    maybe_decompress(&header, payload)
 }
 
 async fn read_frame_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
@@ -181,7 +231,32 @@ async fn read_frame_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<V
         return Err(TransportError::ChecksumMismatch);
     }
 
-    Ok(payload)
+    maybe_decompress(&header, payload)
+}
+
+fn maybe_compress(body: &[u8], options: CodecOptions) -> Result<(u8, Vec<u8>)> {
+    if options.compression != CompressionMode::Zstd
+        || body.len() < options.compression_threshold_bytes
+    {
+        return Ok((FLAGS_NONE, body.to_vec()));
+    }
+
+    let compressed =
+        zstd::bulk::compress(body, 3).map_err(|_| TransportError::CompressionFailure)?;
+    if compressed.len() >= body.len() {
+        return Ok((FLAGS_NONE, body.to_vec()));
+    }
+
+    Ok((FLAG_COMPRESSED_ZSTD, compressed))
+}
+
+fn maybe_decompress(header: &FrameHeader, payload: Vec<u8>) -> Result<Vec<u8>> {
+    match header.flags {
+        FLAGS_NONE => Ok(payload),
+        FLAG_COMPRESSED_ZSTD => zstd::bulk::decompress(&payload, MAX_FRAME_LEN)
+            .map_err(|_| TransportError::CompressionFailure),
+        other => Err(TransportError::UnsupportedFlags(other)),
+    }
 }
 
 fn decode_request_body(body: &[u8]) -> Result<Request> {
@@ -246,12 +321,13 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        decode_request, decode_response, encode_request, encode_response, read_request_from,
-        read_request_from_async, read_response_from, read_response_from_async, write_request_to,
-        write_request_to_async, write_response_to, write_response_to_async,
+        decode_request, decode_response, encode_request, encode_request_with_options,
+        encode_response, read_request_from, read_request_from_async, read_response_from,
+        read_response_from_async, write_request_to, write_request_to_async, write_response_to,
+        write_response_to_async,
     };
     use crate::constants::{HEADER_LEN, MAGIC_BYTES, MAX_FRAME_LEN, VERSION};
-    use crate::{Request, Response, Status, TransportError};
+    use crate::{CodecOptions, CompressionMode, Request, Response, Status, TransportError};
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
@@ -609,5 +685,30 @@ mod tests {
             read_request_from(&mut FailingReader),
             Err(TransportError::Io(_))
         ));
+    }
+
+    #[test]
+    fn round_trips_compressed_frames() {
+        let request = Request::from_command(
+            id(99),
+            Command::Set {
+                key: "blob".to_string(),
+                value: "x".repeat(4_096),
+                options: SetOptions::default(),
+            },
+        )
+        .unwrap();
+
+        let encoded = encode_request_with_options(
+            &request,
+            CodecOptions {
+                compression: CompressionMode::Zstd,
+                compression_threshold_bytes: 32,
+            },
+        )
+        .unwrap();
+        let decoded = decode_request(&encoded).unwrap();
+
+        assert_eq!(decoded, request);
     }
 }

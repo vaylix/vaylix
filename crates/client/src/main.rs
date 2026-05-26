@@ -8,6 +8,7 @@ use args::{Args, OutputModeArg};
 use clap::Parser;
 use client::{Client, ClientConfig, OutputMode};
 use std::path::PathBuf;
+use transport::CodecOptions;
 use url::Url;
 
 const DEFAULT_USERNAME: &str = "vaylix";
@@ -46,9 +47,18 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
         OutputModeArg::Table => OutputMode::Table,
         OutputModeArg::Json => OutputMode::Json,
     };
+    let cli_transport = CodecOptions {
+        compression: args.compression.into(),
+        compression_threshold_bytes: args.compression_threshold_bytes,
+    };
 
     if let Some(url) = args.url {
         let parsed = Url::parse(&url).map_err(std::io::Error::other)?;
+        if parsed.scheme() != "vaylix" {
+            return Err(error::ClientError::InvalidConfiguration(
+                "unsupported URL scheme",
+            ));
+        }
         let host = parsed.host_str().unwrap_or("127.0.0.1").to_string();
         let port = parsed.port().unwrap_or(9173);
         let parsed_username = if parsed.username().is_empty() {
@@ -72,19 +82,48 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
                 }
             })
             .unwrap_or(cli_output);
+        let url_ssl = parsed
+            .query_pairs()
+            .any(|(key, value)| key == "ssl" && value.eq_ignore_ascii_case("true"));
+        let compression = parsed
+            .query_pairs()
+            .find_map(|(key, value)| {
+                if key == "compression" {
+                    match value.as_ref() {
+                        "none" => Some(transport::CompressionMode::None),
+                        "zstd" => Some(transport::CompressionMode::Zstd),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(cli_transport.compression);
+        let compression_threshold_bytes = parsed
+            .query_pairs()
+            .find_map(|(key, value)| {
+                (key == "compression_threshold_bytes")
+                    .then(|| value.parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(cli_transport.compression_threshold_bytes);
+        let ssl = args.ssl || url_ssl;
+        let tls_ca_cert = args.tls_ca_cert.or_else(|| {
+            parsed.query_pairs().find_map(|(key, value)| {
+                (key == "ca_cert").then(|| PathBuf::from(value.into_owned()))
+            })
+        });
+        if tls_ca_cert.is_some() && !ssl {
+            return Err(error::ClientError::InvalidConfiguration(
+                "tls_ca_cert requires ssl=true",
+            ));
+        }
 
         Ok(ClientConfig {
             host,
             port,
-            ssl: args.ssl
-                || parsed
-                    .query_pairs()
-                    .any(|(key, value)| key == "ssl" && value.eq_ignore_ascii_case("true")),
-            tls_ca_cert: args.tls_ca_cert.or_else(|| {
-                parsed.query_pairs().find_map(|(key, value)| {
-                    (key == "ca_cert").then(|| PathBuf::from(value.into_owned()))
-                })
-            }),
+            ssl,
+            tls_ca_cert,
             username: Some(
                 args.user
                     .or(parsed_username)
@@ -96,8 +135,17 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
                     .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
             ),
             output,
+            transport: CodecOptions {
+                compression,
+                compression_threshold_bytes,
+            },
         })
     } else {
+        if args.tls_ca_cert.is_some() && !args.ssl {
+            return Err(error::ClientError::InvalidConfiguration(
+                "tls_ca_cert requires --ssl",
+            ));
+        }
         Ok(ClientConfig {
             host: args.host,
             port: args.port,
@@ -109,6 +157,7 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
                     .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
             ),
             output: cli_output,
+            transport: cli_transport,
         })
     }
 }
@@ -116,8 +165,9 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_PASSWORD, DEFAULT_USERNAME, parse_client_config};
-    use crate::args::{Args, OutputModeArg};
+    use crate::args::{Args, CompressionModeArg, OutputModeArg};
     use crate::client::OutputMode;
+    use transport::CompressionMode;
 
     #[test]
     fn url_credentials_and_output_are_parsed() {
@@ -130,6 +180,8 @@ mod tests {
             user: None,
             password: None,
             output: OutputModeArg::Plain,
+            compression: CompressionModeArg::None,
+            compression_threshold_bytes: 256,
         })
         .unwrap();
 
@@ -138,6 +190,7 @@ mod tests {
         assert_eq!(config.username.as_deref(), Some("alice"));
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.output, OutputMode::Json);
+        assert_eq!(config.transport.compression, CompressionMode::None);
     }
 
     #[test]
@@ -151,6 +204,8 @@ mod tests {
             user: Some("override".to_string()),
             password: Some("override-pass".to_string()),
             output: OutputModeArg::Table,
+            compression: CompressionModeArg::None,
+            compression_threshold_bytes: 256,
         })
         .unwrap();
 
@@ -171,6 +226,8 @@ mod tests {
             user: None,
             password: None,
             output: OutputModeArg::Plain,
+            compression: CompressionModeArg::None,
+            compression_threshold_bytes: 256,
         })
         .unwrap();
 
