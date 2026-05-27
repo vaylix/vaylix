@@ -175,6 +175,7 @@ fn transport_options(disable_compression: bool) -> CodecOptions {
         CodecOptions {
             compression: CompressionMode::None,
             compression_threshold_bytes: 0,
+            ..CodecOptions::default()
         }
     } else {
         CodecOptions::default()

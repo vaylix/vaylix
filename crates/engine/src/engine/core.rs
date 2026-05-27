@@ -1,8 +1,8 @@
 use crate::EngineMetadata;
 use crate::config::EngineOptions;
 use crate::engine::{
-    EngineState, Expiration, ScanPage, SetCondition, SetOptions, SetOutcome, StorageEngine,
-    TransactionResult,
+    EngineState, Expiration, LogicalBackup, LogicalBackupEntry, ScanPage, SetCondition, SetOptions,
+    SetOutcome, StorageEngine, TransactionResult,
 };
 use crate::error::Result;
 use crate::paths::Paths;
@@ -543,6 +543,19 @@ impl Engine {
             | Command::Metrics
             | Command::Save
             | Command::Snapshot
+            | Command::Backup
+            | Command::Restore { .. }
+            | Command::CreateUser { .. }
+            | Command::DropUser { .. }
+            | Command::CreateRole { .. }
+            | Command::DropRole { .. }
+            | Command::GrantRole { .. }
+            | Command::RevokeRole { .. }
+            | Command::GrantPermission { .. }
+            | Command::RevokePermission { .. }
+            | Command::ShowUsers
+            | Command::ShowRoles
+            | Command::WhoAmI
             | Command::Multi
             | Command::Exec
             | Command::Discard
@@ -959,6 +972,68 @@ impl StorageEngine for Engine {
 
         Ok(())
     }
+
+    fn logical_backup(&mut self) -> Result<String> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+        let entries = self
+            .state
+            .data
+            .iter()
+            .map(|(key, value)| LogicalBackupEntry {
+                key: key.clone(),
+                value: value.clone(),
+                expires_at_ms: self.state.expirations.get(key).copied(),
+            })
+            .collect();
+        let backup = LogicalBackup {
+            version: 1,
+            created_at_ms: now_ms,
+            source_engine_version: self.state.metadata.version,
+            source_sequence: self.state.metadata.last_applied_sequence,
+            entries,
+        };
+
+        serde_json::to_string(&backup)
+            .map_err(|err| crate::EngineError::SnapshotSerialize(err.to_string()))
+    }
+
+    fn restore_logical_backup(&mut self, dump: &str) -> Result<usize> {
+        let backup: LogicalBackup = serde_json::from_str(dump)
+            .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string()))?;
+        if backup.version != 1 {
+            return Err(crate::EngineError::UnsupportedStorageFormat {
+                resource: "logical backup",
+            });
+        }
+
+        let now_ms = self.now();
+        let mut operations = Vec::with_capacity(1 + backup.entries.len().saturating_mul(2));
+        operations.push(WalOperation::Clear);
+        let mut restored = 0;
+
+        for entry in backup.entries {
+            if let Some(expires_at_ms) = entry.expires_at_ms
+                && expires_at_ms <= now_ms
+            {
+                continue;
+            }
+            operations.push(WalOperation::Set {
+                key: entry.key.clone(),
+                value: entry.value,
+            });
+            if let Some(expires_at_ms) = entry.expires_at_ms {
+                operations.push(WalOperation::Expire {
+                    key: entry.key,
+                    expires_at_ms,
+                });
+            }
+            restored += 1;
+        }
+
+        self.append_and_apply(operations)?;
+        Ok(restored)
+    }
 }
 
 fn now_millis() -> u64 {
@@ -1163,6 +1238,48 @@ mod tests {
         assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn logical_backup_restore_round_trip_replaces_state_atomically() {
+        let root = temp_dir("logical-backup");
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let mut source = Engine::from_paths_with_options(
+            paths.clone(),
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("source-key")),
+            },
+        )
+        .unwrap();
+        source.set("a".to_string(), "1".to_string()).unwrap();
+        source.expire("a", 60).unwrap();
+        source.set("b".to_string(), "2".to_string()).unwrap();
+
+        let dump = source.logical_backup().unwrap();
+
+        let restore_root = temp_dir("logical-restore");
+        let restore_paths = Paths::from_data_dir(&restore_root).unwrap();
+        let mut restored = Engine::from_paths_with_options(
+            restore_paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("restore-key")),
+            },
+        )
+        .unwrap();
+        restored
+            .set("old".to_string(), "value".to_string())
+            .unwrap();
+
+        assert_eq!(restored.restore_logical_backup(&dump).unwrap(), 2);
+        assert_eq!(restored.get("a").unwrap().as_deref(), Some("1"));
+        assert_eq!(restored.get("b").unwrap().as_deref(), Some("2"));
+        assert_eq!(restored.get("old").unwrap(), None);
+        assert!(restored.ttl("a").unwrap() > 0);
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(restore_root).ok();
     }
 
     #[test]

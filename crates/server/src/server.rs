@@ -19,13 +19,14 @@ use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use tokio_rustls::TlsAcceptor;
 use transport::{
-    CodecOptions, Request, Response, Status, TransportError, read_request_from_async,
-    write_response_to_async_with_options,
+    CodecOptions, Request, Response, Status, TransportError, negotiate_server_options,
+    read_client_hello_from_async, read_request_from_async_with_options,
+    write_response_to_async_with_options, write_server_hello_to_async,
 };
 use uuid::Uuid;
 
 use crate::audit::{AuditEvent, AuditLogger};
-use crate::auth::AuthConfig;
+use crate::auth::{AuthConfig, Identity, Permission};
 use crate::error::{Result, ServerError};
 use crate::metrics::Metrics;
 
@@ -220,7 +221,7 @@ pub struct Server {
 }
 
 struct SessionState {
-    authenticated_user: Option<String>,
+    identity: Option<Identity>,
     transaction_queue: Vec<Command>,
     rate_limiter: RateLimiter,
 }
@@ -228,14 +229,14 @@ struct SessionState {
 impl SessionState {
     fn new(guards: &ServerGuards) -> Self {
         Self {
-            authenticated_user: None,
+            identity: None,
             transaction_queue: Vec::new(),
             rate_limiter: RateLimiter::new(guards.requests_per_second, guards.request_burst),
         }
     }
 
     fn is_authenticated(&self) -> bool {
-        self.authenticated_user.is_some()
+        self.identity.is_some()
     }
 
     fn in_transaction(&self) -> bool {
@@ -512,6 +513,34 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = SessionState::new(&runtime.guards);
+    let client_hello = match read_client_hello_from_async(&mut stream).await {
+        Ok(hello) => hello,
+        Err(TransportError::UnexpectedEof) => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let transport = match negotiate_server_options(&client_hello, runtime.transport) {
+        Ok((server_hello, transport)) => {
+            write_server_hello_to_async(&mut stream, &server_hello).await?;
+            log_connection_event(
+                "INFO",
+                connection_id,
+                peer_addr,
+                &format!(
+                    "negotiated protocol={} compression={} max_frame_len={}",
+                    server_hello.protocol_version,
+                    server_hello.compression.as_str(),
+                    server_hello.max_frame_len
+                ),
+            );
+            transport
+        }
+        Err(err) => {
+            let server_hello =
+                transport::ServerHello::error(err.code(), err.name(), &err.to_string());
+            write_server_hello_to_async(&mut stream, &server_hello).await?;
+            return Err(err.into());
+        }
+    };
 
     loop {
         let read_result = if let Some(idle_timeout) = runtime.idle_timeout {
@@ -522,7 +551,7 @@ where
                     }
                     continue;
                 }
-                result = timeout(idle_timeout, read_request_from_async(&mut stream)) => {
+                result = timeout(idle_timeout, read_request_from_async_with_options(&mut stream, transport)) => {
                     match result {
                         Ok(result) => result,
                         Err(_) => {
@@ -541,7 +570,7 @@ where
                     }
                     continue;
                 }
-                result = read_request_from_async(&mut stream) => result,
+                result = read_request_from_async_with_options(&mut stream, transport) => result,
             }
         };
 
@@ -552,6 +581,24 @@ where
         };
         let started_at = Instant::now();
 
+        if request.metadata.deadline_ms == Some(0) {
+            let err = TransportError::DeadlineExceeded;
+            let response =
+                error_response(request.request_id, err.code(), err.name(), &err.to_string());
+            write_response_to_async_with_options(&mut stream, &response, transport).await?;
+            continue;
+        }
+
+        if session.in_transaction() && request.metadata.sequence.is_some() {
+            let err = TransportError::ProtocolStateViolation(
+                "pipelined requests are not supported inside transactions",
+            );
+            let response =
+                error_response(request.request_id, err.code(), err.name(), &err.to_string());
+            write_response_to_async_with_options(&mut stream, &response, transport).await?;
+            continue;
+        }
+
         if !session.rate_limiter.allow() {
             let response = error_response(
                 request.request_id,
@@ -559,7 +606,7 @@ where
                 ServerError::RateLimitExceeded.name(),
                 &ServerError::RateLimitExceeded.to_string(),
             );
-            write_response_to_async_with_options(&mut stream, &response, runtime.transport).await?;
+            write_response_to_async_with_options(&mut stream, &response, transport).await?;
             record_audit_event(
                 &runtime.audit_logger,
                 AuditContext {
@@ -593,8 +640,7 @@ where
             Ok(command) => command,
             Err(err) => {
                 let response = error_response(request_id, err.code(), err.name(), &err.to_string());
-                write_response_to_async_with_options(&mut stream, &response, runtime.transport)
-                    .await?;
+                write_response_to_async_with_options(&mut stream, &response, transport).await?;
                 record_audit_event(
                     &runtime.audit_logger,
                     AuditContext {
@@ -615,7 +661,7 @@ where
 
         if let Err(err) = validate_command(&command, &runtime.guards) {
             let response = error_response(request_id, err.code(), err.name(), &err.to_string());
-            write_response_to_async_with_options(&mut stream, &response, runtime.transport).await?;
+            write_response_to_async_with_options(&mut stream, &response, transport).await?;
             record_audit_event(
                 &runtime.audit_logger,
                 AuditContext {
@@ -651,7 +697,7 @@ where
         } else {
             None
         };
-        write_response_to_async_with_options(&mut stream, &response, runtime.transport).await?;
+        write_response_to_async_with_options(&mut stream, &response, transport).await?;
         record_audit_event(
             &runtime.audit_logger,
             AuditContext {
@@ -743,6 +789,22 @@ fn validate_command(command: &Command, guards: &ServerGuards) -> Result<()> {
             ..
         } => validate_key(pattern, guards)?,
         Command::Scan { pattern: None, .. } => {}
+        Command::Restore { dump } => validate_value(dump, guards)?,
+        Command::CreateUser { username, password } => {
+            validate_key(username, guards)?;
+            validate_value(password, guards)?;
+        }
+        Command::DropUser { username } => validate_key(username, guards)?,
+        Command::CreateRole { role } | Command::DropRole { role } => validate_key(role, guards)?,
+        Command::GrantRole { role, username } | Command::RevokeRole { role, username } => {
+            validate_key(role, guards)?;
+            validate_key(username, guards)?;
+        }
+        Command::GrantPermission { permission, role }
+        | Command::RevokePermission { permission, role } => {
+            validate_key(permission, guards)?;
+            validate_key(role, guards)?;
+        }
         _ => {}
     }
 
@@ -760,11 +822,12 @@ async fn process_command(
     if matches!(command, Command::Auth { .. }) {
         return handle_auth(
             metrics,
-            runtime.auth_config.as_ref(),
+            runtime.auth_config.clone(),
             session,
             request_id,
             command,
-        );
+        )
+        .await;
     }
 
     if runtime.auth_config.is_some()
@@ -780,6 +843,10 @@ async fn process_command(
             .await;
     }
 
+    if runtime.auth_config.is_some() {
+        authorize_command(&command, session)?;
+    }
+
     match command {
         Command::Multi => {
             metrics.transactions_started.fetch_add(1, Ordering::Relaxed);
@@ -792,29 +859,208 @@ async fn process_command(
             Ok(Response::entries(request_id, &entries)?)
         }
         Command::Info => {
-            let mut entries = engine.info().await?;
-            entries.extend(metrics.snapshot());
-            entries.push((
-                "auth_required".to_string(),
-                runtime.auth_config.is_some().to_string(),
-            ));
-            entries.push((
-                "compression".to_string(),
-                runtime.transport.compression.as_str().to_string(),
-            ));
-            entries.push((
-                "tls_enabled".to_string(),
-                runtime.tls_config.is_some().to_string(),
-            ));
+            let entries = structured_info(engine, metrics, runtime).await?;
             Ok(Response::entries(request_id, &entries)?)
+        }
+        Command::CreateUser { username, password } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.create_user(username, password).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::DropUser { username } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.drop_user(&username).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::CreateRole { role } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.create_role(role).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::DropRole { role } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.drop_role(&role).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::GrantRole { role, username } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.grant_role(&role, &username).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::RevokeRole { role, username } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.revoke_role(&role, &username).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::GrantPermission { permission, role } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config
+                .grant_permission(Permission::parse(&permission)?, &role)
+                .await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::RevokePermission { permission, role } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config
+                .revoke_permission(Permission::parse(&permission)?, &role)
+                .await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::ShowUsers => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            Ok(Response::entries(request_id, &auth_config.users().await)?)
+        }
+        Command::ShowRoles => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            Ok(Response::entries(request_id, &auth_config.roles().await)?)
+        }
+        Command::WhoAmI => {
+            let Some(identity) = &session.identity else {
+                return Err(ServerError::AuthenticationRequired);
+            };
+            Ok(Response::entries(
+                request_id,
+                &[
+                    ("username".to_string(), identity.username.clone()),
+                    ("permissions".to_string(), identity.permissions_csv()),
+                ],
+            )?)
         }
         command => engine.execute(request_id, command).await,
     }
 }
 
-fn handle_auth(
+async fn structured_info(
+    engine: EngineHandle,
     metrics: Arc<Metrics>,
-    auth_config: Option<&AuthConfig>,
+    runtime: &ServerRuntimeConfig,
+) -> Result<Vec<(String, String)>> {
+    let engine_entries = engine.info().await?;
+    let lookup = |key: &str| {
+        engine_entries
+            .iter()
+            .find_map(|(entry_key, value)| (entry_key == key).then(|| value.clone()))
+            .unwrap_or_else(|| "unknown".to_string())
+    };
+    let mut entries = vec![
+        (
+            "server.version".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ),
+        ("server.mode".to_string(), "single-node".to_string()),
+        (
+            "transport.protocol_magic".to_string(),
+            String::from_utf8_lossy(&transport::MAGIC_BYTES).to_string(),
+        ),
+        (
+            "transport.protocol_version".to_string(),
+            transport::VERSION.to_string(),
+        ),
+        (
+            "transport.compression".to_string(),
+            runtime.transport.compression.as_str().to_string(),
+        ),
+        (
+            "transport.max_frame_len".to_string(),
+            runtime.transport.max_frame_len.to_string(),
+        ),
+        (
+            "storage.engine_version".to_string(),
+            lookup("engine_version"),
+        ),
+        ("storage.key_count".to_string(), lookup("key_count")),
+        (
+            "storage.last_applied_sequence".to_string(),
+            lookup("last_applied_sequence"),
+        ),
+        (
+            "persistence.wal_size_bytes".to_string(),
+            lookup("wal_size_bytes"),
+        ),
+        (
+            "persistence.wal_sync_policy".to_string(),
+            lookup("wal_sync_policy"),
+        ),
+        (
+            "persistence.last_snapshot_at_ms".to_string(),
+            lookup("last_snapshot_at_ms"),
+        ),
+        (
+            "security.auth_required".to_string(),
+            runtime.auth_config.is_some().to_string(),
+        ),
+        (
+            "security.rbac_enabled".to_string(),
+            runtime.auth_config.is_some().to_string(),
+        ),
+        (
+            "security.tls_enabled".to_string(),
+            runtime.tls_config.is_some().to_string(),
+        ),
+        (
+            "security.storage_encryption".to_string(),
+            lookup("storage_encryption"),
+        ),
+        (
+            "security.storage_key_id".to_string(),
+            lookup("storage_key_id"),
+        ),
+        (
+            "runtime.idle_timeout_seconds".to_string(),
+            runtime
+                .idle_timeout
+                .map(|duration| duration.as_secs().to_string())
+                .unwrap_or_else(|| "disabled".to_string()),
+        ),
+        (
+            "runtime.snapshot_interval_seconds".to_string(),
+            runtime
+                .snapshot_interval
+                .map(|duration| duration.as_secs().to_string())
+                .unwrap_or_else(|| "disabled".to_string()),
+        ),
+        (
+            "runtime.expiration_sweep_interval_seconds".to_string(),
+            runtime
+                .expiration_sweep_interval
+                .map(|duration| duration.as_secs().to_string())
+                .unwrap_or_else(|| "disabled".to_string()),
+        ),
+    ];
+    entries.extend(
+        metrics
+            .snapshot()
+            .into_iter()
+            .map(|(key, value)| (format!("metrics.{key}"), value)),
+    );
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+
+    Ok(entries)
+}
+
+async fn handle_auth(
+    metrics: Arc<Metrics>,
+    auth_config: Option<AuthConfig>,
     session: &mut SessionState,
     request_id: Uuid,
     command: Command,
@@ -824,19 +1070,22 @@ fn handle_auth(
     };
 
     let Some(auth_config) = auth_config else {
-        session.authenticated_user = Some("anonymous".to_string());
+        session.identity = Some(Identity {
+            username: "anonymous".to_string(),
+            permissions: Permission::all(),
+        });
         metrics.auth_successes.fetch_add(1, Ordering::Relaxed);
         return Ok(Response::ok(request_id));
     };
 
-    if auth_config.verify(&username, &password) {
-        session.authenticated_user = Some(auth_config.username().to_string());
+    if let Some(identity) = auth_config.verify(&username, &password).await? {
+        session.identity = Some(identity);
         metrics.auth_successes.fetch_add(1, Ordering::Relaxed);
-        Ok(Response::ok(request_id))
-    } else {
-        metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-        Err(ServerError::AuthenticationFailed)
+        return Ok(Response::ok(request_id));
     }
+
+    metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+    Err(ServerError::AuthenticationFailed)
 }
 
 async fn handle_transaction_command(
@@ -881,9 +1130,73 @@ async fn handle_transaction_command(
             }
             validate_command(&other, &runtime.guards)?;
             validate_transaction_command(&other)?;
+            if runtime.auth_config.is_some() {
+                authorize_command(&other, session)?;
+            }
             session.transaction_queue.push(other);
             Ok(Response::value(request_id, "QUEUED")?)
         }
+    }
+}
+
+fn authorize_command(command: &Command, session: &SessionState) -> Result<()> {
+    let Some(permission) = command_permission(command) else {
+        return Ok(());
+    };
+    let Some(identity) = &session.identity else {
+        return Err(ServerError::AuthenticationRequired);
+    };
+    if identity.has(permission) {
+        Ok(())
+    } else {
+        Err(ServerError::PermissionDenied)
+    }
+}
+
+fn command_permission(command: &Command) -> Option<Permission> {
+    match command {
+        Command::Ping { .. }
+        | Command::Auth { .. }
+        | Command::Multi
+        | Command::Exec
+        | Command::Discard
+        | Command::WhoAmI => None,
+        Command::Get { .. }
+        | Command::Exists { .. }
+        | Command::MGet { .. }
+        | Command::Ttl { .. }
+        | Command::Scan { .. }
+        | Command::DbSize
+        | Command::Count
+        | Command::List => Some(Permission::Read),
+        Command::GetDel { .. }
+        | Command::GetEx { .. }
+        | Command::Set { .. }
+        | Command::SetNx { .. }
+        | Command::MSet { .. }
+        | Command::Delete { .. }
+        | Command::Incr { .. }
+        | Command::Decr { .. }
+        | Command::Expire { .. }
+        | Command::Persist { .. }
+        | Command::Rename { .. }
+        | Command::RenameNx { .. }
+        | Command::Clear => Some(Permission::Write),
+        Command::Info | Command::Metrics => Some(Permission::Metrics),
+        Command::Save | Command::Snapshot => Some(Permission::Snapshot),
+        Command::Backup => Some(Permission::Backup),
+        Command::Restore { .. } => Some(Permission::Restore),
+        Command::CreateUser { .. }
+        | Command::DropUser { .. }
+        | Command::CreateRole { .. }
+        | Command::DropRole { .. }
+        | Command::GrantRole { .. }
+        | Command::RevokeRole { .. }
+        | Command::GrantPermission { .. }
+        | Command::RevokePermission { .. }
+        | Command::ShowUsers
+        | Command::ShowRoles => Some(Permission::Admin),
+        Command::Help | Command::Exit => None,
     }
 }
 
@@ -985,9 +1298,25 @@ where
             engine.snapshot()?;
             Ok(Response::ok(request_id))
         }
+        Command::Backup => Ok(Response::value(request_id, &engine.logical_backup()?)?),
+        Command::Restore { dump } => Ok(Response::count(
+            request_id,
+            engine.restore_logical_backup(&dump)? as u64,
+        )),
         Command::Multi | Command::Exec | Command::Discard => {
             Err(ServerError::UnsupportedRemoteCommand)
         }
+        Command::CreateUser { .. }
+        | Command::DropUser { .. }
+        | Command::CreateRole { .. }
+        | Command::DropRole { .. }
+        | Command::GrantRole { .. }
+        | Command::RevokeRole { .. }
+        | Command::GrantPermission { .. }
+        | Command::RevokePermission { .. }
+        | Command::ShowUsers
+        | Command::ShowRoles
+        | Command::WhoAmI => Err(ServerError::UnsupportedRemoteCommand),
         Command::Help | Command::Exit => Err(ServerError::UnsupportedRemoteCommand),
     }
 }
@@ -1024,6 +1353,19 @@ fn validate_transaction_command(command: &Command) -> Result<()> {
         | Command::Metrics
         | Command::Save
         | Command::Snapshot
+        | Command::Backup
+        | Command::Restore { .. }
+        | Command::CreateUser { .. }
+        | Command::DropUser { .. }
+        | Command::CreateRole { .. }
+        | Command::DropRole { .. }
+        | Command::GrantRole { .. }
+        | Command::RevokeRole { .. }
+        | Command::GrantPermission { .. }
+        | Command::RevokePermission { .. }
+        | Command::ShowUsers
+        | Command::ShowRoles
+        | Command::WhoAmI
         | Command::Auth { .. }
         | Command::Help
         | Command::Exit
@@ -1127,6 +1469,19 @@ fn opcode_name(command: &Command) -> &'static str {
         Command::Count => "COUNT",
         Command::Save => "SAVE",
         Command::Snapshot => "SNAPSHOT",
+        Command::Backup => "BACKUP",
+        Command::Restore { .. } => "RESTORE",
+        Command::CreateUser { .. } => "CREATE_USER",
+        Command::DropUser { .. } => "DROP_USER",
+        Command::CreateRole { .. } => "CREATE_ROLE",
+        Command::DropRole { .. } => "DROP_ROLE",
+        Command::GrantRole { .. } => "GRANT_ROLE",
+        Command::RevokeRole { .. } => "REVOKE_ROLE",
+        Command::GrantPermission { .. } => "GRANT_PERMISSION",
+        Command::RevokePermission { .. } => "REVOKE_PERMISSION",
+        Command::ShowUsers => "SHOW_USERS",
+        Command::ShowRoles => "SHOW_ROLES",
+        Command::WhoAmI => "WHOAMI",
         Command::Multi => "MULTI",
         Command::Exec => "EXEC",
         Command::Discard => "DISCARD",
@@ -1140,7 +1495,11 @@ fn record_audit_event(logger: &AuditLogger, context: AuditContext<'_>) {
         timestamp_ms: current_time_millis(),
         connection_id: context.connection_id,
         peer: context.peer_addr.map(|addr| addr.to_string()),
-        username: context.session.authenticated_user.clone(),
+        username: context
+            .session
+            .identity
+            .as_ref()
+            .map(|identity| identity.username.clone()),
         request_id: context.request_id.to_string(),
         opcode: context.opcode.to_string(),
         status: match context.status {
@@ -1167,7 +1526,7 @@ mod tests {
 
     use super::{
         RateLimiter, ServerGuards, SessionState, error_response, execute_command, handle_auth,
-        handle_transaction_command, validate_command,
+        handle_transaction_command, process_command, structured_info, validate_command,
     };
     use crate::audit::AuditLogger;
     use crate::auth::AuthConfig;
@@ -1380,6 +1739,37 @@ mod tests {
         fn info(&mut self) -> Result<Vec<(String, String)>> {
             Ok(vec![("key_count".to_string(), self.data.len().to_string())])
         }
+        fn logical_backup(&mut self) -> Result<String> {
+            Ok(serde_json::json!({
+                "version": 1,
+                "entries": self
+                    .data
+                    .iter()
+                    .map(|(key, value)| serde_json::json!({
+                        "key": key,
+                        "value": value,
+                        "expires_at_ms": null,
+                    }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string())
+        }
+        fn restore_logical_backup(&mut self, dump: &str) -> Result<usize> {
+            let backup: serde_json::Value = serde_json::from_str(dump)
+                .map_err(|err| engine::EngineError::SnapshotDeserialize(err.to_string()))?;
+            self.data.clear();
+            if let Some(entries) = backup.get("entries").and_then(|entries| entries.as_array()) {
+                for entry in entries {
+                    if let (Some(key), Some(value)) = (
+                        entry.get("key").and_then(|key| key.as_str()),
+                        entry.get("value").and_then(|value| value.as_str()),
+                    ) {
+                        self.data.insert(key.to_string(), value.to_string());
+                    }
+                }
+            }
+            Ok(self.data.len())
+        }
         fn sweep_expired(&mut self) -> Result<usize> {
             Ok(0)
         }
@@ -1485,28 +1875,30 @@ mod tests {
         let auth = AuthConfig::new("dbuser".to_string(), "secret".to_string()).unwrap();
         let metrics = Arc::new(Metrics::default());
         let mut session = SessionState::new(&guards());
-        let denied = handle_auth(
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let denied = runtime_handle.block_on(handle_auth(
             Arc::clone(&metrics),
-            Some(&auth),
+            Some(auth.clone()),
             &mut session,
             id(1),
             Command::Auth {
                 username: "dbuser".to_string(),
                 password: "wrong".to_string(),
             },
-        );
+        ));
         assert!(denied.is_err());
-        let ok = handle_auth(
-            Arc::clone(&metrics),
-            Some(&auth),
-            &mut session,
-            id(2),
-            Command::Auth {
-                username: "dbuser".to_string(),
-                password: "secret".to_string(),
-            },
-        )
-        .unwrap();
+        let ok = runtime_handle
+            .block_on(handle_auth(
+                Arc::clone(&metrics),
+                Some(auth),
+                &mut session,
+                id(2),
+                Command::Auth {
+                    username: "dbuser".to_string(),
+                    password: "secret".to_string(),
+                },
+            ))
+            .unwrap();
         assert_eq!(ok.status, Status::Ok);
         assert!(session.is_authenticated());
 
@@ -1520,8 +1912,7 @@ mod tests {
         )
         .unwrap();
         let handle = EngineHandle::new(engine);
-        let queued = tokio::runtime::Runtime::new()
-            .unwrap()
+        let queued = runtime_handle
             .block_on(handle_transaction_command(
                 handle,
                 metrics,
@@ -1539,6 +1930,122 @@ mod tests {
     }
 
     #[test]
+    fn rbac_allows_admin_management_and_denies_missing_permissions() {
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
+        let mut admin_session = SessionState::new(&guards());
+        runtime_handle
+            .block_on(handle_auth(
+                Arc::clone(&metrics),
+                runtime.auth_config.clone(),
+                &mut admin_session,
+                id(20),
+                Command::Auth {
+                    username: "dbuser".to_string(),
+                    password: "secret".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("rbac")).unwrap(),
+            engine::EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("rbac-key")),
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        for (request_id, command) in [
+            (
+                id(21),
+                Command::CreateUser {
+                    username: "alice".to_string(),
+                    password: "pw".to_string(),
+                },
+            ),
+            (
+                id(22),
+                Command::CreateRole {
+                    role: "readonly".to_string(),
+                },
+            ),
+            (
+                id(23),
+                Command::GrantPermission {
+                    permission: "read".to_string(),
+                    role: "readonly".to_string(),
+                },
+            ),
+            (
+                id(24),
+                Command::GrantRole {
+                    role: "readonly".to_string(),
+                    username: "alice".to_string(),
+                },
+            ),
+        ] {
+            let response = runtime_handle
+                .block_on(process_command(
+                    handle.clone(),
+                    Arc::clone(&metrics),
+                    &runtime,
+                    &mut admin_session,
+                    request_id,
+                    command,
+                ))
+                .unwrap();
+            assert_eq!(response.status, Status::Ok);
+        }
+
+        let mut readonly_session = SessionState::new(&guards());
+        runtime_handle
+            .block_on(handle_auth(
+                Arc::clone(&metrics),
+                runtime.auth_config.clone(),
+                &mut readonly_session,
+                id(25),
+                Command::Auth {
+                    username: "alice".to_string(),
+                    password: "pw".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let read_response = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut readonly_session,
+                id(26),
+                Command::Get {
+                    key: "missing".to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(read_response.status, Status::NotFound);
+
+        let write_denied = runtime_handle
+            .block_on(process_command(
+                handle,
+                metrics,
+                &runtime,
+                &mut readonly_session,
+                id(27),
+                Command::Set {
+                    key: "key".to_string(),
+                    value: "value".to_string(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap_err();
+        assert!(matches!(write_denied, crate::ServerError::PermissionDenied));
+    }
+
+    #[test]
     fn rejects_local_only_commands_and_builds_error_payloads() {
         let mut engine = FakeEngine::default();
         assert!(execute_command(&mut engine, id(7), Command::Help).is_err());
@@ -1549,6 +2056,70 @@ mod tests {
         assert_eq!(payload.code, "SRV-400");
         assert_eq!(payload.name, "Bad Request");
         assert_eq!(payload.message, "invalid request");
+    }
+
+    #[test]
+    fn routes_logical_backup_and_restore_commands() {
+        let mut engine = FakeEngine::default();
+        engine
+            .set("app:mode".to_string(), "production".to_string())
+            .unwrap();
+
+        let dump = execute_command(&mut engine, id(10), Command::Backup)
+            .unwrap()
+            .decode_value()
+            .unwrap();
+        assert!(dump.contains("app:mode"));
+
+        engine.set("old".to_string(), "value".to_string()).unwrap();
+        let restored = execute_command(&mut engine, id(11), Command::Restore { dump })
+            .unwrap()
+            .decode_count()
+            .unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(
+            engine.get("app:mode").unwrap(),
+            Some("production".to_string())
+        );
+        assert_eq!(engine.get("old").unwrap(), None);
+    }
+
+    #[test]
+    fn structured_info_uses_section_prefixed_keys() {
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("info")).unwrap(),
+            engine::EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("info-key")),
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+        let metrics = Arc::new(Metrics::default());
+        let entries = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(structured_info(handle, metrics, &runtime()))
+            .unwrap();
+
+        assert!(entries.iter().any(|(key, _)| key == "server.version"));
+        assert!(
+            entries
+                .iter()
+                .any(|(key, value)| key == "transport.protocol_version" && value == "2")
+        );
+        assert!(entries.iter().any(|(key, _)| key == "storage.key_count"));
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| key == "persistence.wal_size_bytes")
+        );
+        assert!(entries.iter().any(|(key, _)| key == "security.tls_enabled"));
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| key == "runtime.idle_timeout_seconds")
+        );
+        assert!(entries.iter().any(|(key, _)| key.starts_with("metrics.")));
     }
 
     #[test]

@@ -154,6 +154,58 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "snapshot",
     },
     CommandInfo {
+        name: "backup",
+        usage: "backup",
+    },
+    CommandInfo {
+        name: "restore",
+        usage: "restore <logical-dump-json>",
+    },
+    CommandInfo {
+        name: "create-user",
+        usage: "create user <username> password <password>",
+    },
+    CommandInfo {
+        name: "drop-user",
+        usage: "drop user <username>",
+    },
+    CommandInfo {
+        name: "create-role",
+        usage: "create role <role>",
+    },
+    CommandInfo {
+        name: "drop-role",
+        usage: "drop role <role>",
+    },
+    CommandInfo {
+        name: "grant-role",
+        usage: "grant role <role> to <username>",
+    },
+    CommandInfo {
+        name: "revoke-role",
+        usage: "revoke role <role> from <username>",
+    },
+    CommandInfo {
+        name: "grant-permission",
+        usage: "grant permission <permission> to <role>",
+    },
+    CommandInfo {
+        name: "revoke-permission",
+        usage: "revoke permission <permission> from <role>",
+    },
+    CommandInfo {
+        name: "show-users",
+        usage: "show users",
+    },
+    CommandInfo {
+        name: "show-roles",
+        usage: "show roles",
+    },
+    CommandInfo {
+        name: "whoami",
+        usage: "whoami",
+    },
+    CommandInfo {
         name: "multi",
         usage: "multi",
     },
@@ -259,6 +311,42 @@ pub enum Command {
     Clear,
     Count,
     Save,
+    Backup,
+    Restore {
+        dump: String,
+    },
+    CreateUser {
+        username: String,
+        password: String,
+    },
+    DropUser {
+        username: String,
+    },
+    CreateRole {
+        role: String,
+    },
+    DropRole {
+        role: String,
+    },
+    GrantRole {
+        role: String,
+        username: String,
+    },
+    RevokeRole {
+        role: String,
+        username: String,
+    },
+    GrantPermission {
+        permission: String,
+        role: String,
+    },
+    RevokePermission {
+        permission: String,
+        role: String,
+    },
+    ShowUsers,
+    ShowRoles,
+    WhoAmI,
     Multi,
     Exec,
     Discard,

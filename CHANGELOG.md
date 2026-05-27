@@ -6,7 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-- No unreleased changes yet.
+### Added
+
+- Breaking transport protocol v2 using `VTP2` magic and protocol version `2`.
+- Required startup capability negotiation before command frames.
+- Negotiated capabilities for zstd compression, request deadlines, server metrics, pipelining, and trace context.
+- Optional request metadata for deadline milliseconds, trace id, and sequence number.
+- Negotiated frame size limits and decompressed frame size validation.
+- Server integration coverage for v2 handshake, old protocol rejection, compression negotiation, deadline rejection, and pipelined request correlation.
+- Logical `BACKUP` and `RESTORE` commands with consistent online JSON dumps and WAL-backed atomic restore.
+- Structured `INFO` output with server, transport, storage, persistence, security, runtime, and metrics sections.
+- Pretty client `HELP` output with command usage instead of a single-line command list.
+- Added server-side RBAC without a separate binary: users, roles, permissions, admin commands, and per-command authorization.
+- Added encrypted persisted auth/RBAC metadata under the data directory.
+- Added client/server/transport support for `create user`, `drop user`, `create role`, `drop role`, `grant role`, `revoke role`, `grant permission`, `revoke permission`, `show users`, `show roles`, and `whoami`.
+- Added tests for RBAC persistence, permission enforcement, and TCP-level read-only user behavior.
+
+### Changed
+
+- Updated all workspace crate versions to `0.2.0`.
+- Docker release publishing now explicitly targets `linux/amd64,linux/arm64` and keeps stable release tags available as both `latest` and the semver version, for example `0.2.0`.
+
+### Compatibility
+
+- `0.2.0` clients and servers are not wire-compatible with `0.1.0` clients and servers.
 
 ## [0.1.0] - 2026-05-27
 

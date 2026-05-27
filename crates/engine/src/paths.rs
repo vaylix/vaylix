@@ -24,6 +24,10 @@ pub struct Paths {
     pub keyring_path: PathBuf,
     /// Temporary keyring path used for atomic updates.
     pub keyring_tmp_path: PathBuf,
+    /// Encrypted server authentication and RBAC metadata path.
+    pub auth_path: PathBuf,
+    /// Temporary authentication metadata path used for atomic updates.
+    pub auth_tmp_path: PathBuf,
 }
 
 impl Paths {
@@ -48,6 +52,8 @@ impl Paths {
             wal_path: data_dir.join("wal.log"),
             keyring_path: data_dir.join("keyring.bin"),
             keyring_tmp_path: data_dir.join("keyring.bin.tmp"),
+            auth_path: data_dir.join("auth.bin"),
+            auth_tmp_path: data_dir.join("auth.bin.tmp"),
             data_dir,
         })
     }
@@ -75,5 +81,7 @@ mod tests {
         assert!(paths.wal_path.ends_with("wal.log"));
         assert!(paths.keyring_path.ends_with("keyring.bin"));
         assert!(paths.keyring_tmp_path.ends_with("keyring.bin.tmp"));
+        assert!(paths.auth_path.ends_with("auth.bin"));
+        assert!(paths.auth_tmp_path.ends_with("auth.bin.tmp"));
     }
 }

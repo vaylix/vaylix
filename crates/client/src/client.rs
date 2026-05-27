@@ -14,7 +14,9 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use transport::{
-    CodecOptions, Request, Response, Status, read_response_from, write_request_to_with_options,
+    ClientHello, CodecOptions, Request, Response, Status, client_options_from_server_hello,
+    read_response_from_with_options, read_server_hello_from, write_client_hello_to,
+    write_request_to_with_options,
 };
 use uuid::Uuid;
 
@@ -103,7 +105,7 @@ impl Client {
             &format!("connecting to {addr} ssl={}", config.ssl),
         );
         let tcp_stream = TcpStream::connect(addr)?;
-        let stream = if config.ssl {
+        let mut stream = if config.ssl {
             ClientStream::Tls(Box::new(connect_tls(
                 tcp_stream,
                 &config.host,
@@ -114,6 +116,16 @@ impl Client {
         } else {
             ClientStream::Tcp(tcp_stream)
         };
+        let client_hello = ClientHello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            desired_compression: config.transport.compression,
+            max_frame_len: config.transport.max_frame_len as u32,
+            auth_intent: config.username.is_some(),
+            ..ClientHello::new("vaylix-client", env!("CARGO_PKG_VERSION"))
+        };
+        write_client_hello_to(&mut stream, &client_hello)?;
+        let server_hello = read_server_hello_from(&mut stream)?;
+        let transport = client_options_from_server_hello(&server_hello)?;
         log_event("INFO", "client.startup", "connection established");
 
         let mut editor = Editor::<ClientHelper, DefaultHistory>::with_config(rustyline_config)?;
@@ -125,7 +137,7 @@ impl Client {
             stream,
             paths,
             output: config.output,
-            transport: config.transport,
+            transport,
         };
 
         if let (Some(username), Some(password)) = (config.username, config.password) {
@@ -194,7 +206,7 @@ impl Client {
         write_request_to_with_options(&mut self.stream, &request, self.transport)?;
         self.stream.flush()?;
 
-        let response = read_response_from(&mut self.stream)?;
+        let response = read_response_from_with_options(&mut self.stream, self.transport)?;
 
         if response.request_id != request_id {
             return Err(ClientError::ResponseIdMismatch {
@@ -288,13 +300,51 @@ fn load_private_key(path: &std::path::Path) -> Result<PrivateKeyDer<'static>> {
 }
 
 fn help_text() -> String {
-    let commands = COMMANDS
+    let name_width = COMMANDS
         .iter()
-        .map(|command| format!("{} ({})", command.name, command.usage))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .map(|command| command.name.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let usage_width = COMMANDS
+        .iter()
+        .map(|command| command.usage.len())
+        .max()
+        .unwrap_or(5)
+        .max(5);
+    let mut lines = vec![
+        "Vaylix command help".to_string(),
+        "".to_string(),
+        format!(
+            "{:<name_width$} | {:<usage_width$}",
+            "command",
+            "usage",
+            name_width = name_width,
+            usage_width = usage_width
+        ),
+        format!("{}-+-{}", "-".repeat(name_width), "-".repeat(usage_width)),
+    ];
+    for command in COMMANDS {
+        lines.push(format!(
+            "{:<name_width$} | {:<usage_width$}",
+            command.name,
+            command.usage,
+            name_width = name_width,
+            usage_width = usage_width
+        ));
+    }
+    lines.extend([
+        "".to_string(),
+        "Examples:".to_string(),
+        "  set user:1 alice ex 60".to_string(),
+        "  get user:1".to_string(),
+        "  scan 0 match user:* count 20".to_string(),
+        "  backup".to_string(),
+        r#"  restore "{\"version\":1,\"created_at_ms\":0,\"source_engine_version\":2,\"source_sequence\":0,\"entries\":[]}""#.to_string(),
+        "  info".to_string(),
+    ]);
 
-    format!("Available commands: {commands}")
+    lines.join("\n")
 }
 
 fn render_response(command: &Command, response: &Response, output: OutputMode) -> Result<String> {
@@ -318,7 +368,8 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             Command::Ping { .. }
             | Command::Get { .. }
             | Command::GetDel { .. }
-            | Command::GetEx { .. } => Ok(response.decode_value()?),
+            | Command::GetEx { .. }
+            | Command::Backup => Ok(response.decode_value()?),
             Command::Set { options, .. } => {
                 if options.return_previous {
                     Ok(response.decode_value()?)
@@ -332,6 +383,14 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::Clear
             | Command::Save
             | Command::Snapshot
+            | Command::CreateUser { .. }
+            | Command::DropUser { .. }
+            | Command::CreateRole { .. }
+            | Command::DropRole { .. }
+            | Command::GrantRole { .. }
+            | Command::RevokeRole { .. }
+            | Command::GrantPermission { .. }
+            | Command::RevokePermission { .. }
             | Command::Multi
             | Command::Discard => Ok("OK".to_string()),
             Command::Exec => Ok(response
@@ -352,7 +411,7 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
                 .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")),
-            Command::Delete { .. } | Command::DbSize | Command::Count => {
+            Command::Delete { .. } | Command::DbSize | Command::Count | Command::Restore { .. } => {
                 Ok(response.decode_count()?.to_string())
             }
             Command::Incr { .. } | Command::Decr { .. } | Command::Ttl { .. } => {
@@ -368,7 +427,12 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
 
                 Ok(format!("cursor={}, keys=[{}]", payload.next_cursor, keys))
             }
-            Command::Info | Command::Metrics | Command::List => {
+            Command::Info
+            | Command::Metrics
+            | Command::List
+            | Command::ShowUsers
+            | Command::ShowRoles
+            | Command::WhoAmI => {
                 let entries = response.decode_entries()?;
                 render_entries(&entries, output)
             }
@@ -569,9 +633,12 @@ mod tests {
     #[test]
     fn help_text_lists_supported_commands() {
         let help = help_text();
-        assert!(help.contains("auth (auth <username> <password>)"));
-        assert!(help.contains("multi (multi)"));
-        assert!(help.contains("exec (exec)"));
+        assert!(help.contains("command"));
+        assert!(help.contains("auth"));
+        assert!(help.contains("auth <username> <password>"));
+        assert!(help.contains("backup"));
+        assert!(help.contains("restore <logical-dump-json>"));
+        assert!(help.contains("Examples:"));
     }
 
     #[test]

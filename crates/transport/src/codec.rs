@@ -5,13 +5,16 @@ use crc32fast::hash;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
+use crate::constants::HEADER_LEN;
 use crate::constants::{FLAG_COMPRESSED_ZSTD, FLAGS_NONE};
-use crate::constants::{HEADER_LEN, MAX_FRAME_LEN};
 use crate::error::{Result, TransportError};
 use crate::frame::FrameHeader;
 use crate::opcode::Opcode;
 use crate::options::{CodecOptions, CompressionMode};
-use crate::request::Request;
+use crate::request::{
+    REQUEST_META_DEADLINE_MS, REQUEST_META_SEQUENCE, REQUEST_META_TRACE_ID, Request,
+    RequestMetadata,
+};
 use crate::response::{Response, Status};
 
 /// Encodes a request into a framed binary packet.
@@ -21,9 +24,19 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>> {
 
 /// Encodes a request into a framed binary packet using caller-provided write options.
 pub fn encode_request_with_options(request: &Request, options: CodecOptions) -> Result<Vec<u8>> {
-    let mut body = BytesMut::with_capacity(17 + request.payload.len());
+    let mut body = BytesMut::with_capacity(18 + request.payload.len());
+    body.put_u8(metadata_flags(request.metadata));
     body.extend_from_slice(request.request_id.as_bytes());
     body.put_u8(request.opcode.into());
+    if let Some(deadline_ms) = request.metadata.deadline_ms {
+        body.put_u64(deadline_ms);
+    }
+    if let Some(trace_id) = request.metadata.trace_id {
+        body.extend_from_slice(trace_id.as_bytes());
+    }
+    if let Some(sequence) = request.metadata.sequence {
+        body.put_u64(sequence);
+    }
     body.extend_from_slice(&request.payload);
 
     encode_frame(&body, options)
@@ -31,7 +44,7 @@ pub fn encode_request_with_options(request: &Request, options: CodecOptions) -> 
 
 /// Decodes a framed binary packet into a request.
 pub fn decode_request(bytes: &[u8]) -> Result<Request> {
-    let body = decode_frame(bytes)?;
+    let body = decode_frame_with_options(bytes, CodecOptions::default())?;
     decode_request_body(&body)
 }
 
@@ -52,19 +65,37 @@ pub fn encode_response_with_options(response: &Response, options: CodecOptions) 
 
 /// Decodes a framed binary packet into a response.
 pub fn decode_response(bytes: &[u8]) -> Result<Response> {
-    let body = decode_frame(bytes)?;
+    let body = decode_frame_with_options(bytes, CodecOptions::default())?;
     decode_response_body(&body)
 }
 
 /// Reads a single framed request from a blocking reader.
 pub fn read_request_from<R: Read>(reader: &mut R) -> Result<Request> {
-    let body = read_frame_from(reader)?;
+    let body = read_frame_from_with_options(reader, CodecOptions::default())?;
+    decode_request_body(&body)
+}
+
+/// Reads a single framed request from a blocking reader using negotiated options.
+pub fn read_request_from_with_options<R: Read>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Request> {
+    let body = read_frame_from_with_options(reader, options)?;
     decode_request_body(&body)
 }
 
 /// Reads a single framed request from an async reader.
 pub async fn read_request_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Request> {
-    let body = read_frame_from_async(reader).await?;
+    let body = read_frame_from_async_with_options(reader, CodecOptions::default()).await?;
+    decode_request_body(&body)
+}
+
+/// Reads a single framed request from an async reader using negotiated options.
+pub async fn read_request_from_async_with_options<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Request> {
+    let body = read_frame_from_async_with_options(reader, options).await?;
     decode_request_body(&body)
 }
 
@@ -106,13 +137,31 @@ pub async fn write_request_to_async_with_options<W: AsyncWrite + Unpin>(
 
 /// Reads a single framed response from a blocking reader.
 pub fn read_response_from<R: Read>(reader: &mut R) -> Result<Response> {
-    let body = read_frame_from(reader)?;
+    let body = read_frame_from_with_options(reader, CodecOptions::default())?;
+    decode_response_body(&body)
+}
+
+/// Reads a single framed response from a blocking reader using negotiated options.
+pub fn read_response_from_with_options<R: Read>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Response> {
+    let body = read_frame_from_with_options(reader, options)?;
     decode_response_body(&body)
 }
 
 /// Reads a single framed response from an async reader.
 pub async fn read_response_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Response> {
-    let body = read_frame_from_async(reader).await?;
+    let body = read_frame_from_async_with_options(reader, CodecOptions::default()).await?;
+    decode_response_body(&body)
+}
+
+/// Reads a single framed response from an async reader using negotiated options.
+pub async fn read_response_from_async_with_options<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Response> {
+    let body = read_frame_from_async_with_options(reader, options).await?;
     decode_response_body(&body)
 }
 
@@ -153,18 +202,18 @@ pub async fn write_response_to_async_with_options<W: AsyncWrite + Unpin>(
 }
 
 fn encode_frame(body: &[u8], options: CodecOptions) -> Result<Vec<u8>> {
-    if body.len() > MAX_FRAME_LEN {
+    if body.len() > options.max_decompressed_frame_len {
         return Err(TransportError::FrameTooLarge {
             length: body.len(),
-            max: MAX_FRAME_LEN,
+            max: options.max_decompressed_frame_len,
         });
     }
 
     let (flags, payload) = maybe_compress(body, options)?;
-    if payload.len() > MAX_FRAME_LEN {
+    if payload.len() > options.max_frame_len {
         return Err(TransportError::FrameTooLarge {
             length: payload.len(),
-            max: MAX_FRAME_LEN,
+            max: options.max_frame_len,
         });
     }
     let checksum = hash(&payload);
@@ -177,13 +226,14 @@ fn encode_frame(body: &[u8], options: CodecOptions) -> Result<Vec<u8>> {
     Ok(frame.to_vec())
 }
 
-fn decode_frame(frame: &[u8]) -> Result<Vec<u8>> {
+fn decode_frame_with_options(frame: &[u8], options: CodecOptions) -> Result<Vec<u8>> {
     if frame.len() < HEADER_LEN {
         return Err(TransportError::UnexpectedEof);
     }
 
     let mut buf = frame;
     let header = FrameHeader::decode(&mut buf)?;
+    enforce_frame_limit(header.length as usize, options.max_frame_len)?;
     let payload_length = header.length as usize;
 
     if buf.remaining() < payload_length {
@@ -199,15 +249,49 @@ fn decode_frame(frame: &[u8]) -> Result<Vec<u8>> {
         return Err(TransportError::ChecksumMismatch);
     }
 
-    maybe_decompress(&header, payload)
+    maybe_decompress(&header, payload, options)
 }
 
-fn read_frame_from<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
+pub(crate) fn read_startup_frame_from<R: Read>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Vec<u8>> {
+    read_frame_from_with_options(reader, options)
+}
+
+pub(crate) fn write_startup_frame_to<W: Write>(
+    writer: &mut W,
+    body: &[u8],
+    options: CodecOptions,
+) -> Result<()> {
+    writer.write_all(&encode_frame(body, options)?)?;
+    Ok(())
+}
+
+pub(crate) async fn read_startup_frame_from_async<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Vec<u8>> {
+    read_frame_from_async_with_options(reader, options).await
+}
+
+pub(crate) async fn write_startup_frame_to_async<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    body: &[u8],
+    options: CodecOptions,
+) -> Result<()> {
+    writer.write_all(&encode_frame(body, options)?).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+fn read_frame_from_with_options<R: Read>(reader: &mut R, options: CodecOptions) -> Result<Vec<u8>> {
     let mut header_bytes = [0_u8; HEADER_LEN];
     read_exact_or_eof(reader, &mut header_bytes)?;
 
     let mut header_slice = header_bytes.as_slice();
     let header = FrameHeader::decode(&mut header_slice)?;
+    enforce_frame_limit(header.length as usize, options.max_frame_len)?;
     let mut payload = vec![0_u8; header.length as usize];
 
     if !payload.is_empty() {
@@ -218,15 +302,19 @@ fn read_frame_from<R: Read>(reader: &mut R) -> Result<Vec<u8>> {
         return Err(TransportError::ChecksumMismatch);
     }
 
-    maybe_decompress(&header, payload)
+    maybe_decompress(&header, payload, options)
 }
 
-async fn read_frame_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>> {
+async fn read_frame_from_async_with_options<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    options: CodecOptions,
+) -> Result<Vec<u8>> {
     let mut header_bytes = [0_u8; HEADER_LEN];
     read_exact_or_eof_async(reader, &mut header_bytes).await?;
 
     let mut header_slice = header_bytes.as_slice();
     let header = FrameHeader::decode(&mut header_slice)?;
+    enforce_frame_limit(header.length as usize, options.max_frame_len)?;
     let mut payload = vec![0_u8; header.length as usize];
 
     if !payload.is_empty() {
@@ -237,7 +325,7 @@ async fn read_frame_from_async<R: AsyncRead + Unpin>(reader: &mut R) -> Result<V
         return Err(TransportError::ChecksumMismatch);
     }
 
-    maybe_decompress(&header, payload)
+    maybe_decompress(&header, payload, options)
 }
 
 fn maybe_compress(body: &[u8], options: CodecOptions) -> Result<(u8, Vec<u8>)> {
@@ -253,11 +341,30 @@ fn maybe_compress(body: &[u8], options: CodecOptions) -> Result<(u8, Vec<u8>)> {
     Ok((FLAG_COMPRESSED_ZSTD, compressed))
 }
 
-fn maybe_decompress(header: &FrameHeader, payload: Vec<u8>) -> Result<Vec<u8>> {
+fn maybe_decompress(
+    header: &FrameHeader,
+    payload: Vec<u8>,
+    options: CodecOptions,
+) -> Result<Vec<u8>> {
     match header.flags {
         FLAGS_NONE => Ok(payload),
-        FLAG_COMPRESSED_ZSTD => zstd::bulk::decompress(&payload, MAX_FRAME_LEN)
-            .map_err(|_| TransportError::CompressionFailure),
+        FLAG_COMPRESSED_ZSTD => {
+            let decode_limit = options.max_decompressed_frame_len.saturating_add(1);
+            let decoder = zstd::stream::read::Decoder::new(payload.as_slice())
+                .map_err(|_| TransportError::CompressionFailure)?;
+            let mut limited = decoder.take(decode_limit as u64);
+            let mut decoded = Vec::new();
+            limited
+                .read_to_end(&mut decoded)
+                .map_err(|_| TransportError::CompressionFailure)?;
+            if decoded.len() > options.max_decompressed_frame_len {
+                return Err(TransportError::DecompressedFrameTooLarge {
+                    length: decoded.len(),
+                    max: options.max_decompressed_frame_len,
+                });
+            }
+            Ok(decoded)
+        }
         other => Err(TransportError::UnsupportedFlags(other)),
     }
 }
@@ -265,16 +372,74 @@ fn maybe_decompress(header: &FrameHeader, payload: Vec<u8>) -> Result<Vec<u8>> {
 fn decode_request_body(body: &[u8]) -> Result<Request> {
     let mut buf = body;
 
-    if buf.remaining() < 17 {
+    if buf.remaining() < 18 {
         return Err(TransportError::UnexpectedEof);
     }
 
+    let flags = buf.get_u8();
+    if flags & !(REQUEST_META_DEADLINE_MS | REQUEST_META_TRACE_ID | REQUEST_META_SEQUENCE) != 0 {
+        return Err(TransportError::CorruptedPayload);
+    }
     let request_id =
         Uuid::from_slice(&buf.copy_to_bytes(16)).map_err(|_| TransportError::CorruptedPayload)?;
     let opcode = Opcode::try_from(buf.get_u8())?;
+    let deadline_ms = if flags & REQUEST_META_DEADLINE_MS != 0 {
+        if buf.remaining() < 8 {
+            return Err(TransportError::UnexpectedEof);
+        }
+        Some(buf.get_u64())
+    } else {
+        None
+    };
+    let trace_id = if flags & REQUEST_META_TRACE_ID != 0 {
+        if buf.remaining() < 16 {
+            return Err(TransportError::UnexpectedEof);
+        }
+        Some(
+            Uuid::from_slice(&buf.copy_to_bytes(16))
+                .map_err(|_| TransportError::CorruptedPayload)?,
+        )
+    } else {
+        None
+    };
+    let sequence = if flags & REQUEST_META_SEQUENCE != 0 {
+        if buf.remaining() < 8 {
+            return Err(TransportError::UnexpectedEof);
+        }
+        Some(buf.get_u64())
+    } else {
+        None
+    };
     let payload = buf.to_vec();
 
-    Ok(Request::new(request_id, opcode, payload))
+    Ok(
+        Request::new(request_id, opcode, payload).with_metadata(RequestMetadata {
+            deadline_ms,
+            trace_id,
+            sequence,
+        }),
+    )
+}
+
+fn metadata_flags(metadata: RequestMetadata) -> u8 {
+    let mut flags = 0;
+    if metadata.deadline_ms.is_some() {
+        flags |= REQUEST_META_DEADLINE_MS;
+    }
+    if metadata.trace_id.is_some() {
+        flags |= REQUEST_META_TRACE_ID;
+    }
+    if metadata.sequence.is_some() {
+        flags |= REQUEST_META_SEQUENCE;
+    }
+    flags
+}
+
+fn enforce_frame_limit(length: usize, max: usize) -> Result<()> {
+    if length > max {
+        return Err(TransportError::FrameTooLarge { length, max });
+    }
+    Ok(())
 }
 
 fn decode_response_body(body: &[u8]) -> Result<Response> {
@@ -325,9 +490,9 @@ mod tests {
 
     use super::{
         decode_request, decode_response, encode_request, encode_request_with_options,
-        encode_response, read_request_from, read_request_from_async, read_response_from,
-        read_response_from_async, write_request_to, write_request_to_async, write_response_to,
-        write_response_to_async,
+        encode_response, read_request_from, read_request_from_async,
+        read_request_from_with_options, read_response_from, read_response_from_async,
+        write_request_to, write_request_to_async, write_response_to, write_response_to_async,
     };
     use crate::constants::{FLAG_COMPRESSED_ZSTD, HEADER_LEN, MAGIC_BYTES, MAX_FRAME_LEN, VERSION};
     use crate::{CodecOptions, CompressionMode, Request, Response, Status, TransportError};
@@ -428,6 +593,42 @@ mod tests {
             Command::Count,
             Command::Save,
             Command::Snapshot,
+            Command::Backup,
+            Command::Restore {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::CreateUser {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            },
+            Command::DropUser {
+                username: "alice".to_string(),
+            },
+            Command::CreateRole {
+                role: "readonly".to_string(),
+            },
+            Command::DropRole {
+                role: "readonly".to_string(),
+            },
+            Command::GrantRole {
+                role: "readonly".to_string(),
+                username: "alice".to_string(),
+            },
+            Command::RevokeRole {
+                role: "readonly".to_string(),
+                username: "alice".to_string(),
+            },
+            Command::GrantPermission {
+                permission: "read".to_string(),
+                role: "readonly".to_string(),
+            },
+            Command::RevokePermission {
+                permission: "read".to_string(),
+                role: "readonly".to_string(),
+            },
+            Command::ShowUsers,
+            Command::ShowRoles,
+            Command::WhoAmI,
         ];
 
         for command in commands {
@@ -580,12 +781,13 @@ mod tests {
     #[test]
     fn rejects_unknown_opcode() {
         let mut payload = Vec::new();
+        payload.push(0);
         payload.extend_from_slice(id(1).as_bytes());
         payload.push(0xff);
         let mut frame = Vec::from(MAGIC_BYTES);
         frame.push(VERSION);
         frame.push(0);
-        frame.extend_from_slice(&17_u32.to_be_bytes());
+        frame.extend_from_slice(&18_u32.to_be_bytes());
         frame.extend_from_slice(&crc32fast::hash(&payload).to_be_bytes());
         frame.extend_from_slice(&payload);
 
@@ -723,11 +925,48 @@ mod tests {
             CodecOptions {
                 compression: CompressionMode::Zstd,
                 compression_threshold_bytes: 32,
+                ..CodecOptions::default()
             },
         )
         .unwrap();
         let decoded = decode_request(&encoded).unwrap();
 
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn rejects_decompressed_payload_above_negotiated_limit() {
+        let request = Request::from_command(
+            id(100),
+            Command::Set {
+                key: "blob".to_string(),
+                value: "x".repeat(4_096),
+                options: SetOptions::default(),
+            },
+        )
+        .unwrap();
+        let encoded = encode_request_with_options(
+            &request,
+            CodecOptions {
+                compression: CompressionMode::Zstd,
+                compression_threshold_bytes: 0,
+                ..CodecOptions::default()
+            },
+        )
+        .unwrap();
+        let mut cursor = Cursor::new(encoded);
+
+        assert!(matches!(
+            read_request_from_with_options(
+                &mut cursor,
+                CodecOptions {
+                    compression: CompressionMode::Zstd,
+                    compression_threshold_bytes: 0,
+                    max_frame_len: 8 * 1024 * 1024,
+                    max_decompressed_frame_len: 64,
+                }
+            ),
+            Err(TransportError::DecompressedFrameTooLarge { .. })
+        ));
     }
 }

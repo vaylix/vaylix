@@ -17,16 +17,22 @@ async fn try_main() -> server::Result<()> {
     {
         return Err(server::ServerError::TlsConfiguration);
     }
-    let auth_config = if args.disable_auth {
-        None
-    } else {
-        Some(server::auth::AuthConfig::new(args.user, args.password)?)
-    };
     let paths = match args.data_dir {
         Some(data_dir) => engine::Paths::from_data_dir(data_dir)?,
         None => engine::Paths::new()?,
     };
     let keyring = engine::load_or_create_keyring(&paths.keyring_path, &paths.keyring_tmp_path)?;
+    let auth_config = if args.disable_auth {
+        None
+    } else {
+        Some(server::auth::AuthConfig::load_or_bootstrap(
+            paths.auth_path.clone(),
+            paths.auth_tmp_path.clone(),
+            keyring.clone(),
+            args.user,
+            args.password,
+        )?)
+    };
     let engine_options = engine::EngineOptions {
         wal_sync: match args.wal_sync {
             WalSyncMode::Buffered => engine::WalSyncPolicy::Buffered,
@@ -56,6 +62,7 @@ async fn try_main() -> server::Result<()> {
         CodecOptions {
             compression: CompressionMode::None,
             compression_threshold_bytes: 0,
+            ..CodecOptions::default()
         }
     } else {
         CodecOptions::default()

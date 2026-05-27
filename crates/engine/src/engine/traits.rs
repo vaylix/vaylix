@@ -9,6 +9,24 @@ pub struct ScanPage {
     pub keys: Vec<String>,
 }
 
+/// Logical backup document used by `BACKUP` and `RESTORE`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogicalBackup {
+    pub version: u32,
+    pub created_at_ms: u64,
+    pub source_engine_version: u32,
+    pub source_sequence: u64,
+    pub entries: Vec<LogicalBackupEntry>,
+}
+
+/// One key/value entry in a logical backup.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LogicalBackupEntry {
+    pub key: String,
+    pub value: String,
+    pub expires_at_ms: Option<u64>,
+}
+
 /// Result of evaluating one command inside an atomic transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransactionResult {
@@ -170,4 +188,10 @@ pub trait StorageEngine {
 
     /// Persists a new snapshot and truncates the WAL.
     fn snapshot(&mut self) -> Result<()>;
+
+    /// Exports a consistent logical backup as JSON.
+    fn logical_backup(&mut self) -> Result<String>;
+
+    /// Replaces the current data with a logical backup in one WAL-backed batch.
+    fn restore_logical_backup(&mut self, dump: &str) -> Result<usize>;
 }
