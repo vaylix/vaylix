@@ -1,25 +1,41 @@
-# =========================
-# Builder Stage
-# =========================
+# syntax=docker/dockerfile:1.7
 
-FROM rust:1.95.0-bookworm AS builder
+FROM rust:1.95.0-bookworm AS chef
+
+RUN cargo install cargo-chef --locked
 
 WORKDIR /app
 
-# Copy manifests first for dependency caching
-COPY Cargo.toml Cargo.lock ./
 
+FROM chef AS planner
+
+COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Build release binary
-RUN cargo build --release -p server
+RUN cargo chef prepare --recipe-path recipe.json
 
 
-# =========================
-# Runtime Stage
-# =========================
+FROM chef AS builder
 
-FROM debian:bookworm-slim
+COPY --from=planner /app/recipe.json recipe.json
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo chef cook --release --package server --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/app/target \
+    cargo build --release -p server \
+    && mkdir -p /out \
+    && cp target/release/vaylix /out/vaylix
+
+
+FROM debian:bookworm-slim AS runtime
 
 ENV VAYLIX_BIND=0.0.0.0
 ENV VAYLIX_PORT=9173
@@ -35,10 +51,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy server binary
-COPY --from=builder \
-    /app/target/release/vaylix \
-    /usr/local/bin/vaylix
+COPY --from=builder /out/vaylix /usr/local/bin/vaylix
 
 EXPOSE 9173
 

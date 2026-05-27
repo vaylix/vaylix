@@ -1,17 +1,20 @@
 use crate::engine::EngineState;
 use crate::{EngineError, Result};
-use postcard::{from_bytes, to_allocvec};
+
+use super::binary;
 
 /// Serializes the current engine state into snapshot bytes.
 pub fn serialize(data: &EngineState) -> Result<Vec<u8>> {
-    let serialized = to_allocvec(data).map_err(EngineError::SnapshotSerialize)?;
+    let serialized =
+        binary::encode(data).map_err(|err| EngineError::SnapshotSerialize(err.to_string()))?;
 
     Ok(serialized)
 }
 
 /// Deserializes snapshot bytes back into an engine state.
 pub fn deserialize(bytes: &[u8]) -> Result<EngineState> {
-    let deserialized: EngineState = from_bytes(bytes).map_err(EngineError::SnapshotDeserialize)?;
+    let deserialized: EngineState =
+        binary::decode(bytes).map_err(|err| EngineError::SnapshotDeserialize(err.to_string()))?;
 
     Ok(deserialized)
 }

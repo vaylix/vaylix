@@ -1,6 +1,5 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
-use transport::CompressionMode;
 
 use crate::auth::{DEFAULT_PASSWORD, DEFAULT_USERNAME};
 
@@ -13,22 +12,6 @@ pub enum WalSyncMode {
     Flush,
     /// Force the kernel to sync written data after each append.
     Sync,
-}
-
-/// CLI-friendly transport compression modes.
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum CompressionModeArg {
-    None,
-    Zstd,
-}
-
-impl From<CompressionModeArg> for CompressionMode {
-    fn from(value: CompressionModeArg) -> Self {
-        match value {
-            CompressionModeArg::None => CompressionMode::None,
-            CompressionModeArg::Zstd => CompressionMode::Zstd,
-        }
-    }
 }
 
 /// Command-line arguments for the Vaylix server binary.
@@ -60,15 +43,22 @@ pub struct Args {
     pub idle_timeout_seconds: Option<u64>,
 
     /// Enable TLS for client/server transport.
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        env = "VAYLIX_SSL",
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
     pub ssl: bool,
 
     /// PEM-encoded TLS certificate chain used when SSL is enabled.
-    #[arg(long, requires = "ssl")]
+    #[arg(long, env = "VAYLIX_TLS_CERT", requires = "ssl")]
     pub tls_cert: Option<PathBuf>,
 
     /// PEM-encoded PKCS#8 or RSA private key used when SSL is enabled.
-    #[arg(long, requires = "ssl")]
+    #[arg(long, env = "VAYLIX_TLS_KEY", requires = "ssl")]
     pub tls_key: Option<PathBuf>,
 
     /// Optional data directory override. This is the directory that should be mounted in containers.
@@ -91,6 +81,14 @@ pub struct Args {
     /// Password required for authenticated access.
     #[arg(long, env = "VAYLIX_PASSWORD", default_value = DEFAULT_PASSWORD)]
     pub password: String,
+
+    /// Disable authentication. Intended for local development and trusted test networks only.
+    #[arg(long, env = "VAYLIX_DISABLE_AUTH", default_value_t = false)]
+    pub disable_auth: bool,
+
+    /// Disable outbound transport compression.
+    #[arg(long, env = "VAYLIX_DISABLE_COMPRESSION", default_value_t = false)]
+    pub disable_compression: bool,
 
     /// Maximum request payload bytes accepted per command after framing.
     #[arg(long, default_value_t = 1_048_576)]
@@ -119,14 +117,6 @@ pub struct Args {
     /// Burst size for the per-connection request limiter.
     #[arg(long, default_value_t = 400)]
     pub request_burst: u32,
-
-    /// Compression mode used for outbound transport frames.
-    #[arg(long, value_enum, default_value_t = CompressionModeArg::None)]
-    pub compression: CompressionModeArg,
-
-    /// Minimum payload size before outbound transport compression is attempted.
-    #[arg(long, default_value_t = 256)]
-    pub compression_threshold_bytes: usize,
 
     /// Optional audit log path override. Defaults to <data-dir>/audit.log.
     #[arg(long)]

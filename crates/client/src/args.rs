@@ -1,27 +1,11 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
-use transport::CompressionMode;
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum OutputModeArg {
     Plain,
     Table,
     Json,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-pub enum CompressionModeArg {
-    None,
-    Zstd,
-}
-
-impl From<CompressionModeArg> for CompressionMode {
-    fn from(value: CompressionModeArg) -> Self {
-        match value {
-            CompressionModeArg::None => CompressionMode::None,
-            CompressionModeArg::Zstd => CompressionMode::Zstd,
-        }
-    }
 }
 
 #[derive(Parser, Debug)]
@@ -40,7 +24,13 @@ pub struct Args {
     pub port: u16,
 
     /// Enable TLS for the client connection.
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        value_parser = clap::value_parser!(bool)
+    )]
     pub ssl: bool,
 
     /// Optional PEM-encoded CA certificate used to validate the server certificate.
@@ -55,15 +45,15 @@ pub struct Args {
     #[arg(long)]
     pub password: Option<String>,
 
+    /// Disable automatic AUTH on connect.
+    #[arg(long, default_value_t = false)]
+    pub disable_auth: bool,
+
+    /// Disable outbound transport compression.
+    #[arg(long, default_value_t = false)]
+    pub disable_compression: bool,
+
     /// Output rendering mode.
     #[arg(long, value_enum, default_value_t = OutputModeArg::Plain)]
     pub output: OutputModeArg,
-
-    /// Compression mode to use for outbound transport frames.
-    #[arg(long, value_enum, default_value_t = CompressionModeArg::None)]
-    pub compression: CompressionModeArg,
-
-    /// Minimum payload size before outbound transport compression is attempted.
-    #[arg(long, default_value_t = 256)]
-    pub compression_threshold_bytes: usize,
 }

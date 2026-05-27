@@ -7,8 +7,8 @@ use crate::engine::{
 use crate::error::Result;
 use crate::paths::Paths;
 use crate::store::{
-    Manifest, WalEntry, WalOperation, append, deserialize, keyring, load, load_manifest, replay,
-    save, save_manifest, serialize, truncate,
+    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, append, deserialize, keyring, load,
+    load_manifest, replay, save, save_manifest, serialize, truncate,
 };
 use command::Command;
 use crc32fast::hash;
@@ -49,7 +49,7 @@ impl Engine {
         };
 
         if let Some(manifest) = load_manifest(&paths.manifest_path)? {
-            if manifest.storage_format_version != 1 {
+            if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
                 return Err(crate::EngineError::UnsupportedStorageFormat {
                     resource: "manifest",
                 });
@@ -941,7 +941,7 @@ impl StorageEngine for Engine {
         )?;
 
         let manifest = Manifest {
-            storage_format_version: 1,
+            storage_format_version: STORAGE_FORMAT_VERSION,
             engine_version: durable_state.metadata.version,
             last_snapshot_sequence: sequence,
             last_snapshot_at_ms: snapshot_started_at_ms,

@@ -2,13 +2,14 @@ use crate::config::StorageKeyring;
 use crate::store::crypto::{decrypt, encrypt};
 use crate::{EngineError, Result, WalSyncPolicy};
 use crc32fast::hash;
-use postcard::{Error, from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::OpenOptions,
     io::{ErrorKind, Read, Write},
     path::Path,
 };
+
+use super::binary;
 
 const MAX_WAL_ENTRY_SIZE: u32 = 4 * 1024 * 1024;
 
@@ -60,7 +61,7 @@ pub fn append(
 ) -> Result<()> {
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
 
-    let bytes = to_allocvec(entry).map_err(EngineError::WalSerialize)?;
+    let bytes = binary::encode(entry).map_err(|err| EngineError::WalSerialize(err.to_string()))?;
     let durable_bytes = match keyring {
         Some(keyring) => encrypt(keyring.active(), "wal entry", &bytes)?,
         None => bytes,
@@ -135,11 +136,8 @@ pub fn replay(path: &Path, keyring: Option<&StorageKeyring>) -> Result<Vec<WalEn
             None => entry_buf,
         };
 
-        let entry: WalEntry = match from_bytes(&plain_bytes) {
-            Ok(value) => value,
-            Err(Error::DeserializeUnexpectedEnd) => break,
-            Err(err) => return Err(EngineError::WalDeserialize(err)),
-        };
+        let entry: WalEntry = binary::decode(&plain_bytes)
+            .map_err(|err| EngineError::WalDeserialize(err.to_string()))?;
 
         entries.push(entry);
     }
@@ -169,8 +167,6 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
-
-    use postcard::to_allocvec;
 
     use super::{WalEntry, WalOperation, append, replay, truncate};
     use crate::WalSyncPolicy;
@@ -203,6 +199,10 @@ mod tests {
                 value: "alice".to_string(),
             }],
         )
+    }
+
+    fn encode_entry(entry: &WalEntry) -> Vec<u8> {
+        crate::store::binary::encode(entry).unwrap()
     }
 
     #[test]
@@ -300,7 +300,7 @@ mod tests {
         let valid = encrypt(
             keyring.active(),
             "wal entry",
-            &to_allocvec(&sample_entry(1)).unwrap(),
+            &encode_entry(&sample_entry(1)),
         )
         .unwrap();
         corrupt_file
@@ -311,7 +311,7 @@ mod tests {
         let mut corrupt = encrypt(
             keyring.active(),
             "wal entry",
-            &to_allocvec(&sample_entry(2)).unwrap(),
+            &encode_entry(&sample_entry(2)),
         )
         .unwrap();
         *corrupt.last_mut().unwrap() = 0xff;

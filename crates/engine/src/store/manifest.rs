@@ -1,10 +1,14 @@
 use crate::{EngineError, Result};
-use postcard::{from_bytes, to_allocvec};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::ErrorKind;
 use std::io::Write;
 use std::path::Path;
+
+use super::binary;
+
+/// Current durable storage serialization format.
+pub const STORAGE_FORMAT_VERSION: u32 = 2;
 
 /// Metadata persisted alongside snapshots to describe the durable baseline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,7 +29,8 @@ pub struct Manifest {
 
 /// Saves a manifest atomically using a temporary file and rename.
 pub fn save(manifest: &Manifest, path: &Path, temp_path: &Path) -> Result<()> {
-    let bytes = to_allocvec(manifest).map_err(EngineError::ManifestSerialize)?;
+    let bytes =
+        binary::encode(manifest).map_err(|err| EngineError::ManifestSerialize(err.to_string()))?;
     let mut file = File::create(temp_path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
@@ -38,7 +43,8 @@ pub fn save(manifest: &Manifest, path: &Path, temp_path: &Path) -> Result<()> {
 pub fn load(path: &Path) -> Result<Option<Manifest>> {
     match fs::read(path) {
         Ok(bytes) => {
-            let manifest = from_bytes(&bytes).map_err(EngineError::ManifestDeserialize)?;
+            let manifest = binary::decode(&bytes)
+                .map_err(|err| EngineError::ManifestDeserialize(err.to_string()))?;
             Ok(Some(manifest))
         }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),

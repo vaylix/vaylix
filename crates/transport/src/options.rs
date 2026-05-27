@@ -2,9 +2,9 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionMode {
     /// Disable transport compression.
-    #[default]
     None,
     /// Compress frame payloads with zstd.
+    #[default]
     Zstd,
 }
 
@@ -30,8 +30,8 @@ pub struct CodecOptions {
 impl Default for CodecOptions {
     fn default() -> Self {
         Self {
-            compression: CompressionMode::None,
-            compression_threshold_bytes: 256,
+            compression: CompressionMode::Zstd,
+            compression_threshold_bytes: 0,
         }
     }
 }

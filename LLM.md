@@ -13,16 +13,17 @@ The current implementation is a single-node, string-to-string key/value database
 - a shared transport crate used by both client and server
 - a Tokio multi-client server
 - authenticated client connections
+- optional TLS client/server transport
 - encrypted-at-rest WAL and snapshots
 - append-only audit logging
-- optional frame-level zstd compression
+- default-on outbound frame-level zstd compression
 - deterministic command parsing and explicit error codes
 
 The long-term target is broader:
 - scale from a single node to replicated and sharded deployments
 - keep the transport layer evolvable enough for replication traffic and cluster coordination
 - harden transactional behavior toward stronger ACID guarantees than the current session-queued model
-- add auditability and optional transport compression without breaking engine layering
+- add auditability and compression negotiation without breaking engine layering
 
 ## Workspace Layout
 
@@ -105,30 +106,32 @@ Request IDs are UUIDs, not random integers. This removes the old local counter/r
 
 ## TLS
 
-TLS is supported but optional.
+TLS is supported but disabled by default.
 
-Enable TLS from the client with either:
-- `--ssl`
-- connection URL query `?ssl=true`
+Client behavior:
+- the client uses plaintext TCP by default
+- `--ssl` opens a TLS connection
+- connection URL query `ssl=true` also enables TLS
+- system root store by default
+- optional custom CA via `--tls-ca-cert`
 
-Enable TLS on the server with:
+Server inputs:
 - `--ssl`
 - `--tls-cert`
 - `--tls-key`
 
-Client trust behavior:
-- system root store by default
-- optional custom CA via `--tls-ca-cert`
+When `--ssl` is enabled on the server, both `--tls-cert` and `--tls-key` are required. Plain TCP remains useful for local development and private test networks, but production deployments should enable TLS.
 
 ## Authentication
 
-Authentication is mandatory.
+Authentication is enabled by default.
 
 Development defaults:
 - username: `vaylix`
 - password: `vaylix`
 
 These defaults exist for local development only. Production deployments should always override them.
+Use `--disable-auth` only for local/trusted testing. When auth is disabled on the server, commands execute without an `AUTH` handshake.
 
 Client connection string format:
 - `vaylix://user:password@host:port`
@@ -137,6 +140,7 @@ Supported query parameters:
 - `ssl=true`
 - `output=plain|table|json`
 - `ca_cert=/path/to/ca.pem`
+- `auth=false`
 - `compression=none|zstd`
 
 CLI flags override URL-derived values when both are provided.
@@ -147,6 +151,8 @@ Durability model:
 - encrypted snapshot
 - WAL replay on startup
 - manifest metadata for snapshot state
+- storage format version `2`
+- MessagePack-based engine serialization inside encrypted snapshot, WAL, manifest, and keyring files
 
 Snapshot flow:
 1. purge expired keys
@@ -176,6 +182,8 @@ Current model:
 - keys can be rotated by the server and old keys remain available for decryption of older persisted data
 
 This is meant to keep persistence concerns under server control rather than exposing raw key material as a CLI requirement.
+
+Older pre-version-2 storage files are not migrated automatically. Recovery must fail closed with an unsupported-format or decode error rather than silently reading incompatible persisted data.
 
 ## Audit Logging
 
@@ -211,17 +219,18 @@ Architectural target:
 
 Do not document distributed support as implemented today. It is a roadmap constraint, not a delivered feature.
 
-## Compression Direction
+## Compression
 
-Transport compression is implemented as an outbound frame-level setting:
-- mode: `none` or `zstd`
-- configurable compression threshold in bytes
+Transport compression is enabled by default for outbound frames in the current client/server binaries:
+- default mode: `zstd`
+- default threshold: `0`
 - readers decompress automatically based on the frame flag
 - frame checksums validate the on-wire compressed payload
+- `--disable-compression` disables outbound compression on that process
 
 Still missing:
 - compression negotiation
-- compression policy coordination between peers
+- compression policy coordination between mixed-version peers
 - replication-stream tuning
 
 ## Abuse Controls and Runtime Guards
@@ -241,7 +250,9 @@ Current runtime protections:
 - engine work is funneled through a dedicated engine worker
 - optional background snapshotter
 - optional background expiration sweeper
-- TLS and plain TCP support through the same transport abstraction
+- plaintext TCP by default
+- TLS accept path when `--ssl` is enabled
+- auth and compression enabled by default with explicit disable flags
 
 ## Client Runtime
 
@@ -274,6 +285,7 @@ Pull request CI runs:
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace`
+- `cargo audit`
 
 Release workflow goal:
 - publish multi-OS client binaries
@@ -286,7 +298,8 @@ Release workflow goal:
 - no replication or sharding yet
 - no ACL or multi-user authorization model
 - no online backup/restore tool in the current tree
-- TLS is optional rather than mandatory
+- no TLS certificate automation or rotation workflow yet
+- TLS is opt-in rather than mandatory
 
 ## Guidance for Agents
 
