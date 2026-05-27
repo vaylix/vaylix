@@ -12,6 +12,11 @@ async fn main() {
 
 async fn try_main() -> server::Result<()> {
     let args = Args::parse();
+    if !args.ssl
+        && (args.tls_cert.is_some() || args.tls_key.is_some() || args.tls_client_ca.is_some())
+    {
+        return Err(server::ServerError::TlsConfiguration);
+    }
     let auth_config = if args.disable_auth {
         None
     } else {
@@ -39,7 +44,11 @@ async fn try_main() -> server::Result<()> {
             .tls_key
             .as_deref()
             .ok_or(server::ServerError::TlsConfiguration)?;
-        Some(server::tls::load_server_config(cert, key)?)
+        Some(server::tls::load_server_config(
+            cert,
+            key,
+            args.tls_client_ca.as_deref(),
+        )?)
     } else {
         None
     };

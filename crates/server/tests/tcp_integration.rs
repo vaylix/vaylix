@@ -6,9 +6,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command::{Command, Expiration, SetCondition, SetOptions};
 use engine::{Engine, EngineOptions, Paths, WalSyncPolicy};
-use rcgen::generate_simple_self_signed;
+use rcgen::{
+    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    generate_simple_self_signed,
+};
 use rustls::pki_types::ServerName;
 use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ClientConfig, RootCertStore};
 use server::Server;
 use server::audit::AuditLogger;
@@ -80,23 +84,114 @@ fn tls_config_for(root: &Path) -> (Arc<rustls::ServerConfig>, String) {
     fs::write(&key_path, key_pem.as_bytes()).unwrap();
 
     (
-        server::tls::load_server_config(&cert_path, &key_path).unwrap(),
+        server::tls::load_server_config(&cert_path, &key_path, None).unwrap(),
         cert_pem,
     )
 }
 
-async fn connect_tls(addr: SocketAddr, cert_pem: &str) -> TlsStream<TcpStream> {
+struct MutualTlsMaterial {
+    server_config: Arc<rustls::ServerConfig>,
+    ca_pem: String,
+    client_cert_pem: String,
+    client_key_pem: String,
+}
+
+fn mutual_tls_config_for(root: &Path) -> MutualTlsMaterial {
+    fs::create_dir_all(root).unwrap();
+    let ca_key = KeyPair::generate().unwrap();
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+    let server_key = KeyPair::generate().unwrap();
+    let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    server_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let client_key = KeyPair::generate().unwrap();
+    let mut client_params = CertificateParams::default();
+    client_params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .unwrap();
+
+    let server_cert_path = root.join("server.crt");
+    let server_key_path = root.join("server.key");
+    let client_ca_path = root.join("client-ca.crt");
+    fs::write(&server_cert_path, server_cert.pem().as_bytes()).unwrap();
+    fs::write(&server_key_path, server_key.serialize_pem().as_bytes()).unwrap();
+    fs::write(&client_ca_path, ca_cert.pem().as_bytes()).unwrap();
+
+    MutualTlsMaterial {
+        server_config: server::tls::load_server_config(
+            &server_cert_path,
+            &server_key_path,
+            Some(&client_ca_path),
+        )
+        .unwrap(),
+        ca_pem: ca_cert.pem(),
+        client_cert_pem: client_cert.pem(),
+        client_key_pem: client_key.serialize_pem(),
+    }
+}
+
+fn root_store_from_pem(cert_pem: &str) -> RootCertStore {
     let mut roots = RootCertStore::empty();
-    let cert_der = rustls::pki_types::CertificateDer::pem_slice_iter(cert_pem.as_bytes())
+    let cert_der = CertificateDer::pem_slice_iter(cert_pem.as_bytes())
         .next()
         .unwrap()
         .unwrap();
     roots.add(cert_der).unwrap();
+
+    roots
+}
+
+async fn connect_tls(addr: SocketAddr, cert_pem: &str) -> TlsStream<TcpStream> {
     let tls_config = Arc::new(
         ClientConfig::builder()
-            .with_root_certificates(roots)
+            .with_root_certificates(root_store_from_pem(cert_pem))
             .with_no_client_auth(),
     );
+    connect_tls_with_config(addr, tls_config).await.unwrap()
+}
+
+async fn connect_mutual_tls(
+    addr: SocketAddr,
+    ca_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+) -> TlsStream<TcpStream> {
+    let client_certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(client_cert_pem.as_bytes())
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+    let client_key = PrivateKeyDer::from_pem_slice(client_key_pem.as_bytes())
+        .unwrap()
+        .clone_key();
+    let tls_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(root_store_from_pem(ca_pem))
+            .with_client_auth_cert(client_certs, client_key)
+            .unwrap(),
+    );
+    connect_tls_with_config(addr, tls_config).await.unwrap()
+}
+
+async fn connect_tls_with_config(
+    addr: SocketAddr,
+    tls_config: Arc<ClientConfig>,
+) -> std::io::Result<TlsStream<TcpStream>> {
     let connector = TlsConnector::from(tls_config);
     let tcp_stream = timeout(Duration::from_secs(2), TcpStream::connect(addr))
         .await
@@ -104,7 +199,7 @@ async fn connect_tls(addr: SocketAddr, cert_pem: &str) -> TlsStream<TcpStream> {
         .unwrap();
     let server_name = ServerName::try_from("localhost".to_string()).unwrap();
 
-    connector.connect(server_name, tcp_stream).await.unwrap()
+    connector.connect(server_name, tcp_stream).await
 }
 
 async fn connect_tcp(addr: SocketAddr) -> TcpStream {
@@ -417,6 +512,102 @@ async fn accepts_tls_connections_when_enabled() {
         .await
         .unwrap();
     assert_eq!(response.status, Status::Ok);
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepts_mutual_tls_connections_with_valid_client_certificate() {
+    let root = temp_dir("mtls-valid");
+    let mtls = mutual_tls_config_for(&root);
+
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
+        },
+    )
+    .unwrap();
+
+    let server = Server::with_engine(
+        "127.0.0.1".to_string(),
+        0,
+        16,
+        engine,
+        runtime_with_tls(None, Some(mtls.server_config)),
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let mut tls_stream = connect_mutual_tls(
+        addr,
+        &mtls.ca_pem,
+        &mtls.client_cert_pem,
+        &mtls.client_key_pem,
+    )
+    .await;
+
+    authenticate(&mut tls_stream).await;
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rejects_tls_clients_without_certificate_when_mutual_tls_is_required() {
+    let root = temp_dir("mtls-missing-client-cert");
+    let mtls = mutual_tls_config_for(&root);
+
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
+        },
+    )
+    .unwrap();
+
+    let server = Server::with_engine(
+        "127.0.0.1".to_string(),
+        0,
+        16,
+        engine,
+        runtime_with_tls(None, Some(mtls.server_config)),
+    )
+    .await
+    .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let tls_config = Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(root_store_from_pem(&mtls.ca_pem))
+            .with_no_client_auth(),
+    );
+    let mut tls_stream = connect_tls_with_config(addr, tls_config).await.unwrap();
+    let auth = Request::from_command(
+        id(1),
+        Command::Auth {
+            username: "vaylix".to_string(),
+            password: "vaylix".to_string(),
+        },
+    )
+    .unwrap();
+    let write_result = write_request_to_async(&mut tls_stream, &auth).await;
+    if write_result.is_ok() {
+        let read_result = timeout(
+            Duration::from_secs(2),
+            transport::read_response_from_async(&mut tls_stream),
+        )
+        .await;
+        assert!(read_result.is_err() || read_result.unwrap().is_err());
+    }
 
     server_task.abort();
     fs::remove_dir_all(root).ok();

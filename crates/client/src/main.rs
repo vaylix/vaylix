@@ -76,11 +76,22 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
                 (key == "ca_cert").then(|| PathBuf::from(value.into_owned()))
             })
         });
+        let tls_client_cert = args.tls_client_cert.or_else(|| {
+            parsed.query_pairs().find_map(|(key, value)| {
+                (key == "client_cert").then(|| PathBuf::from(value.into_owned()))
+            })
+        });
+        let tls_client_key = args.tls_client_key.or_else(|| {
+            parsed.query_pairs().find_map(|(key, value)| {
+                (key == "client_key").then(|| PathBuf::from(value.into_owned()))
+            })
+        });
         if tls_ca_cert.is_some() && !ssl {
             return Err(error::ClientError::InvalidConfiguration(
                 "tls_ca_cert requires ssl=true or --ssl",
             ));
         }
+        validate_mtls_config(ssl, tls_client_cert.as_ref(), tls_client_key.as_ref())?;
         let disable_auth = args.disable_auth
             || parsed
                 .query_pairs()
@@ -95,6 +106,8 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
             port,
             ssl,
             tls_ca_cert,
+            tls_client_cert,
+            tls_client_key,
             username: (!disable_auth).then(|| {
                 args.user
                     .or(parsed_username)
@@ -114,11 +127,18 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
                 "tls_ca_cert requires --ssl",
             ));
         }
+        validate_mtls_config(
+            args.ssl,
+            args.tls_client_cert.as_ref(),
+            args.tls_client_key.as_ref(),
+        )?;
         Ok(ClientConfig {
             host: args.host,
             port: args.port,
             ssl: args.ssl,
             tls_ca_cert: args.tls_ca_cert,
+            tls_client_cert: args.tls_client_cert,
+            tls_client_key: args.tls_client_key,
             username: (!args.disable_auth)
                 .then(|| args.user.unwrap_or_else(|| DEFAULT_USERNAME.to_string())),
             password: (!args.disable_auth).then(|| {
@@ -129,6 +149,25 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
             transport: transport_options(args.disable_compression),
         })
     }
+}
+
+fn validate_mtls_config(
+    ssl: bool,
+    tls_client_cert: Option<&PathBuf>,
+    tls_client_key: Option<&PathBuf>,
+) -> error::Result<()> {
+    if (tls_client_cert.is_some() || tls_client_key.is_some()) && !ssl {
+        return Err(error::ClientError::InvalidConfiguration(
+            "tls client certificate options require ssl=true or --ssl",
+        ));
+    }
+    if tls_client_cert.is_some() != tls_client_key.is_some() {
+        return Err(error::ClientError::InvalidConfiguration(
+            "tls_client_cert and tls_client_key must be provided together",
+        ));
+    }
+
+    Ok(())
 }
 
 fn transport_options(disable_compression: bool) -> CodecOptions {
@@ -158,6 +197,8 @@ mod tests {
             port: 9173,
             ssl: false,
             tls_ca_cert: None,
+            tls_client_cert: None,
+            tls_client_key: None,
             user: None,
             password: None,
             disable_auth: false,
@@ -183,6 +224,8 @@ mod tests {
             port: 9173,
             ssl: false,
             tls_ca_cert: None,
+            tls_client_cert: None,
+            tls_client_key: None,
             user: Some("override".to_string()),
             password: Some("override-pass".to_string()),
             disable_auth: false,
@@ -205,6 +248,8 @@ mod tests {
             port: 9173,
             ssl: false,
             tls_ca_cert: None,
+            tls_client_cert: None,
+            tls_client_key: None,
             user: None,
             password: None,
             disable_auth: false,
@@ -227,6 +272,8 @@ mod tests {
             port: 9173,
             ssl: false,
             tls_ca_cert: None,
+            tls_client_cert: None,
+            tls_client_key: None,
             user: None,
             password: None,
             disable_auth: false,
@@ -247,5 +294,58 @@ mod tests {
 
         let explicit_false = Args::try_parse_from(["vaylix-client", "--ssl", "false"]).unwrap();
         assert!(!explicit_false.ssl);
+    }
+
+    #[test]
+    fn url_can_configure_mutual_tls_paths() {
+        let config = parse_client_config(Args {
+            url: Some(
+                "vaylix://alice:secret@db.internal:9999?ssl=true&client_cert=/tmp/client.crt&client_key=/tmp/client.key"
+                    .to_string(),
+            ),
+            host: "127.0.0.1".to_string(),
+            port: 9173,
+            ssl: false,
+            tls_ca_cert: None,
+            tls_client_cert: None,
+            tls_client_key: None,
+            user: None,
+            password: None,
+            disable_auth: false,
+            disable_compression: false,
+            output: OutputModeArg::Plain,
+        })
+        .unwrap();
+
+        assert!(config.ssl);
+        assert_eq!(
+            config.tls_client_cert.as_deref(),
+            Some(std::path::Path::new("/tmp/client.crt"))
+        );
+        assert_eq!(
+            config.tls_client_key.as_deref(),
+            Some(std::path::Path::new("/tmp/client.key"))
+        );
+    }
+
+    #[test]
+    fn rejects_partial_mutual_tls_configuration() {
+        let err = parse_client_config(Args {
+            url: None,
+            host: "127.0.0.1".to_string(),
+            port: 9173,
+            ssl: true,
+            tls_ca_cert: None,
+            tls_client_cert: Some("/tmp/client.crt".into()),
+            tls_client_key: None,
+            user: None,
+            password: None,
+            disable_auth: false,
+            disable_compression: false,
+            output: OutputModeArg::Plain,
+        })
+        .unwrap_err();
+
+        assert_eq!(err.code(), "CLI-008");
     }
 }

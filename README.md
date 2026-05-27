@@ -1,6 +1,6 @@
 # Vaylix
 
-Vaylix is a Rust key/value database project built around a strict transport boundary. It currently provides a single-node, string-to-string database with a framed binary protocol, a Tokio multi-client server, default-on authentication, default-on transport compression, optional TLS, and encrypted-at-rest persistence.
+Vaylix is a Rust key/value database project built around a strict transport boundary. It currently provides a single-node, string-to-string database with a framed binary protocol, a Tokio multi-client server, default-on authentication, default-on transport compression, optional TLS/mTLS, and encrypted-at-rest persistence.
 
 The project is intentionally structured as a serious systems codebase rather than a demo:
 - protocol and engine responsibilities are separated
@@ -16,6 +16,7 @@ Implemented today:
 - shared transport crate for client and server
 - authentication enabled by default, with an explicit local-only disable flag
 - optional TLS via `--ssl`, `--tls-cert`, and `--tls-key`
+- optional mTLS by adding `--tls-client-ca` on the server and a client certificate/key on the client
 - zstd transport compression enabled by default, with an explicit disable flag
 - WAL + snapshot durability
 - server-managed storage keyring with rotation support
@@ -93,6 +94,24 @@ cargo run -p client -- \
   --tls-ca-cert ./certs/ca.crt
 ```
 
+Require client certificates with mTLS:
+
+```bash
+cargo run -p server -- \
+  --bind 127.0.0.1 \
+  --port 9173 \
+  --ssl \
+  --tls-cert ./certs/server.crt \
+  --tls-key ./certs/server.key \
+  --tls-client-ca ./certs/client-ca.crt
+
+cargo run -p client -- \
+  --url 'vaylix://vaylix:vaylix@127.0.0.1:9173?ssl=true' \
+  --tls-ca-cert ./certs/server-ca.crt \
+  --tls-client-cert ./certs/client.crt \
+  --tls-client-key ./certs/client.key
+```
+
 Authentication and compression are enabled by default. For trusted local testing only, use `--disable-auth` or `--disable-compression` on the matching side.
 
 ## Docker Persistence
@@ -115,6 +134,7 @@ The current durable storage format is version `2` and uses encrypted MessagePack
 
 - Authentication is enabled by default. `--disable-auth` exists for local/trusted testing only.
 - TLS is disabled by default and enabled with `--ssl`.
+- mTLS is enabled by setting `--tls-client-ca` on the server. The client must then provide `--tls-client-cert` and `--tls-client-key`.
 - Transport compression is enabled by default. `--disable-compression` exists for compatibility and diagnostics.
 - At-rest encryption is managed by the server; there is no raw `--data-key` flag.
 - Audit logging is enabled by default under the data directory.
