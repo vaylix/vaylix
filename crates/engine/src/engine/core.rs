@@ -1119,7 +1119,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             engine
-                .get_ex("user:2", Some(Expiration::Milliseconds(1_500)), false)
+                .get_ex("user:2", Some(Expiration::Seconds(60)), false)
                 .unwrap(),
             Some("carol".to_string())
         );
