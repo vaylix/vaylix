@@ -1,6 +1,5 @@
 use crate::config::{StorageKey, StorageKeyring};
 use crate::{EngineError, Result};
-use postcard::{from_bytes, to_allocvec};
 use rand::random;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
@@ -8,6 +7,8 @@ use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+use super::binary;
 
 const DEFAULT_SECRET_BYTES: usize = 32;
 const DEFAULT_ROTATION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -80,7 +81,8 @@ fn from_runtime(keyring: &StorageKeyring) -> StoredKeyring {
 }
 
 fn save(keyring: &StorageKeyring, path: &Path, temp_path: &Path) -> Result<()> {
-    let bytes = to_allocvec(&from_runtime(keyring)).map_err(EngineError::ManifestSerialize)?;
+    let bytes = binary::encode(&from_runtime(keyring))
+        .map_err(|err| EngineError::ManifestSerialize(err.to_string()))?;
     let mut file = File::create(temp_path)?;
     file.write_all(&bytes)?;
     file.sync_all()?;
@@ -92,8 +94,8 @@ fn save(keyring: &StorageKeyring, path: &Path, temp_path: &Path) -> Result<()> {
 fn load(path: &Path) -> Result<Option<StorageKeyring>> {
     match fs::read(path) {
         Ok(bytes) => {
-            let stored =
-                from_bytes::<StoredKeyring>(&bytes).map_err(EngineError::ManifestDeserialize)?;
+            let stored: StoredKeyring = binary::decode(&bytes)
+                .map_err(|err| EngineError::ManifestDeserialize(err.to_string()))?;
             Ok(Some(to_runtime(stored)))
         }
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),

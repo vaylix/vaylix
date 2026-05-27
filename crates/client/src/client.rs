@@ -95,10 +95,13 @@ impl Client {
 
         let helper = ClientHelper::new();
         let paths = Paths::new()?;
-        log_event("INFO", "client.startup", &format!("connecting to {addr}"));
+        log_event(
+            "INFO",
+            "client.startup",
+            &format!("connecting to {addr} ssl={}", config.ssl),
+        );
         let tcp_stream = TcpStream::connect(addr)?;
         let stream = if config.ssl {
-            log_event("INFO", "client.tls", "tls enabled for client connection");
             ClientStream::Tls(Box::new(connect_tls(
                 tcp_stream,
                 &config.host,
@@ -540,7 +543,7 @@ mod tests {
         let config = ClientConfig {
             host: "127.0.0.1".to_string(),
             port: 9173,
-            ssl: true,
+            ssl: false,
             tls_ca_cert: None,
             username: Some("u".to_string()),
             password: Some("p".to_string()),
@@ -548,6 +551,5 @@ mod tests {
             transport: CodecOptions::default(),
         };
         assert_eq!(config.output, OutputMode::Json);
-        assert!(config.ssl);
     }
 }

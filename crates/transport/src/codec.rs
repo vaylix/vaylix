@@ -161,6 +161,12 @@ fn encode_frame(body: &[u8], options: CodecOptions) -> Result<Vec<u8>> {
     }
 
     let (flags, payload) = maybe_compress(body, options)?;
+    if payload.len() > MAX_FRAME_LEN {
+        return Err(TransportError::FrameTooLarge {
+            length: payload.len(),
+            max: MAX_FRAME_LEN,
+        });
+    }
     let checksum = hash(&payload);
     let mut header = FrameHeader::new(payload.len() as u32, checksum)?;
     header.flags = flags;
@@ -243,9 +249,6 @@ fn maybe_compress(body: &[u8], options: CodecOptions) -> Result<(u8, Vec<u8>)> {
 
     let compressed =
         zstd::bulk::compress(body, 3).map_err(|_| TransportError::CompressionFailure)?;
-    if compressed.len() >= body.len() {
-        return Ok((FLAGS_NONE, body.to_vec()));
-    }
 
     Ok((FLAG_COMPRESSED_ZSTD, compressed))
 }
@@ -326,7 +329,7 @@ mod tests {
         read_response_from_async, write_request_to, write_request_to_async, write_response_to,
         write_response_to_async,
     };
-    use crate::constants::{HEADER_LEN, MAGIC_BYTES, MAX_FRAME_LEN, VERSION};
+    use crate::constants::{FLAG_COMPRESSED_ZSTD, HEADER_LEN, MAGIC_BYTES, MAX_FRAME_LEN, VERSION};
     use crate::{CodecOptions, CompressionMode, Request, Response, Status, TransportError};
 
     fn id(value: u128) -> Uuid {
@@ -482,6 +485,22 @@ mod tests {
 
         assert_eq!(read_request_from(&mut request_cursor).unwrap(), request);
         assert_eq!(read_response_from(&mut response_cursor).unwrap(), response);
+    }
+
+    #[test]
+    fn default_encoding_compresses_frames() {
+        let request = Request::from_command(
+            id(10),
+            Command::Ping {
+                message: Some("hello".to_string()),
+            },
+        )
+        .unwrap();
+
+        let encoded = encode_request(&request).unwrap();
+
+        assert_eq!(encoded[5], FLAG_COMPRESSED_ZSTD);
+        assert_eq!(decode_request(&encoded).unwrap(), request);
     }
 
     #[test]

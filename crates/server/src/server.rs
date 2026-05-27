@@ -47,7 +47,7 @@ pub struct ServerRuntimeConfig {
     pub snapshot_interval: Option<Duration>,
     pub expiration_sweep_interval: Option<Duration>,
     pub idle_timeout: Option<Duration>,
-    pub auth_config: AuthConfig,
+    pub auth_config: Option<AuthConfig>,
     pub guards: ServerGuards,
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
     pub transport: CodecOptions,
@@ -281,11 +281,13 @@ impl Server {
             "INFO",
             "server.startup",
             &format!(
-                "binding listener to {addr} max_connections={max_connections} snapshot_interval={:?} sweep_interval={:?} idle_timeout={:?} tls_enabled={}",
+                "binding listener to {addr} max_connections={max_connections} snapshot_interval={:?} sweep_interval={:?} idle_timeout={:?} tls_enabled={} auth_required={} compression={}",
                 runtime.snapshot_interval,
                 runtime.expiration_sweep_interval,
                 runtime.idle_timeout,
                 runtime.tls_config.is_some(),
+                runtime.auth_config.is_some(),
+                runtime.transport.compression.as_str(),
             ),
         );
 
@@ -294,7 +296,10 @@ impl Server {
         log_event(
             "INFO",
             "server.startup",
-            &format!("listener ready on {local_addr} auth_required=true"),
+            &format!(
+                "listener ready on {local_addr} auth_required={}",
+                runtime.auth_config.is_some()
+            ),
         );
 
         Ok(Self {
@@ -753,10 +758,19 @@ async fn process_command(
     command: Command,
 ) -> Result<Response> {
     if matches!(command, Command::Auth { .. }) {
-        return handle_auth(metrics, &runtime.auth_config, session, request_id, command);
+        return handle_auth(
+            metrics,
+            runtime.auth_config.as_ref(),
+            session,
+            request_id,
+            command,
+        );
     }
 
-    if !session.is_authenticated() && !matches!(command, Command::Ping { .. }) {
+    if runtime.auth_config.is_some()
+        && !session.is_authenticated()
+        && !matches!(command, Command::Ping { .. })
+    {
         metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         return Err(ServerError::AuthenticationRequired);
     }
@@ -781,6 +795,14 @@ async fn process_command(
             let mut entries = engine.info().await?;
             entries.extend(metrics.snapshot());
             entries.push((
+                "auth_required".to_string(),
+                runtime.auth_config.is_some().to_string(),
+            ));
+            entries.push((
+                "compression".to_string(),
+                runtime.transport.compression.as_str().to_string(),
+            ));
+            entries.push((
                 "tls_enabled".to_string(),
                 runtime.tls_config.is_some().to_string(),
             ));
@@ -792,13 +814,19 @@ async fn process_command(
 
 fn handle_auth(
     metrics: Arc<Metrics>,
-    auth_config: &AuthConfig,
+    auth_config: Option<&AuthConfig>,
     session: &mut SessionState,
     request_id: Uuid,
     command: Command,
 ) -> Result<Response> {
     let Command::Auth { username, password } = command else {
         unreachable!();
+    };
+
+    let Some(auth_config) = auth_config else {
+        session.authenticated_user = Some("anonymous".to_string());
+        metrics.auth_successes.fetch_add(1, Ordering::Relaxed);
+        return Ok(Response::ok(request_id));
     };
 
     if auth_config.verify(&username, &password) {
@@ -1204,7 +1232,7 @@ mod tests {
             snapshot_interval: None,
             expiration_sweep_interval: None,
             idle_timeout: None,
-            auth_config: AuthConfig::new("dbuser".to_string(), "secret".to_string()).unwrap(),
+            auth_config: Some(AuthConfig::new("dbuser".to_string(), "secret".to_string()).unwrap()),
             guards: guards(),
             tls_config: None,
             transport: CodecOptions::default(),
@@ -1459,7 +1487,7 @@ mod tests {
         let mut session = SessionState::new(&guards());
         let denied = handle_auth(
             Arc::clone(&metrics),
-            &auth,
+            Some(&auth),
             &mut session,
             id(1),
             Command::Auth {
@@ -1470,7 +1498,7 @@ mod tests {
         assert!(denied.is_err());
         let ok = handle_auth(
             Arc::clone(&metrics),
-            &auth,
+            Some(&auth),
             &mut session,
             id(2),
             Command::Auth {

@@ -8,7 +8,7 @@ use args::{Args, OutputModeArg};
 use clap::Parser;
 use client::{Client, ClientConfig, OutputMode};
 use std::path::PathBuf;
-use transport::CodecOptions;
+use transport::{CodecOptions, CompressionMode};
 use url::Url;
 
 const DEFAULT_USERNAME: &str = "vaylix";
@@ -36,11 +36,6 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
         OutputModeArg::Table => OutputMode::Table,
         OutputModeArg::Json => OutputMode::Json,
     };
-    let cli_transport = CodecOptions {
-        compression: args.compression.into(),
-        compression_threshold_bytes: args.compression_threshold_bytes,
-    };
-
     if let Some(url) = args.url {
         let parsed = Url::parse(&url).map_err(std::io::Error::other)?;
         if parsed.scheme() != "vaylix" {
@@ -73,29 +68,8 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
             .unwrap_or(cli_output);
         let url_ssl = parsed
             .query_pairs()
-            .any(|(key, value)| key == "ssl" && value.eq_ignore_ascii_case("true"));
-        let compression = parsed
-            .query_pairs()
-            .find_map(|(key, value)| {
-                if key == "compression" {
-                    match value.as_ref() {
-                        "none" => Some(transport::CompressionMode::None),
-                        "zstd" => Some(transport::CompressionMode::Zstd),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(cli_transport.compression);
-        let compression_threshold_bytes = parsed
-            .query_pairs()
-            .find_map(|(key, value)| {
-                (key == "compression_threshold_bytes")
-                    .then(|| value.parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap_or(cli_transport.compression_threshold_bytes);
+            .find_map(|(key, value)| (key == "ssl").then(|| value.eq_ignore_ascii_case("true")))
+            .unwrap_or(false);
         let ssl = args.ssl || url_ssl;
         let tls_ca_cert = args.tls_ca_cert.or_else(|| {
             parsed.query_pairs().find_map(|(key, value)| {
@@ -104,30 +78,35 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
         });
         if tls_ca_cert.is_some() && !ssl {
             return Err(error::ClientError::InvalidConfiguration(
-                "tls_ca_cert requires ssl=true",
+                "tls_ca_cert requires ssl=true or --ssl",
             ));
         }
+        let disable_auth = args.disable_auth
+            || parsed
+                .query_pairs()
+                .any(|(key, value)| key == "auth" && value.eq_ignore_ascii_case("false"));
+        let disable_compression = args.disable_compression
+            || parsed
+                .query_pairs()
+                .any(|(key, value)| key == "compression" && value.eq_ignore_ascii_case("none"));
 
         Ok(ClientConfig {
             host,
             port,
             ssl,
             tls_ca_cert,
-            username: Some(
+            username: (!disable_auth).then(|| {
                 args.user
                     .or(parsed_username)
-                    .unwrap_or_else(|| DEFAULT_USERNAME.to_string()),
-            ),
-            password: Some(
+                    .unwrap_or_else(|| DEFAULT_USERNAME.to_string())
+            }),
+            password: (!disable_auth).then(|| {
                 args.password
                     .or(parsed_password)
-                    .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
-            ),
+                    .unwrap_or_else(|| DEFAULT_PASSWORD.to_string())
+            }),
             output,
-            transport: CodecOptions {
-                compression,
-                compression_threshold_bytes,
-            },
+            transport: transport_options(disable_compression),
         })
     } else {
         if args.tls_ca_cert.is_some() && !args.ssl {
@@ -140,22 +119,35 @@ fn parse_client_config(args: Args) -> error::Result<ClientConfig> {
             port: args.port,
             ssl: args.ssl,
             tls_ca_cert: args.tls_ca_cert,
-            username: Some(args.user.unwrap_or_else(|| DEFAULT_USERNAME.to_string())),
-            password: Some(
+            username: (!args.disable_auth)
+                .then(|| args.user.unwrap_or_else(|| DEFAULT_USERNAME.to_string())),
+            password: (!args.disable_auth).then(|| {
                 args.password
-                    .unwrap_or_else(|| DEFAULT_PASSWORD.to_string()),
-            ),
+                    .unwrap_or_else(|| DEFAULT_PASSWORD.to_string())
+            }),
             output: cli_output,
-            transport: cli_transport,
+            transport: transport_options(args.disable_compression),
         })
+    }
+}
+
+fn transport_options(disable_compression: bool) -> CodecOptions {
+    if disable_compression {
+        CodecOptions {
+            compression: CompressionMode::None,
+            compression_threshold_bytes: 0,
+        }
+    } else {
+        CodecOptions::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DEFAULT_PASSWORD, DEFAULT_USERNAME, parse_client_config};
-    use crate::args::{Args, CompressionModeArg, OutputModeArg};
+    use crate::args::{Args, OutputModeArg};
     use crate::client::OutputMode;
+    use clap::Parser;
     use transport::CompressionMode;
 
     #[test]
@@ -168,9 +160,9 @@ mod tests {
             tls_ca_cert: None,
             user: None,
             password: None,
+            disable_auth: false,
+            disable_compression: false,
             output: OutputModeArg::Plain,
-            compression: CompressionModeArg::None,
-            compression_threshold_bytes: 256,
         })
         .unwrap();
 
@@ -179,7 +171,8 @@ mod tests {
         assert_eq!(config.username.as_deref(), Some("alice"));
         assert_eq!(config.password.as_deref(), Some("secret"));
         assert_eq!(config.output, OutputMode::Json);
-        assert_eq!(config.transport.compression, CompressionMode::None);
+        assert!(!config.ssl);
+        assert_eq!(config.transport.compression, CompressionMode::Zstd);
     }
 
     #[test]
@@ -192,9 +185,9 @@ mod tests {
             tls_ca_cert: None,
             user: Some("override".to_string()),
             password: Some("override-pass".to_string()),
+            disable_auth: false,
+            disable_compression: false,
             output: OutputModeArg::Table,
-            compression: CompressionModeArg::None,
-            compression_threshold_bytes: 256,
         })
         .unwrap();
 
@@ -214,13 +207,45 @@ mod tests {
             tls_ca_cert: None,
             user: None,
             password: None,
+            disable_auth: false,
+            disable_compression: false,
             output: OutputModeArg::Plain,
-            compression: CompressionModeArg::None,
-            compression_threshold_bytes: 256,
         })
         .unwrap();
 
         assert_eq!(config.username.as_deref(), Some(DEFAULT_USERNAME));
         assert_eq!(config.password.as_deref(), Some(DEFAULT_PASSWORD));
+    }
+
+    #[test]
+    fn can_disable_auth_and_compression() {
+        let config = parse_client_config(Args {
+            url: Some(
+                "vaylix://alice:secret@db.internal:9999?auth=false&compression=none".to_string(),
+            ),
+            host: "127.0.0.1".to_string(),
+            port: 9173,
+            ssl: false,
+            tls_ca_cert: None,
+            user: None,
+            password: None,
+            disable_auth: false,
+            disable_compression: false,
+            output: OutputModeArg::Plain,
+        })
+        .unwrap();
+
+        assert_eq!(config.username, None);
+        assert_eq!(config.password, None);
+        assert_eq!(config.transport.compression, CompressionMode::None);
+    }
+
+    #[test]
+    fn ssl_flag_accepts_optional_bool_value() {
+        let enabled = Args::try_parse_from(["vaylix-client", "--ssl"]).unwrap();
+        assert!(enabled.ssl);
+
+        let explicit_false = Args::try_parse_from(["vaylix-client", "--ssl", "false"]).unwrap();
+        assert!(!explicit_false.ssl);
     }
 }

@@ -1,6 +1,6 @@
 use clap::Parser;
 use server::{Args, Server, WalSyncMode};
-use transport::CodecOptions;
+use transport::{CodecOptions, CompressionMode};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -12,7 +12,11 @@ async fn main() {
 
 async fn try_main() -> server::Result<()> {
     let args = Args::parse();
-    let auth_config = server::auth::AuthConfig::new(args.user, args.password)?;
+    let auth_config = if args.disable_auth {
+        None
+    } else {
+        Some(server::auth::AuthConfig::new(args.user, args.password)?)
+    };
     let paths = match args.data_dir {
         Some(data_dir) => engine::Paths::from_data_dir(data_dir)?,
         None => engine::Paths::new()?,
@@ -37,10 +41,15 @@ async fn try_main() -> server::Result<()> {
             .ok_or(server::ServerError::TlsConfiguration)?;
         Some(server::tls::load_server_config(cert, key)?)
     } else {
-        if args.tls_cert.is_some() || args.tls_key.is_some() {
-            return Err(server::ServerError::TlsConfiguration);
-        }
         None
+    };
+    let transport = if args.disable_compression {
+        CodecOptions {
+            compression: CompressionMode::None,
+            compression_threshold_bytes: 0,
+        }
+    } else {
+        CodecOptions::default()
     };
     let audit_log_path = args
         .audit_log_path
@@ -68,10 +77,7 @@ async fn try_main() -> server::Result<()> {
             request_burst: args.request_burst,
         },
         tls_config,
-        transport: CodecOptions {
-            compression: args.compression.into(),
-            compression_threshold_bytes: args.compression_threshold_bytes,
-        },
+        transport,
         audit_logger: std::sync::Arc::new(audit_logger),
     };
     let server = Server::new(

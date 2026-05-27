@@ -9,13 +9,13 @@ pub enum EngineError {
     #[error("filesystem I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("snapshot serialization failed: {0}")]
-    SnapshotSerialize(#[source] postcard::Error),
+    SnapshotSerialize(String),
     #[error("snapshot deserialization failed: {0}")]
-    SnapshotDeserialize(#[source] postcard::Error),
+    SnapshotDeserialize(String),
     #[error("manifest serialization failed: {0}")]
-    ManifestSerialize(#[source] postcard::Error),
+    ManifestSerialize(String),
     #[error("manifest deserialization failed: {0}")]
-    ManifestDeserialize(#[source] postcard::Error),
+    ManifestDeserialize(String),
     #[error("checksum validation failed for {resource}")]
     ChecksumMismatch { resource: &'static str },
     #[error("encrypted storage operation failed for {resource}")]
@@ -23,9 +23,9 @@ pub enum EngineError {
     #[error("unsupported storage format for {resource}")]
     UnsupportedStorageFormat { resource: &'static str },
     #[error("write-ahead log serialization failed: {0}")]
-    WalSerialize(#[source] postcard::Error),
+    WalSerialize(String),
     #[error("write-ahead log deserialization failed: {0}")]
-    WalDeserialize(#[source] postcard::Error),
+    WalDeserialize(String),
     #[error("value for key '{key}' is not a valid integer: {value}")]
     InvalidIntegerValue { key: String, value: String },
     #[error("numeric overflow for key '{key}'")]
