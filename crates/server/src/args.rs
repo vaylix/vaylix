@@ -61,6 +61,10 @@ pub struct Args {
     #[arg(long, env = "VAYLIX_TLS_KEY", requires = "ssl")]
     pub tls_key: Option<PathBuf>,
 
+    /// PEM-encoded CA bundle used to require and verify client certificates.
+    #[arg(long, env = "VAYLIX_TLS_CLIENT_CA", requires = "ssl")]
+    pub tls_client_ca: Option<PathBuf>,
+
     /// Optional data directory override. This is the directory that should be mounted in containers.
     #[arg(long, env = "VAYLIX_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
@@ -121,4 +125,32 @@ pub struct Args {
     /// Optional audit log path override. Defaults to <data-dir>/audit.log.
     #[arg(long)]
     pub audit_log_path: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Args;
+    use clap::Parser;
+
+    #[test]
+    fn ssl_flag_accepts_optional_bool_value() {
+        let enabled = Args::try_parse_from(["vaylix", "--ssl"]).unwrap();
+        assert!(enabled.ssl);
+
+        let explicit_false = Args::try_parse_from(["vaylix", "--ssl", "false"]).unwrap();
+        assert!(!explicit_false.ssl);
+    }
+
+    #[test]
+    fn tls_client_ca_requires_ssl() {
+        let result = Args::try_parse_from(["vaylix", "--tls-client-ca", "/tmp/ca.crt"]);
+        assert!(result.is_err());
+
+        let parsed =
+            Args::try_parse_from(["vaylix", "--ssl", "--tls-client-ca", "/tmp/ca.crt"]).unwrap();
+        assert_eq!(
+            parsed.tls_client_ca.as_deref(),
+            Some(std::path::Path::new("/tmp/ca.crt"))
+        );
+    }
 }

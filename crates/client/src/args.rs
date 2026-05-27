@@ -37,6 +37,14 @@ pub struct Args {
     #[arg(long)]
     pub tls_ca_cert: Option<PathBuf>,
 
+    /// Optional PEM-encoded client certificate chain used for mTLS.
+    #[arg(long)]
+    pub tls_client_cert: Option<PathBuf>,
+
+    /// Optional PEM-encoded client private key used for mTLS.
+    #[arg(long)]
+    pub tls_client_key: Option<PathBuf>,
+
     /// Username used for server authentication.
     #[arg(long)]
     pub user: Option<String>,

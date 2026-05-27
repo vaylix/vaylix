@@ -13,7 +13,7 @@ The current implementation is a single-node, string-to-string key/value database
 - a shared transport crate used by both client and server
 - a Tokio multi-client server
 - authenticated client connections
-- optional TLS client/server transport
+- optional TLS and mTLS client/server transport
 - encrypted-at-rest WAL and snapshots
 - append-only audit logging
 - default-on outbound frame-level zstd compression
@@ -114,13 +114,18 @@ Client behavior:
 - connection URL query `ssl=true` also enables TLS
 - system root store by default
 - optional custom CA via `--tls-ca-cert`
+- optional mTLS client identity via `--tls-client-cert` and `--tls-client-key`
+- connection URL query params `client_cert=/path/to/client.crt` and `client_key=/path/to/client.key` can also provide mTLS material
 
 Server inputs:
 - `--ssl`
 - `--tls-cert`
 - `--tls-key`
+- `--tls-client-ca`
 
 When `--ssl` is enabled on the server, both `--tls-cert` and `--tls-key` are required. Plain TCP remains useful for local development and private test networks, but production deployments should enable TLS.
+
+When `--tls-client-ca` is provided, the server requires clients to present a certificate chaining to that CA. mTLS is additive to username/password authentication; it should not be described as replacing application-level auth.
 
 ## Authentication
 
@@ -140,6 +145,8 @@ Supported query parameters:
 - `ssl=true`
 - `output=plain|table|json`
 - `ca_cert=/path/to/ca.pem`
+- `client_cert=/path/to/client.crt`
+- `client_key=/path/to/client.key`
 - `auth=false`
 - `compression=none|zstd`
 
