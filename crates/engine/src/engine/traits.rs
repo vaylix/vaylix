@@ -194,4 +194,7 @@ pub trait StorageEngine {
 
     /// Replaces the current data with a logical backup in one WAL-backed batch.
     fn restore_logical_backup(&mut self, dump: &str) -> Result<usize>;
+
+    /// Validates a logical backup and returns the number of live entries it contains.
+    fn validate_logical_backup(&mut self, dump: &str) -> Result<usize>;
 }

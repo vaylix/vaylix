@@ -31,6 +31,9 @@ pub enum Permission {
     Restore,
     Metrics,
     Snapshot,
+    Clear,
+    UserAdmin,
+    RoleAdmin,
 }
 
 impl Permission {
@@ -43,6 +46,9 @@ impl Permission {
             Self::Restore,
             Self::Metrics,
             Self::Snapshot,
+            Self::Clear,
+            Self::UserAdmin,
+            Self::RoleAdmin,
         ]
         .into_iter()
         .collect()
@@ -57,6 +63,9 @@ impl Permission {
             Self::Restore => "restore",
             Self::Metrics => "metrics",
             Self::Snapshot => "snapshot",
+            Self::Clear => "clear",
+            Self::UserAdmin => "user_admin",
+            Self::RoleAdmin => "role_admin",
         }
     }
 
@@ -69,9 +78,19 @@ impl Permission {
             "restore" => Ok(Self::Restore),
             "metrics" => Ok(Self::Metrics),
             "snapshot" => Ok(Self::Snapshot),
+            "clear" => Ok(Self::Clear),
+            "user_admin" => Ok(Self::UserAdmin),
+            "role_admin" => Ok(Self::RoleAdmin),
             _ => Err(ServerError::InvalidPermission(value.to_string())),
         }
     }
+}
+
+/// A permission grant scoped to a glob-like key pattern.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PermissionGrant {
+    pub permission: Permission,
+    pub pattern: String,
 }
 
 /// Authenticated session identity with resolved permissions.
@@ -79,11 +98,26 @@ impl Permission {
 pub struct Identity {
     pub username: String,
     pub permissions: BTreeSet<Permission>,
+    pub grants: BTreeSet<PermissionGrant>,
 }
 
 impl Identity {
     pub fn has(&self, permission: Permission) -> bool {
         self.permissions.contains(&Permission::Admin) || self.permissions.contains(&permission)
+    }
+
+    pub fn allows_key(&self, permission: Permission, key: &str) -> bool {
+        self.permissions.contains(&Permission::Admin)
+            || self.grants.iter().any(|grant| {
+                grant.permission == permission && wildcard_matches(&grant.pattern, key)
+            })
+    }
+
+    pub fn allows_pattern(&self, permission: Permission, requested_pattern: &str) -> bool {
+        self.permissions.contains(&Permission::Admin)
+            || self.grants.iter().any(|grant| {
+                grant.permission == permission && pattern_covers(&grant.pattern, requested_pattern)
+            })
     }
 
     pub fn permissions_csv(&self) -> String {
@@ -104,7 +138,10 @@ struct UserRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct RoleRecord {
+    #[serde(default)]
     permissions: BTreeSet<Permission>,
+    #[serde(default)]
+    grants: BTreeSet<PermissionGrant>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -177,6 +214,13 @@ impl AuthConfig {
         self.store.write().await.create_user(username, password)
     }
 
+    pub async fn alter_user_password(&self, username: &str, password: String) -> Result<()> {
+        self.store
+            .write()
+            .await
+            .alter_user_password(username, password)
+    }
+
     pub async fn drop_user(&self, username: &str) -> Result<()> {
         self.store.write().await.drop_user(username)
     }
@@ -197,12 +241,28 @@ impl AuthConfig {
         self.store.write().await.revoke_role(role, username)
     }
 
-    pub async fn grant_permission(&self, permission: Permission, role: &str) -> Result<()> {
-        self.store.write().await.grant_permission(permission, role)
+    pub async fn grant_permission(
+        &self,
+        permission: Permission,
+        pattern: String,
+        role: &str,
+    ) -> Result<()> {
+        self.store
+            .write()
+            .await
+            .grant_permission(permission, pattern, role)
     }
 
-    pub async fn revoke_permission(&self, permission: Permission, role: &str) -> Result<()> {
-        self.store.write().await.revoke_permission(permission, role)
+    pub async fn revoke_permission(
+        &self,
+        permission: Permission,
+        pattern: String,
+        role: &str,
+    ) -> Result<()> {
+        self.store
+            .write()
+            .await
+            .revoke_permission(permission, pattern, role)
     }
 
     pub async fn users(&self) -> Vec<(String, String)> {
@@ -231,9 +291,11 @@ impl AuthStore {
             return Ok(None);
         }
 
+        let (permissions, grants) = self.resolve_permissions(user);
         Ok(Some(Identity {
             username: username.to_string(),
-            permissions: self.resolve_permissions(user),
+            permissions,
+            grants,
         }))
     }
 
@@ -249,6 +311,16 @@ impl AuthStore {
                 disabled: false,
             },
         );
+        self.save()
+    }
+
+    fn alter_user_password(&mut self, username: &str, password: String) -> Result<()> {
+        let user = self
+            .stored
+            .users
+            .get_mut(username)
+            .ok_or_else(|| ServerError::UserNotFound(username.to_string()))?;
+        user.password_hash = hash_password(&password)?;
         self.save()
     }
 
@@ -277,6 +349,7 @@ impl AuthStore {
             role,
             RoleRecord {
                 permissions: BTreeSet::new(),
+                grants: BTreeSet::new(),
             },
         );
         self.save()
@@ -329,18 +402,31 @@ impl AuthStore {
         self.save()
     }
 
-    fn grant_permission(&mut self, permission: Permission, role: &str) -> Result<()> {
+    fn grant_permission(
+        &mut self,
+        permission: Permission,
+        pattern: String,
+        role: &str,
+    ) -> Result<()> {
         let role = self
             .stored
             .roles
             .get_mut(role)
             .ok_or_else(|| ServerError::RoleNotFound(role.to_string()))?;
-        role.permissions.insert(permission);
+        role.grants.insert(PermissionGrant {
+            permission,
+            pattern,
+        });
         self.save()
     }
 
-    fn revoke_permission(&mut self, permission: Permission, role: &str) -> Result<()> {
-        if role == ADMIN_ROLE && permission == Permission::Admin {
+    fn revoke_permission(
+        &mut self,
+        permission: Permission,
+        pattern: String,
+        role: &str,
+    ) -> Result<()> {
+        if role == ADMIN_ROLE && permission == Permission::Admin && pattern == "*" {
             return Err(ServerError::ProtectedRole(role.to_string()));
         }
         let role = self
@@ -348,7 +434,13 @@ impl AuthStore {
             .roles
             .get_mut(role)
             .ok_or_else(|| ServerError::RoleNotFound(role.to_string()))?;
-        role.permissions.remove(&permission);
+        role.grants.remove(&PermissionGrant {
+            permission,
+            pattern: pattern.clone(),
+        });
+        if pattern == "*" {
+            role.permissions.remove(&permission);
+        }
         self.save()
     }
 
@@ -373,28 +465,38 @@ impl AuthStore {
         self.stored
             .roles
             .iter()
-            .map(|(role, record)| {
-                (
-                    role.clone(),
-                    record
-                        .permissions
-                        .iter()
-                        .map(|permission| permission.as_str())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                )
-            })
+            .map(|(role, record)| (role.clone(), role_grants(record).join(",")))
             .collect()
     }
 
-    fn resolve_permissions(&self, user: &UserRecord) -> BTreeSet<Permission> {
+    fn resolve_permissions(
+        &self,
+        user: &UserRecord,
+    ) -> (BTreeSet<Permission>, BTreeSet<PermissionGrant>) {
         let mut permissions = BTreeSet::new();
+        let mut grants = BTreeSet::new();
         for role in &user.roles {
             if let Some(role) = self.stored.roles.get(role) {
                 permissions.extend(role.permissions.iter().copied());
+                grants.extend(
+                    role.permissions
+                        .iter()
+                        .copied()
+                        .map(|permission| PermissionGrant {
+                            permission,
+                            pattern: "*".to_string(),
+                        }),
+                );
+                permissions.extend(
+                    role.grants
+                        .iter()
+                        .filter(|grant| grant.pattern == "*")
+                        .map(|grant| grant.permission),
+                );
+                grants.extend(role.grants.iter().cloned());
             }
         }
-        permissions
+        (permissions, grants)
     }
 
     fn admin_user_count(&self) -> usize {
@@ -419,6 +521,13 @@ fn bootstrap_store(username: String, password: String) -> Result<StoredAuth> {
         ADMIN_ROLE.to_string(),
         RoleRecord {
             permissions: Permission::all(),
+            grants: Permission::all()
+                .into_iter()
+                .map(|permission| PermissionGrant {
+                    permission,
+                    pattern: "*".to_string(),
+                })
+                .collect(),
         },
     );
 
@@ -481,6 +590,43 @@ fn save_store(stored: &StoredAuth, persist: &PersistConfig) -> Result<()> {
     Ok(())
 }
 
+fn role_grants(record: &RoleRecord) -> Vec<String> {
+    let mut grants = record
+        .permissions
+        .iter()
+        .map(|permission| format!("{} on *", permission.as_str()))
+        .chain(
+            record
+                .grants
+                .iter()
+                .map(|grant| format!("{} on {}", grant.permission.as_str(), grant.pattern)),
+        )
+        .collect::<Vec<_>>();
+    grants.sort();
+    grants.dedup();
+    grants
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let Some(star_index) = pattern.find('*') else {
+        return pattern == value;
+    };
+    let (prefix, suffix_with_star) = pattern.split_at(star_index);
+    let suffix = &suffix_with_star[1..];
+    value.starts_with(prefix) && value.ends_with(suffix)
+}
+
+fn pattern_covers(grant_pattern: &str, requested_pattern: &str) -> bool {
+    grant_pattern == "*"
+        || grant_pattern == requested_pattern
+        || requested_pattern != "*"
+            && grant_pattern.ends_with('*')
+            && requested_pattern.starts_with(grant_pattern.trim_end_matches('*'))
+}
+
 #[allow(dead_code)]
 fn _assert_paths(_: &Path) {}
 
@@ -527,14 +673,52 @@ mod tests {
             .await
             .unwrap();
         auth.create_role("readonly".to_string()).await.unwrap();
-        auth.grant_permission(Permission::Read, "readonly")
+        auth.grant_permission(Permission::Read, "*".to_string(), "readonly")
             .await
             .unwrap();
         auth.grant_role("readonly", "alice").await.unwrap();
 
         let identity = auth.verify("alice", "pw").await.unwrap().unwrap();
         assert!(identity.has(Permission::Read));
+        assert!(identity.allows_key(Permission::Read, "anything"));
         assert!(!identity.has(Permission::Write));
+    }
+
+    #[tokio::test]
+    async fn grants_pattern_scoped_permissions() {
+        let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
+        auth.create_user("alice".to_string(), "pw".to_string())
+            .await
+            .unwrap();
+        auth.create_role("app_reader".to_string()).await.unwrap();
+        auth.grant_permission(Permission::Read, "app:*".to_string(), "app_reader")
+            .await
+            .unwrap();
+        auth.grant_role("app_reader", "alice").await.unwrap();
+
+        let identity = auth.verify("alice", "pw").await.unwrap().unwrap();
+        assert!(!identity.has(Permission::Read));
+        assert!(identity.allows_key(Permission::Read, "app:1"));
+        assert!(identity.allows_pattern(Permission::Read, "app:*"));
+        assert!(!identity.allows_key(Permission::Read, "other:1"));
+        assert!(!identity.allows_pattern(Permission::Read, "other:*"));
+    }
+
+    #[tokio::test]
+    async fn rotates_password_for_future_auth_attempts() {
+        let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
+        auth.create_user("alice".to_string(), "old".to_string())
+            .await
+            .unwrap();
+
+        let existing = auth.verify("alice", "old").await.unwrap().unwrap();
+        auth.alter_user_password("alice", "new".to_string())
+            .await
+            .unwrap();
+
+        assert_eq!(existing.username, "alice");
+        assert!(auth.verify("alice", "old").await.unwrap().is_none());
+        assert!(auth.verify("alice", "new").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -552,6 +736,9 @@ mod tests {
         auth.create_user("alice".to_string(), "pw".to_string())
             .await
             .unwrap();
+        auth.alter_user_password("alice", "rotated".to_string())
+            .await
+            .unwrap();
 
         let raw = fs::read(&path).unwrap();
         assert!(!String::from_utf8_lossy(&raw).contains("alice"));
@@ -564,7 +751,8 @@ mod tests {
             "ignored".to_string(),
         )
         .unwrap();
-        assert!(reloaded.verify("alice", "pw").await.unwrap().is_some());
+        assert!(reloaded.verify("alice", "pw").await.unwrap().is_none());
+        assert!(reloaded.verify("alice", "rotated").await.unwrap().is_some());
 
         fs::remove_file(path).ok();
         fs::remove_file(temp).ok();

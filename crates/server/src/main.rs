@@ -72,6 +72,12 @@ async fn try_main() -> server::Result<()> {
         .clone()
         .unwrap_or_else(|| paths.data_dir.join("audit.log"));
     let audit_logger = server::audit::AuditLogger::open(&audit_log_path)?;
+    let backup_dir = args
+        .backup_dir
+        .clone()
+        .unwrap_or_else(|| paths.data_dir.join("backups"));
+    std::fs::create_dir_all(&backup_dir)?;
+    let mtls_enabled = args.tls_client_ca.is_some();
     let runtime = server::server::ServerRuntimeConfig {
         snapshot_interval: args
             .snapshot_interval_seconds
@@ -95,6 +101,8 @@ async fn try_main() -> server::Result<()> {
         tls_config,
         transport,
         audit_logger: std::sync::Arc::new(audit_logger),
+        backup_dir,
+        mtls_enabled,
     };
     let server = Server::new(
         args.bind,

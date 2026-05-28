@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -53,6 +54,8 @@ pub struct ServerRuntimeConfig {
     pub tls_config: Option<Arc<rustls::ServerConfig>>,
     pub transport: CodecOptions,
     pub audit_logger: Arc<AuditLogger>,
+    pub backup_dir: PathBuf,
+    pub mtls_enabled: bool,
 }
 
 enum EngineRequest {
@@ -71,6 +74,10 @@ enum EngineRequest {
     },
     Snapshot {
         respond_to: oneshot::Sender<Result<()>>,
+    },
+    ValidateBackup {
+        dump: String,
+        respond_to: oneshot::Sender<Result<usize>>,
     },
     SweepExpired {
         respond_to: oneshot::Sender<Result<usize>>,
@@ -111,6 +118,13 @@ impl EngineHandle {
                     }
                     EngineRequest::Snapshot { respond_to } => {
                         let _ = respond_to.send(engine.snapshot().map_err(ServerError::from));
+                    }
+                    EngineRequest::ValidateBackup { dump, respond_to } => {
+                        let _ = respond_to.send(
+                            engine
+                                .validate_logical_backup(&dump)
+                                .map_err(ServerError::from),
+                        );
                     }
                     EngineRequest::SweepExpired { respond_to } => {
                         let _ = respond_to.send(engine.sweep_expired().map_err(ServerError::from));
@@ -173,6 +187,18 @@ impl EngineHandle {
         let (send, recv) = oneshot::channel();
         self.sender
             .send(EngineRequest::SweepExpired { respond_to: send })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn validate_backup(&self, dump: String) -> Result<usize> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::ValidateBackup {
+                dump,
+                respond_to: send,
+            })
             .await
             .map_err(|_| ServerError::EngineWorkerClosed)?;
         recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
@@ -790,7 +816,15 @@ fn validate_command(command: &Command, guards: &ServerGuards) -> Result<()> {
         } => validate_key(pattern, guards)?,
         Command::Scan { pattern: None, .. } => {}
         Command::Restore { dump } => validate_value(dump, guards)?,
+        Command::BackupTo { path }
+        | Command::RestoreFrom { path }
+        | Command::RestoreCheckFrom { path } => validate_value(path, guards)?,
+        Command::RestoreCheck { dump } => validate_value(dump, guards)?,
         Command::CreateUser { username, password } => {
+            validate_key(username, guards)?;
+            validate_value(password, guards)?;
+        }
+        Command::AlterUserPassword { username, password } => {
             validate_key(username, guards)?;
             validate_value(password, guards)?;
         }
@@ -800,15 +834,60 @@ fn validate_command(command: &Command, guards: &ServerGuards) -> Result<()> {
             validate_key(role, guards)?;
             validate_key(username, guards)?;
         }
-        Command::GrantPermission { permission, role }
-        | Command::RevokePermission { permission, role } => {
+        Command::GrantPermission {
+            permission,
+            pattern,
+            role,
+        }
+        | Command::RevokePermission {
+            permission,
+            pattern,
+            role,
+        } => {
             validate_key(permission, guards)?;
+            validate_key(pattern, guards)?;
             validate_key(role, guards)?;
         }
         _ => {}
     }
 
     Ok(())
+}
+
+fn resolve_backup_path(base_dir: &Path, requested: &str, must_exist: bool) -> Result<PathBuf> {
+    let requested_path = Path::new(requested);
+    if requested_path
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return Err(ServerError::BackupPathRejected(requested.to_string()));
+    }
+
+    std::fs::create_dir_all(base_dir)?;
+    let base = base_dir.canonicalize()?;
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        base.join(requested_path)
+    };
+
+    if must_exist {
+        let canonical = candidate.canonicalize()?;
+        if canonical.starts_with(&base) {
+            return Ok(canonical);
+        }
+        return Err(ServerError::BackupPathRejected(requested.to_string()));
+    }
+
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| ServerError::BackupPathRejected(requested.to_string()))?;
+    std::fs::create_dir_all(parent)?;
+    let canonical_parent = parent.canonicalize()?;
+    if !canonical_parent.starts_with(&base) {
+        return Err(ServerError::BackupPathRejected(requested.to_string()));
+    }
+    Ok(candidate)
 }
 
 async fn process_command(
@@ -862,11 +941,42 @@ async fn process_command(
             let entries = structured_info(engine, metrics, runtime).await?;
             Ok(Response::entries(request_id, &entries)?)
         }
+        Command::BackupTo { path } => {
+            let response = engine.execute(request_id, Command::Backup).await?;
+            let dump = response.decode_value()?;
+            let path = resolve_backup_path(&runtime.backup_dir, &path, false)?;
+            std::fs::write(&path, dump)?;
+            Ok(Response::ok(request_id))
+        }
+        Command::RestoreFrom { path } => {
+            let path = resolve_backup_path(&runtime.backup_dir, &path, true)?;
+            let dump = std::fs::read_to_string(path)?;
+            engine.execute(request_id, Command::Restore { dump }).await
+        }
+        Command::RestoreCheck { dump } => Ok(Response::count(
+            request_id,
+            engine.validate_backup(dump).await? as u64,
+        )),
+        Command::RestoreCheckFrom { path } => {
+            let path = resolve_backup_path(&runtime.backup_dir, &path, true)?;
+            let dump = std::fs::read_to_string(path)?;
+            Ok(Response::count(
+                request_id,
+                engine.validate_backup(dump).await? as u64,
+            ))
+        }
         Command::CreateUser { username, password } => {
             let Some(auth_config) = runtime.auth_config.clone() else {
                 return Err(ServerError::UnsupportedRemoteCommand);
             };
             auth_config.create_user(username, password).await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::AlterUserPassword { username, password } => {
+            let Some(auth_config) = runtime.auth_config.clone() else {
+                return Err(ServerError::UnsupportedRemoteCommand);
+            };
+            auth_config.alter_user_password(&username, password).await?;
             Ok(Response::ok(request_id))
         }
         Command::DropUser { username } => {
@@ -904,21 +1014,29 @@ async fn process_command(
             auth_config.revoke_role(&role, &username).await?;
             Ok(Response::ok(request_id))
         }
-        Command::GrantPermission { permission, role } => {
+        Command::GrantPermission {
+            permission,
+            pattern,
+            role,
+        } => {
             let Some(auth_config) = runtime.auth_config.clone() else {
                 return Err(ServerError::UnsupportedRemoteCommand);
             };
             auth_config
-                .grant_permission(Permission::parse(&permission)?, &role)
+                .grant_permission(Permission::parse(&permission)?, pattern, &role)
                 .await?;
             Ok(Response::ok(request_id))
         }
-        Command::RevokePermission { permission, role } => {
+        Command::RevokePermission {
+            permission,
+            pattern,
+            role,
+        } => {
             let Some(auth_config) = runtime.auth_config.clone() else {
                 return Err(ServerError::UnsupportedRemoteCommand);
             };
             auth_config
-                .revoke_permission(Permission::parse(&permission)?, &role)
+                .revoke_permission(Permission::parse(&permission)?, pattern, &role)
                 .await?;
             Ok(Response::ok(request_id))
         }
@@ -981,8 +1099,16 @@ async fn structured_info(
             runtime.transport.compression.as_str().to_string(),
         ),
         (
+            "transport.compression_threshold_bytes".to_string(),
+            runtime.transport.compression_threshold_bytes.to_string(),
+        ),
+        (
             "transport.max_frame_len".to_string(),
             runtime.transport.max_frame_len.to_string(),
+        ),
+        (
+            "transport.max_decompressed_frame_len".to_string(),
+            runtime.transport.max_decompressed_frame_len.to_string(),
         ),
         (
             "storage.engine_version".to_string(),
@@ -1010,12 +1136,34 @@ async fn structured_info(
             runtime.auth_config.is_some().to_string(),
         ),
         (
+            "security.auth_mode".to_string(),
+            if runtime.auth_config.is_some() {
+                "password"
+            } else {
+                "disabled"
+            }
+            .to_string(),
+        ),
+        (
             "security.rbac_enabled".to_string(),
             runtime.auth_config.is_some().to_string(),
         ),
         (
             "security.tls_enabled".to_string(),
             runtime.tls_config.is_some().to_string(),
+        ),
+        (
+            "security.tls_mode".to_string(),
+            if runtime.tls_config.is_some() {
+                "tls"
+            } else {
+                "plaintext"
+            }
+            .to_string(),
+        ),
+        (
+            "security.mtls_enabled".to_string(),
+            runtime.mtls_enabled.to_string(),
         ),
         (
             "security.storage_encryption".to_string(),
@@ -1031,6 +1179,38 @@ async fn structured_info(
                 .idle_timeout
                 .map(|duration| duration.as_secs().to_string())
                 .unwrap_or_else(|| "disabled".to_string()),
+        ),
+        (
+            "runtime.backup_dir".to_string(),
+            runtime.backup_dir.display().to_string(),
+        ),
+        (
+            "runtime.max_request_payload_bytes".to_string(),
+            runtime.guards.max_request_payload_bytes.to_string(),
+        ),
+        (
+            "runtime.max_key_bytes".to_string(),
+            runtime.guards.max_key_bytes.to_string(),
+        ),
+        (
+            "runtime.max_value_bytes".to_string(),
+            runtime.guards.max_value_bytes.to_string(),
+        ),
+        (
+            "runtime.max_keys_per_batch".to_string(),
+            runtime.guards.max_keys_per_batch.to_string(),
+        ),
+        (
+            "runtime.max_transaction_queue_len".to_string(),
+            runtime.guards.max_transaction_queue_len.to_string(),
+        ),
+        (
+            "runtime.requests_per_second".to_string(),
+            runtime.guards.requests_per_second.to_string(),
+        ),
+        (
+            "runtime.request_burst".to_string(),
+            runtime.guards.request_burst.to_string(),
         ),
         (
             "runtime.snapshot_interval_seconds".to_string(),
@@ -1073,6 +1253,13 @@ async fn handle_auth(
         session.identity = Some(Identity {
             username: "anonymous".to_string(),
             permissions: Permission::all(),
+            grants: Permission::all()
+                .into_iter()
+                .map(|permission| crate::auth::PermissionGrant {
+                    permission,
+                    pattern: "*".to_string(),
+                })
+                .collect(),
         });
         metrics.auth_successes.fetch_add(1, Ordering::Relaxed);
         return Ok(Response::ok(request_id));
@@ -1146,11 +1333,19 @@ fn authorize_command(command: &Command, session: &SessionState) -> Result<()> {
     let Some(identity) = &session.identity else {
         return Err(ServerError::AuthenticationRequired);
     };
-    if identity.has(permission) {
-        Ok(())
-    } else {
-        Err(ServerError::PermissionDenied)
+    let keys = command_keys(command);
+    if keys.is_empty() {
+        if let Some(pattern) = command_pattern(command) {
+            if identity.allows_pattern(permission, pattern) {
+                return Ok(());
+            }
+        } else if identity.has(permission) {
+            return Ok(());
+        }
+    } else if keys.iter().all(|key| identity.allows_key(permission, key)) {
+        return Ok(());
     }
+    Err(ServerError::PermissionDenied)
 }
 
 fn command_permission(command: &Command) -> Option<Permission> {
@@ -1169,6 +1364,7 @@ fn command_permission(command: &Command) -> Option<Permission> {
         | Command::DbSize
         | Command::Count
         | Command::List => Some(Permission::Read),
+        Command::Clear => Some(Permission::Clear),
         Command::GetDel { .. }
         | Command::GetEx { .. }
         | Command::Set { .. }
@@ -1180,23 +1376,62 @@ fn command_permission(command: &Command) -> Option<Permission> {
         | Command::Expire { .. }
         | Command::Persist { .. }
         | Command::Rename { .. }
-        | Command::RenameNx { .. }
-        | Command::Clear => Some(Permission::Write),
+        | Command::RenameNx { .. } => Some(Permission::Write),
         Command::Info | Command::Metrics => Some(Permission::Metrics),
         Command::Save | Command::Snapshot => Some(Permission::Snapshot),
-        Command::Backup => Some(Permission::Backup),
-        Command::Restore { .. } => Some(Permission::Restore),
+        Command::Backup | Command::BackupTo { .. } => Some(Permission::Backup),
+        Command::Restore { .. }
+        | Command::RestoreFrom { .. }
+        | Command::RestoreCheck { .. }
+        | Command::RestoreCheckFrom { .. } => Some(Permission::Restore),
         Command::CreateUser { .. }
-        | Command::DropUser { .. }
-        | Command::CreateRole { .. }
+        | Command::AlterUserPassword { .. }
+        | Command::DropUser { .. } => Some(Permission::UserAdmin),
+        Command::CreateRole { .. }
         | Command::DropRole { .. }
         | Command::GrantRole { .. }
         | Command::RevokeRole { .. }
         | Command::GrantPermission { .. }
         | Command::RevokePermission { .. }
-        | Command::ShowUsers
-        | Command::ShowRoles => Some(Permission::Admin),
+        | Command::ShowRoles => Some(Permission::RoleAdmin),
+        Command::ShowUsers => Some(Permission::UserAdmin),
         Command::Help | Command::Exit => None,
+    }
+}
+
+fn command_keys(command: &Command) -> Vec<&str> {
+    match command {
+        Command::Get { key }
+        | Command::GetDel { key }
+        | Command::GetEx { key, .. }
+        | Command::Set { key, .. }
+        | Command::SetNx { key, .. }
+        | Command::Exists { key }
+        | Command::Incr { key }
+        | Command::Decr { key }
+        | Command::Expire { key, .. }
+        | Command::Ttl { key }
+        | Command::Persist { key } => vec![key.as_str()],
+        Command::MGet { keys } | Command::Delete { keys } => {
+            keys.iter().map(String::as_str).collect()
+        }
+        Command::MSet { entries } => entries.iter().map(|(key, _)| key.as_str()).collect(),
+        Command::Rename {
+            source,
+            destination,
+        }
+        | Command::RenameNx {
+            source,
+            destination,
+        } => vec![source.as_str(), destination.as_str()],
+        _ => Vec::new(),
+    }
+}
+
+fn command_pattern(command: &Command) -> Option<&str> {
+    match command {
+        Command::Scan { pattern, .. } => Some(pattern.as_deref().unwrap_or("*")),
+        _ => None,
     }
 }
 
@@ -1303,6 +1538,11 @@ where
             request_id,
             engine.restore_logical_backup(&dump)? as u64,
         )),
+        Command::BackupTo { .. }
+        | Command::RestoreFrom { .. }
+        | Command::RestoreCheck { .. }
+        | Command::RestoreCheckFrom { .. }
+        | Command::AlterUserPassword { .. } => Err(ServerError::UnsupportedRemoteCommand),
         Command::Multi | Command::Exec | Command::Discard => {
             Err(ServerError::UnsupportedRemoteCommand)
         }
@@ -1470,7 +1710,12 @@ fn opcode_name(command: &Command) -> &'static str {
         Command::Save => "SAVE",
         Command::Snapshot => "SNAPSHOT",
         Command::Backup => "BACKUP",
+        Command::BackupTo { .. } => "BACKUP_TO",
         Command::Restore { .. } => "RESTORE",
+        Command::RestoreFrom { .. } => "RESTORE_FROM",
+        Command::RestoreCheck { .. } => "RESTORE_CHECK",
+        Command::RestoreCheckFrom { .. } => "RESTORE_CHECK_FROM",
+        Command::AlterUserPassword { .. } => "ALTER_USER_PASSWORD",
         Command::CreateUser { .. } => "CREATE_USER",
         Command::DropUser { .. } => "DROP_USER",
         Command::CreateRole { .. } => "CREATE_ROLE",
@@ -1508,7 +1753,7 @@ fn record_audit_event(logger: &AuditLogger, context: AuditContext<'_>) {
             Status::NotFound => "not_found".to_string(),
         },
         error_code: context.error_code,
-        latency_ms: context.latency_ms,
+        latency_ms: context.latency_ms.min(u128::from(u64::MAX)) as u64,
     });
 }
 
@@ -1522,6 +1767,7 @@ fn current_time_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::Arc;
 
     use super::{
@@ -1595,6 +1841,8 @@ mod tests {
             guards: guards(),
             tls_config: None,
             transport: CodecOptions::default(),
+            backup_dir: temp_dir("backups"),
+            mtls_enabled: false,
             audit_logger: Arc::new(AuditLogger::open(&audit_path).unwrap()),
         }
     }
@@ -1769,6 +2017,15 @@ mod tests {
                 }
             }
             Ok(self.data.len())
+        }
+        fn validate_logical_backup(&mut self, dump: &str) -> Result<usize> {
+            let backup: serde_json::Value = serde_json::from_str(dump)
+                .map_err(|err| engine::EngineError::SnapshotDeserialize(err.to_string()))?;
+            Ok(backup
+                .get("entries")
+                .and_then(|entries| entries.as_array())
+                .map(|entries| entries.len())
+                .unwrap_or_default())
         }
         fn sweep_expired(&mut self) -> Result<usize> {
             Ok(0)
@@ -1976,6 +2233,7 @@ mod tests {
                 id(23),
                 Command::GrantPermission {
                     permission: "read".to_string(),
+                    pattern: "*".to_string(),
                     role: "readonly".to_string(),
                 },
             ),
@@ -2046,6 +2304,157 @@ mod tests {
     }
 
     #[test]
+    fn rbac_enforces_key_patterns_and_destructive_permissions() {
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
+        let mut admin_session = SessionState::new(&guards());
+        runtime_handle
+            .block_on(handle_auth(
+                Arc::clone(&metrics),
+                runtime.auth_config.clone(),
+                &mut admin_session,
+                id(30),
+                Command::Auth {
+                    username: "dbuser".to_string(),
+                    password: "secret".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("rbac-patterns")).unwrap(),
+            engine::EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("rbac-pattern-key")),
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        for (request_id, command) in [
+            (
+                id(31),
+                Command::CreateUser {
+                    username: "alice".to_string(),
+                    password: "pw".to_string(),
+                },
+            ),
+            (
+                id(32),
+                Command::CreateRole {
+                    role: "app_writer".to_string(),
+                },
+            ),
+            (
+                id(33),
+                Command::GrantPermission {
+                    permission: "write".to_string(),
+                    pattern: "app:*".to_string(),
+                    role: "app_writer".to_string(),
+                },
+            ),
+            (
+                id(34),
+                Command::GrantRole {
+                    role: "app_writer".to_string(),
+                    username: "alice".to_string(),
+                },
+            ),
+        ] {
+            let response = runtime_handle
+                .block_on(process_command(
+                    handle.clone(),
+                    Arc::clone(&metrics),
+                    &runtime,
+                    &mut admin_session,
+                    request_id,
+                    command,
+                ))
+                .unwrap();
+            assert_eq!(response.status, Status::Ok);
+        }
+
+        let mut alice_session = SessionState::new(&guards());
+        runtime_handle
+            .block_on(handle_auth(
+                Arc::clone(&metrics),
+                runtime.auth_config.clone(),
+                &mut alice_session,
+                id(35),
+                Command::Auth {
+                    username: "alice".to_string(),
+                    password: "pw".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let allowed = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut alice_session,
+                id(36),
+                Command::Set {
+                    key: "app:1".to_string(),
+                    value: "ok".to_string(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(allowed.status, Status::Ok);
+
+        let denied = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut alice_session,
+                id(37),
+                Command::Set {
+                    key: "other:1".to_string(),
+                    value: "denied".to_string(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap_err();
+        assert!(matches!(denied, crate::ServerError::PermissionDenied));
+
+        let multi_key_denied = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut alice_session,
+                id(38),
+                Command::MSet {
+                    entries: vec![
+                        ("app:2".to_string(), "ok".to_string()),
+                        ("other:2".to_string(), "denied".to_string()),
+                    ],
+                },
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            multi_key_denied,
+            crate::ServerError::PermissionDenied
+        ));
+
+        let clear_denied = runtime_handle
+            .block_on(process_command(
+                handle,
+                metrics,
+                &runtime,
+                &mut alice_session,
+                id(39),
+                Command::Clear,
+            ))
+            .unwrap_err();
+        assert!(matches!(clear_denied, crate::ServerError::PermissionDenied));
+    }
+
+    #[test]
     fn rejects_local_only_commands_and_builds_error_payloads() {
         let mut engine = FakeEngine::default();
         assert!(execute_command(&mut engine, id(7), Command::Help).is_err());
@@ -2082,6 +2491,157 @@ mod tests {
             Some("production".to_string())
         );
         assert_eq!(engine.get("old").unwrap(), None);
+    }
+
+    #[test]
+    fn routes_sandboxed_backup_files_and_restore_checks() {
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
+        let mut session = SessionState::new(&guards());
+        runtime_handle
+            .block_on(handle_auth(
+                Arc::clone(&metrics),
+                runtime.auth_config.clone(),
+                &mut session,
+                id(50),
+                Command::Auth {
+                    username: "dbuser".to_string(),
+                    password: "secret".to_string(),
+                },
+            ))
+            .unwrap();
+
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("backup-files")).unwrap(),
+            engine::EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("backup-file-key")),
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(51),
+                Command::Set {
+                    key: "app:mode".to_string(),
+                    value: "production".to_string(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap();
+
+        let backup = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(52),
+                Command::BackupTo {
+                    path: "nightly.json".to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(backup.status, Status::Ok);
+        let backup_path = runtime.backup_dir.join("nightly.json");
+        assert!(backup_path.exists());
+
+        let rejected = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(53),
+                Command::BackupTo {
+                    path: "../escape.json".to_string(),
+                },
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            rejected,
+            crate::ServerError::BackupPathRejected(_)
+        ));
+
+        runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(54),
+                Command::Set {
+                    key: "other".to_string(),
+                    value: "temporary".to_string(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap();
+
+        let checked = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(55),
+                Command::RestoreCheckFrom {
+                    path: "nightly.json".to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(checked.decode_count().unwrap(), 1);
+
+        let still_present = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(56),
+                Command::Get {
+                    key: "other".to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(still_present.decode_value().unwrap(), "temporary");
+
+        let restored = runtime_handle
+            .block_on(process_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(57),
+                Command::RestoreFrom {
+                    path: "nightly.json".to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(restored.decode_count().unwrap(), 1);
+
+        let removed = runtime_handle
+            .block_on(process_command(
+                handle,
+                metrics,
+                &runtime,
+                &mut session,
+                id(58),
+                Command::Get {
+                    key: "other".to_string(),
+                },
+            ))
+            .unwrap();
+        assert_eq!(removed.status, Status::NotFound);
+
+        fs::remove_dir_all(runtime.backup_dir).ok();
     }
 
     #[test]

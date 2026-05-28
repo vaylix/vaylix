@@ -340,6 +340,8 @@ fn help_text() -> String {
         "  get user:1".to_string(),
         "  scan 0 match user:* count 20".to_string(),
         "  backup".to_string(),
+        "  backup to nightly.json".to_string(),
+        "  restore check from nightly.json".to_string(),
         r#"  restore "{\"version\":1,\"created_at_ms\":0,\"source_engine_version\":2,\"source_sequence\":0,\"entries\":[]}""#.to_string(),
         "  info".to_string(),
     ]);
@@ -380,9 +382,11 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
                 }
             }
             Command::MSet { .. }
+            | Command::BackupTo { .. }
             | Command::Clear
             | Command::Save
             | Command::Snapshot
+            | Command::AlterUserPassword { .. }
             | Command::CreateUser { .. }
             | Command::DropUser { .. }
             | Command::CreateRole { .. }
@@ -411,9 +415,13 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
                 .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
                 .collect::<Vec<_>>()
                 .join(", ")),
-            Command::Delete { .. } | Command::DbSize | Command::Count | Command::Restore { .. } => {
-                Ok(response.decode_count()?.to_string())
-            }
+            Command::Delete { .. }
+            | Command::DbSize
+            | Command::Count
+            | Command::Restore { .. }
+            | Command::RestoreFrom { .. }
+            | Command::RestoreCheck { .. }
+            | Command::RestoreCheckFrom { .. } => Ok(response.decode_count()?.to_string()),
             Command::Incr { .. } | Command::Decr { .. } | Command::Ttl { .. } => {
                 Ok(response.decode_integer()?.to_string())
             }

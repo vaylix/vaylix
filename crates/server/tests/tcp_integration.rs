@@ -254,6 +254,8 @@ fn runtime_with_tls(
         },
         tls_config,
         transport: CodecOptions::default(),
+        backup_dir: temp_dir("tcp-backups"),
+        mtls_enabled: false,
         audit_logger: std::sync::Arc::new(AuditLogger::open(&audit_path).unwrap()),
     }
 }
@@ -490,7 +492,9 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
     )
     .unwrap();
 
-    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime(None))
+    let runtime = runtime(None);
+    let backup_dir = runtime.backup_dir.clone();
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime)
         .await
         .unwrap();
     let addr = server.local_addr().unwrap();
@@ -569,6 +573,33 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         .unwrap();
     assert!(backup_dump.contains("user:1"));
 
+    let backup_to = Request::from_command(
+        id(321),
+        Command::BackupTo {
+            path: "tcp-backup.json".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &backup_to)
+        .await
+        .unwrap();
+    let backup_to_response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(backup_to_response.status, Status::Ok);
+    assert!(backup_dir.join("tcp-backup.json").exists());
+
+    let restore_check = Request::from_command(
+        id(322),
+        Command::RestoreCheckFrom {
+            path: "tcp-backup.json".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &restore_check)
+        .await
+        .unwrap();
+    let restore_check_response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(restore_check_response.decode_count().unwrap(), 1);
+
     let getdel = Request::from_command(
         id(4),
         Command::GetDel {
@@ -600,6 +631,7 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
 
     server_task.abort();
     fs::remove_dir_all(root).ok();
+    fs::remove_dir_all(backup_dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -642,6 +674,7 @@ async fn enforces_rbac_over_tcp() {
             id(43),
             Command::GrantPermission {
                 permission: "read".to_string(),
+                pattern: "app:*".to_string(),
                 role: "readonly".to_string(),
             },
         ),
@@ -676,13 +709,30 @@ async fn enforces_rbac_over_tcp() {
     let read = Request::from_command(
         id(46),
         Command::Get {
-            key: "missing".to_string(),
+            key: "app:missing".to_string(),
         },
     )
     .unwrap();
     write_request_to_async(&mut stream, &read).await.unwrap();
     let read_response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(read_response.status, Status::NotFound);
+
+    let out_of_pattern_read = Request::from_command(
+        id(461),
+        Command::Get {
+            key: "other:missing".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &out_of_pattern_read)
+        .await
+        .unwrap();
+    let out_of_pattern_response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(out_of_pattern_response.status, Status::Error);
+    assert_eq!(
+        out_of_pattern_response.decode_error().unwrap().code,
+        "SRV-017"
+    );
 
     let write = Request::from_command(
         id(47),
@@ -697,6 +747,69 @@ async fn enforces_rbac_over_tcp() {
     let write_response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(write_response.status, Status::Error);
     assert_eq!(write_response.decode_error().unwrap().code, "SRV-017");
+
+    let mut admin_stream = connect_tcp(addr).await;
+    authenticate(&mut admin_stream).await;
+    let rotate = Request::from_command(
+        id(48),
+        Command::AlterUserPassword {
+            username: "alice".to_string(),
+            password: "new-pw".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut admin_stream, &rotate)
+        .await
+        .unwrap();
+    let rotate_response = read_response_from_async(&mut admin_stream).await.unwrap();
+    assert_eq!(rotate_response.status, Status::Ok);
+
+    let existing_session_read = Request::from_command(
+        id(49),
+        Command::Get {
+            key: "app:still-authenticated".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &existing_session_read)
+        .await
+        .unwrap();
+    let existing_session_response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(existing_session_response.status, Status::NotFound);
+
+    let mut old_password_stream = connect_tcp(addr).await;
+    let old_auth = Request::from_command(
+        id(50),
+        Command::Auth {
+            username: "alice".to_string(),
+            password: "pw".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut old_password_stream, &old_auth)
+        .await
+        .unwrap();
+    let old_auth_response = read_response_from_async(&mut old_password_stream)
+        .await
+        .unwrap();
+    assert_eq!(old_auth_response.status, Status::Error);
+
+    let mut new_password_stream = connect_tcp(addr).await;
+    let new_auth = Request::from_command(
+        id(51),
+        Command::Auth {
+            username: "alice".to_string(),
+            password: "new-pw".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut new_password_stream, &new_auth)
+        .await
+        .unwrap();
+    let new_auth_response = read_response_from_async(&mut new_password_stream)
+        .await
+        .unwrap();
+    assert_eq!(new_auth_response.status, Status::Ok);
 
     server_task.abort();
     fs::remove_dir_all(root).ok();

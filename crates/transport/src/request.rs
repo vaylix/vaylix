@@ -134,9 +134,32 @@ impl Request {
             Command::Save => Ok(Self::new(request_id, Opcode::Save, Vec::new())),
             Command::Snapshot => Ok(Self::new(request_id, Opcode::Snapshot, Vec::new())),
             Command::Backup => Ok(Self::new(request_id, Opcode::Backup, Vec::new())),
+            Command::BackupTo { path } => {
+                Ok(Self::new(request_id, Opcode::BackupTo, encode_key(&path)?))
+            }
             Command::Restore { dump } => {
                 Ok(Self::new(request_id, Opcode::Restore, encode_dump(&dump)?))
             }
+            Command::RestoreFrom { path } => Ok(Self::new(
+                request_id,
+                Opcode::RestoreFrom,
+                encode_key(&path)?,
+            )),
+            Command::RestoreCheck { dump } => Ok(Self::new(
+                request_id,
+                Opcode::RestoreCheck,
+                encode_dump(&dump)?,
+            )),
+            Command::RestoreCheckFrom { path } => Ok(Self::new(
+                request_id,
+                Opcode::RestoreCheckFrom,
+                encode_key(&path)?,
+            )),
+            Command::AlterUserPassword { username, password } => Ok(Self::new(
+                request_id,
+                Opcode::AlterUserPassword,
+                encode_key_value(&username, &password)?,
+            )),
             Command::CreateUser { username, password } => Ok(Self::new(
                 request_id,
                 Opcode::CreateUser,
@@ -165,15 +188,23 @@ impl Request {
                 Opcode::RevokeRole,
                 encode_key_value(&role, &username)?,
             )),
-            Command::GrantPermission { permission, role } => Ok(Self::new(
+            Command::GrantPermission {
+                permission,
+                pattern,
+                role,
+            } => Ok(Self::new(
                 request_id,
                 Opcode::GrantPermission,
-                encode_key_value(&permission, &role)?,
+                encode_three_strings(&permission, &pattern, &role)?,
             )),
-            Command::RevokePermission { permission, role } => Ok(Self::new(
+            Command::RevokePermission {
+                permission,
+                pattern,
+                role,
+            } => Ok(Self::new(
                 request_id,
                 Opcode::RevokePermission,
-                encode_key_value(&permission, &role)?,
+                encode_three_strings(&permission, &pattern, &role)?,
             )),
             Command::ShowUsers => Ok(Self::new(request_id, Opcode::ShowUsers, Vec::new())),
             Command::ShowRoles => Ok(Self::new(request_id, Opcode::ShowRoles, Vec::new())),
@@ -281,9 +312,25 @@ impl Request {
             Opcode::Save => decode_empty(&self.payload).map(|()| Command::Save),
             Opcode::Snapshot => decode_empty(&self.payload).map(|()| Command::Snapshot),
             Opcode::Backup => decode_empty(&self.payload).map(|()| Command::Backup),
+            Opcode::BackupTo => Ok(Command::BackupTo {
+                path: decode_single_key(&self.payload)?,
+            }),
             Opcode::Restore => Ok(Command::Restore {
                 dump: decode_dump(&self.payload)?,
             }),
+            Opcode::RestoreFrom => Ok(Command::RestoreFrom {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::RestoreCheck => Ok(Command::RestoreCheck {
+                dump: decode_dump(&self.payload)?,
+            }),
+            Opcode::RestoreCheckFrom => Ok(Command::RestoreCheckFrom {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::AlterUserPassword => {
+                let (username, password) = decode_key_value(&self.payload)?;
+                Ok(Command::AlterUserPassword { username, password })
+            }
             Opcode::CreateUser => {
                 let (username, password) = decode_key_value(&self.payload)?;
                 Ok(Command::CreateUser { username, password })
@@ -306,12 +353,20 @@ impl Request {
                 Ok(Command::RevokeRole { role, username })
             }
             Opcode::GrantPermission => {
-                let (permission, role) = decode_key_value(&self.payload)?;
-                Ok(Command::GrantPermission { permission, role })
+                let (permission, pattern, role) = decode_three_strings(&self.payload)?;
+                Ok(Command::GrantPermission {
+                    permission,
+                    pattern,
+                    role,
+                })
             }
             Opcode::RevokePermission => {
-                let (permission, role) = decode_key_value(&self.payload)?;
-                Ok(Command::RevokePermission { permission, role })
+                let (permission, pattern, role) = decode_three_strings(&self.payload)?;
+                Ok(Command::RevokePermission {
+                    permission,
+                    pattern,
+                    role,
+                })
             }
             Opcode::ShowUsers => decode_empty(&self.payload).map(|()| Command::ShowUsers),
             Opcode::ShowRoles => decode_empty(&self.payload).map(|()| Command::ShowRoles),
@@ -365,6 +420,14 @@ fn encode_key_value(key: &str, value: &str) -> Result<Vec<u8>> {
     let mut buf = BytesMut::new();
     put_string_u16(&mut buf, key)?;
     put_string_u32(&mut buf, value)?;
+    Ok(buf.to_vec())
+}
+
+fn encode_three_strings(first: &str, second: &str, third: &str) -> Result<Vec<u8>> {
+    let mut buf = BytesMut::new();
+    put_string_u16(&mut buf, first)?;
+    put_string_u16(&mut buf, second)?;
+    put_string_u16(&mut buf, third)?;
     Ok(buf.to_vec())
 }
 
@@ -499,6 +562,15 @@ fn decode_key_value(payload: &[u8]) -> Result<(String, String)> {
     let value = read_string_u32(&mut buf)?;
     ensure_empty(buf)?;
     Ok((key, value))
+}
+
+fn decode_three_strings(payload: &[u8]) -> Result<(String, String, String)> {
+    let mut buf = payload;
+    let first = read_string_u16(&mut buf)?;
+    let second = read_string_u16(&mut buf)?;
+    let third = read_string_u16(&mut buf)?;
+    ensure_empty(buf)?;
+    Ok((first, second, third))
 }
 
 fn decode_key_u64(payload: &[u8]) -> Result<(String, u64)> {
@@ -783,12 +855,28 @@ mod tests {
             Command::Save,
             Command::Snapshot,
             Command::Backup,
+            Command::BackupTo {
+                path: "nightly.json".to_string(),
+            },
             Command::Restore {
                 dump: "{\"version\":1}".to_string(),
+            },
+            Command::RestoreFrom {
+                path: "nightly.json".to_string(),
+            },
+            Command::RestoreCheck {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::RestoreCheckFrom {
+                path: "nightly.json".to_string(),
             },
             Command::CreateUser {
                 username: "alice".to_string(),
                 password: "secret".to_string(),
+            },
+            Command::AlterUserPassword {
+                username: "alice".to_string(),
+                password: "new-secret".to_string(),
             },
             Command::DropUser {
                 username: "alice".to_string(),
@@ -809,10 +897,12 @@ mod tests {
             },
             Command::GrantPermission {
                 permission: "read".to_string(),
+                pattern: "app:*".to_string(),
                 role: "readonly".to_string(),
             },
             Command::RevokePermission {
                 permission: "read".to_string(),
+                pattern: "app:*".to_string(),
                 role: "readonly".to_string(),
             },
             Command::ShowUsers,

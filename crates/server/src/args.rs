@@ -69,6 +69,10 @@ pub struct Args {
     #[arg(long, env = "VAYLIX_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
+    /// Directory used for server-side logical backup and restore files.
+    #[arg(long, env = "VAYLIX_BACKUP_DIR")]
+    pub backup_dir: Option<PathBuf>,
+
     /// WAL durability mode for each committed write.
     #[arg(
         long,

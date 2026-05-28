@@ -155,11 +155,15 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "backup",
-        usage: "backup",
+        usage: "backup [to <path>]",
     },
     CommandInfo {
         name: "restore",
-        usage: "restore <logical-dump-json>",
+        usage: "restore <logical-dump-json> | restore from <path> | restore check <logical-dump-json> | restore check from <path>",
+    },
+    CommandInfo {
+        name: "alter-user",
+        usage: "alter user <username> password <password>",
     },
     CommandInfo {
         name: "create-user",
@@ -187,11 +191,11 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "grant-permission",
-        usage: "grant permission <permission> to <role>",
+        usage: "grant permission <permission> [on <pattern>] to <role>",
     },
     CommandInfo {
         name: "revoke-permission",
-        usage: "revoke permission <permission> from <role>",
+        usage: "revoke permission <permission> [on <pattern>] from <role>",
     },
     CommandInfo {
         name: "show-users",
@@ -312,8 +316,24 @@ pub enum Command {
     Count,
     Save,
     Backup,
+    BackupTo {
+        path: String,
+    },
     Restore {
         dump: String,
+    },
+    RestoreFrom {
+        path: String,
+    },
+    RestoreCheck {
+        dump: String,
+    },
+    RestoreCheckFrom {
+        path: String,
+    },
+    AlterUserPassword {
+        username: String,
+        password: String,
     },
     CreateUser {
         username: String,
@@ -338,10 +358,12 @@ pub enum Command {
     },
     GrantPermission {
         permission: String,
+        pattern: String,
         role: String,
     },
     RevokePermission {
         permission: String,
+        pattern: String,
         role: String,
     },
     ShowUsers,

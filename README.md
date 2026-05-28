@@ -2,15 +2,10 @@
 
 Vaylix is a Rust key/value database project built around a strict transport boundary. It currently provides a single-node, string-to-string database with a framed binary protocol, a Tokio multi-client server, default-on authentication with RBAC, default-on transport compression, optional TLS/mTLS, and encrypted-at-rest persistence.
 
-The project is intentionally structured as a serious systems codebase rather than a demo:
-- protocol and engine responsibilities are separated
-- errors carry stable codes and friendly names
-- persistence behavior is explicit
-- CI enforces formatting, linting, and tests
-
 ## Current Scope
 
 Implemented today:
+
 - `String -> String` data model
 - custom framed binary transport protocol v2 with startup capability negotiation
 - shared transport crate for client and server
@@ -21,7 +16,7 @@ Implemented today:
 - zstd transport compression enabled by default, with an explicit disable flag
 - negotiated protocol capabilities for compression, request deadlines, server metrics, pipelining, and trace context
 - WAL + snapshot durability
-- logical `BACKUP` and `RESTORE` commands for portable dumps
+- logical `BACKUP` and `RESTORE` commands for portable dumps, server-side backup files, and restore dry-runs
 - server-managed storage keyring with rotation support
 - structured `INFO` output grouped by server, transport, storage, persistence, security, runtime, and metrics keys
 - request rate limiting and command quotas
@@ -32,6 +27,7 @@ Implemented today:
 - append-only audit logging
 
 Not implemented yet:
+
 - replication
 - sharding
 - distributed ACID semantics or cluster commit coordination
@@ -126,26 +122,38 @@ Run `help` in the REPL for a formatted command reference with usage examples. Co
 ```text
 INFO
 BACKUP
+BACKUP TO <path>
 RESTORE <logical-dump-json>
+RESTORE FROM <path>
+RESTORE CHECK <logical-dump-json>
+RESTORE CHECK FROM <path>
 SAVE
 SNAPSHOT
 METRICS
 CREATE USER <username> PASSWORD <password>
+ALTER USER <username> PASSWORD <password>
 CREATE ROLE <role>
 GRANT ROLE <role> TO <username>
 GRANT PERMISSION <permission> TO <role>
+GRANT PERMISSION <permission> ON <pattern> TO <role>
 SHOW USERS
 SHOW ROLES
 WHOAMI
 ```
 
-`INFO` returns deterministic section-prefixed keys such as `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.requests_total`.
+`INFO` returns deterministic section-prefixed keys such as `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `security.mtls_enabled`, `transport.compression_mode`, `runtime.backup_dir`, `runtime.max_key_bytes`, `runtime.requests_per_second`, and `metrics.requests_total`.
 
-`BACKUP` produces a logical JSON dump of live keys and absolute expiration timestamps. `RESTORE` accepts that JSON dump and replaces the current keyspace through one WAL-backed atomic engine batch. This is the Vaylix equivalent of a simple `pg_dump` / `pg_restore` flow:
+`BACKUP` produces a logical JSON dump of live keys and absolute expiration timestamps. `RESTORE` accepts that JSON dump and replaces the current keyspace through one WAL-backed atomic engine batch. `BACKUP TO <path>` and `RESTORE FROM <path>` operate on server-local files sandboxed under `--backup-dir` / `VAYLIX_BACKUP_DIR`, which defaults to `<data-dir>/backups`. `RESTORE CHECK` validates a dump and returns the live-entry count without mutating state or WAL.
 
 ```text
 vaylix> backup
 {"version":1,"created_at_ms":...,"entries":[...]}
+
+vaylix> backup to nightly.json
+OK
+
+vaylix> restore check from nightly.json
+1
 
 vaylix> restore "{\"version\":1,\"created_at_ms\":...,\"entries\":[...]}"
 1
@@ -160,7 +168,7 @@ RBAC is handled by the existing server binary and client protocol. No separate a
 On first startup, the configured `--user` / `--password` account is bootstrapped as an administrator. After that, users and roles are loaded from encrypted metadata under the data directory. Available permissions are:
 
 ```text
-read write admin backup restore metrics snapshot
+read write admin backup restore metrics snapshot clear user_admin role_admin
 ```
 
 Example:
@@ -170,18 +178,20 @@ vaylix> create user alice password "secret"
 OK
 vaylix> create role readonly
 OK
-vaylix> grant permission read to readonly
+vaylix> grant permission read on app:* to readonly
 OK
 vaylix> grant role readonly to alice
+OK
+vaylix> alter user alice password "new-secret"
 OK
 vaylix> show users
 alice  roles=readonly disabled=false
 vaylix> whoami
 username     vaylix
-permissions  admin,backup,metrics,read,restore,snapshot,write
+permissions  admin,backup,clear,metrics,read,restore,role_admin,snapshot,user_admin,write
 ```
 
-RBAC checks happen in the server before engine execution. The engine remains unaware of users, roles, and credentials.
+`admin` bypasses all checks. Key-bearing commands require every key to match a grant pattern; for example, `read on app:*` can read `app:1` but not `other:1`. `CLEAR` requires `clear`, restore commands require `restore`, user management requires `user_admin`, and role/grant management requires `role_admin`. RBAC checks happen in the server before engine execution. The engine remains unaware of users, roles, and credentials.
 
 ## Docker Persistence
 
@@ -193,12 +203,13 @@ docker run \
   -v vaylix-data:/var/lib/vaylix \
   -e VAYLIX_USER=vaylix \
   -e VAYLIX_PASSWORD=vaylix \
+  -e VAYLIX_BACKUP_DIR=/var/lib/vaylix/backups \
   ghcr.io/vaylix/vaylix:latest
 ```
 
 Stable releases are also tagged by version, for example `ghcr.io/vaylix/vaylix:0.2.0`.
 
-The data directory contains the snapshot, WAL, manifest, server-managed storage keyring, and `audit.log`.
+The data directory contains the snapshot, WAL, manifest, server-managed storage keyring, backup directory, encrypted RBAC metadata, and `audit.log`.
 The current durable storage format is version `2` and uses encrypted MessagePack payloads for engine state, WAL entries, manifests, and the storage keyring.
 
 ## Security and Operational Notes
@@ -209,7 +220,7 @@ The current durable storage format is version `2` and uses encrypted MessagePack
 - mTLS is enabled by setting `--tls-client-ca` on the server. The client must then provide `--tls-client-cert` and `--tls-client-key`.
 - Transport compression is enabled by default and negotiated during protocol startup. `--disable-compression` exists for compatibility and diagnostics.
 - At-rest encryption is managed by the server; there is no raw `--data-key` flag. WAL, snapshots, and auth/RBAC metadata use encrypted storage envelopes.
-- Audit logging is enabled by default under the data directory.
+- Audit logging is enabled by default under the data directory. Audit JSON lines are SHA-256 hash chained, and the server verifies the chain on startup to detect local modification, deletion, or reordering. This is tamper-evident logging, not non-repudiation without external hash anchoring.
 - Development defaults are convenient, not production-safe.
 - Vaylix is not a distributed database yet. Do not rely on replication, sharding, or distributed ACID behavior until those features are implemented and tested.
 
@@ -229,6 +240,7 @@ The PR workflow runs the same checks against `main`.
 ## Roadmap Constraints
 
 Vaylix is being shaped for a larger future system. That means current changes should preserve room for:
+
 - replication
 - sharding
 - stronger transactional guarantees

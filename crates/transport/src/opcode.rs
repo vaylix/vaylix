@@ -47,6 +47,11 @@ pub enum Opcode {
     ShowUsers = 0x29,
     ShowRoles = 0x2A,
     WhoAmI = 0x2B,
+    BackupTo = 0x2C,
+    RestoreFrom = 0x2D,
+    RestoreCheck = 0x2E,
+    RestoreCheckFrom = 0x2F,
+    AlterUserPassword = 0x30,
 }
 
 impl From<Opcode> for u8 {
@@ -103,6 +108,11 @@ impl TryFrom<u8> for Opcode {
             0x29 => Ok(Self::ShowUsers),
             0x2A => Ok(Self::ShowRoles),
             0x2B => Ok(Self::WhoAmI),
+            0x2C => Ok(Self::BackupTo),
+            0x2D => Ok(Self::RestoreFrom),
+            0x2E => Ok(Self::RestoreCheck),
+            0x2F => Ok(Self::RestoreCheckFrom),
+            0x30 => Ok(Self::AlterUserPassword),
             other => Err(TransportError::UnknownOpcode(other)),
         }
     }
@@ -159,6 +169,11 @@ mod tests {
             (0x29, Opcode::ShowUsers),
             (0x2A, Opcode::ShowRoles),
             (0x2B, Opcode::WhoAmI),
+            (0x2C, Opcode::BackupTo),
+            (0x2D, Opcode::RestoreFrom),
+            (0x2E, Opcode::RestoreCheck),
+            (0x2F, Opcode::RestoreCheckFrom),
+            (0x30, Opcode::AlterUserPassword),
         ];
 
         for (byte, opcode) in mappings {

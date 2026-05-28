@@ -56,7 +56,9 @@ The long-term target is broader:
   - scan/dbsize/info/metrics/list/count
   - clear/save/snapshot
   - backup/restore
+  - backup-to-file/restore-from-file/restore-check
   - create/drop user and role
+  - alter user password
   - grant/revoke role and permission
   - show users/show roles/whoami
   - multi/exec/discard
@@ -168,21 +170,29 @@ Current permissions:
 - `restore`
 - `metrics`
 - `snapshot`
+- `clear`
+- `user_admin`
+- `role_admin`
 
 Current admin commands:
 - `create user <username> password <password>`
+- `alter user <username> password <password>`
 - `drop user <username>`
 - `create role <role>`
 - `drop role <role>`
 - `grant role <role> to <username>`
 - `revoke role <role> from <username>`
 - `grant permission <permission> to <role>`
+- `grant permission <permission> on <pattern> to <role>`
 - `revoke permission <permission> from <role>`
+- `revoke permission <permission> on <pattern> from <role>`
 - `show users`
 - `show roles`
 - `whoami`
 
-Authorization happens in the server after authentication and before engine execution. The engine must remain unaware of users, credentials, roles, and permissions.
+Permission grants are pattern-scoped. The legacy syntax `grant permission <permission> to <role>` is an alias for `grant permission <permission> on * to <role>`. Patterns are glob-like over keys, not SQL schemas or tables. Key-bearing commands require every key to match the relevant permission grant. The `admin` permission bypasses pattern checks. Destructive and administrative operations use explicit permissions: `CLEAR` / `FLUSHDB` require `clear`, restore commands require `restore`, user management requires `user_admin`, and role/grant management requires `role_admin`.
+
+Authorization happens in the server after authentication and before engine execution. The engine must remain unaware of users, credentials, roles, and permissions. Existing authenticated sessions remain valid after password rotation; new authentication attempts use the rotated password.
 
 Client connection string format:
 - `vaylix://user:password@host:port`
@@ -230,10 +240,20 @@ Recovery flow:
 Vaylix also supports logical backups through database commands:
 - `BACKUP`
 - `RESTORE <logical-dump-json>`
+- `BACKUP TO <path>`
+- `RESTORE FROM <path>`
+- `RESTORE CHECK <logical-dump-json>`
+- `RESTORE CHECK FROM <path>`
 
 `BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live string key/value entries, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
 
 `RESTORE` accepts the logical JSON dump and replaces the current keyspace with live dump entries through one WAL-backed atomic engine batch. Entries whose absolute expiration timestamp is already in the past are skipped. This is separate from physical `SAVE` / `SNAPSHOT`, which persist the local node’s encrypted snapshot and flush/rotate the WAL.
+
+`BACKUP TO <path>` and `RESTORE FROM <path>` operate on server-local files under the configured backup directory only. The server resolves and canonicalizes paths, rejects `..` traversal, and rejects paths outside the backup directory. `RESTORE CHECK` validates backup JSON, backup version, entry schema, string fields, and expired-entry handling without mutating engine state or WAL; it returns the count of live entries that would be restored.
+
+Backup directory:
+- server arg/env: `--backup-dir` / `VAYLIX_BACKUP_DIR`
+- default: `<data-dir>/backups`
 
 ### Storage Encryption
 
@@ -256,6 +276,11 @@ Audit logging is implemented as append-only JSON lines under the data directory 
 - optional override: `--audit-log-path`
 
 Each event records:
+- audit format version
+- monotonically increasing audit sequence
+- SHA-256 hash algorithm name
+- previous event hash
+- current event hash
 - timestamp
 - connection id
 - peer address
@@ -265,6 +290,8 @@ Each event records:
 - response status
 - error code when applicable
 - latency in milliseconds
+
+The audit chain uses a fixed zero genesis hash for the first event. On startup, the server verifies existing audit lines and fails closed if a line has malformed JSON, invalid sequence, mismatched previous hash, mismatched event hash, or an unsupported hash algorithm. This makes local tampering detectable, but it is not non-repudiation: a local attacker who can rewrite the entire log can recompute a fresh chain unless the latest hash is anchored externally.
 
 Passwords and payload contents are not written to the audit log.
 
@@ -331,6 +358,8 @@ Current runtime protections:
 
 Examples include `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.requests_total`.
 
+Runtime/security examples also include quota and operational settings such as `runtime.max_key_bytes`, `runtime.max_value_bytes`, `runtime.max_keys_per_batch`, `runtime.max_transaction_queue_len`, `runtime.requests_per_second`, `runtime.request_burst`, `runtime.backup_dir`, `security.auth_enabled`, `security.rbac_enabled`, `security.mtls_enabled`, and `transport.compression_mode`.
+
 ## Client Runtime
 
 - interactive REPL
@@ -357,6 +386,7 @@ This path is the durable storage root for:
 - manifest
 - storage keyring
 - encrypted auth/RBAC metadata
+- logical backup files under the backup directory
 
 ## CI and Release
 
@@ -375,7 +405,6 @@ Release workflow goal:
 
 - full distributed ACID semantics are not implemented
 - no replication or sharding yet
-- RBAC exists, but there is no fine-grained key-pattern ACL model yet
 - backup/restore is command-level logical JSON only; there is no separate streaming backup utility yet
 - no TLS certificate automation or rotation workflow yet
 - TLS is opt-in rather than mandatory

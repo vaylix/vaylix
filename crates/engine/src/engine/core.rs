@@ -544,7 +544,12 @@ impl Engine {
             | Command::Save
             | Command::Snapshot
             | Command::Backup
+            | Command::BackupTo { .. }
             | Command::Restore { .. }
+            | Command::RestoreFrom { .. }
+            | Command::RestoreCheck { .. }
+            | Command::RestoreCheckFrom { .. }
+            | Command::AlterUserPassword { .. }
             | Command::CreateUser { .. }
             | Command::DropUser { .. }
             | Command::CreateRole { .. }
@@ -999,14 +1004,7 @@ impl StorageEngine for Engine {
     }
 
     fn restore_logical_backup(&mut self, dump: &str) -> Result<usize> {
-        let backup: LogicalBackup = serde_json::from_str(dump)
-            .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string()))?;
-        if backup.version != 1 {
-            return Err(crate::EngineError::UnsupportedStorageFormat {
-                resource: "logical backup",
-            });
-        }
-
+        let backup = parse_logical_backup(dump)?;
         let now_ms = self.now();
         let mut operations = Vec::with_capacity(1 + backup.entries.len().saturating_mul(2));
         operations.push(WalOperation::Clear);
@@ -1034,6 +1032,32 @@ impl StorageEngine for Engine {
         self.append_and_apply(operations)?;
         Ok(restored)
     }
+
+    fn validate_logical_backup(&mut self, dump: &str) -> Result<usize> {
+        let backup = parse_logical_backup(dump)?;
+        let now_ms = self.now();
+        Ok(backup
+            .entries
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .expires_at_ms
+                    .map(|expires_at_ms| expires_at_ms > now_ms)
+                    .unwrap_or(true)
+            })
+            .count())
+    }
+}
+
+fn parse_logical_backup(dump: &str) -> Result<LogicalBackup> {
+    let backup: LogicalBackup = serde_json::from_str(dump)
+        .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string()))?;
+    if backup.version != 1 {
+        return Err(crate::EngineError::UnsupportedStorageFormat {
+            resource: "logical backup",
+        });
+    }
+    Ok(backup)
 }
 
 fn now_millis() -> u64 {

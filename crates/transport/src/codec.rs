@@ -594,12 +594,28 @@ mod tests {
             Command::Save,
             Command::Snapshot,
             Command::Backup,
+            Command::BackupTo {
+                path: "nightly.json".to_string(),
+            },
             Command::Restore {
                 dump: "{\"version\":1}".to_string(),
+            },
+            Command::RestoreFrom {
+                path: "nightly.json".to_string(),
+            },
+            Command::RestoreCheck {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::RestoreCheckFrom {
+                path: "nightly.json".to_string(),
             },
             Command::CreateUser {
                 username: "alice".to_string(),
                 password: "secret".to_string(),
+            },
+            Command::AlterUserPassword {
+                username: "alice".to_string(),
+                password: "new-secret".to_string(),
             },
             Command::DropUser {
                 username: "alice".to_string(),
@@ -620,10 +636,12 @@ mod tests {
             },
             Command::GrantPermission {
                 permission: "read".to_string(),
+                pattern: "app:*".to_string(),
                 role: "readonly".to_string(),
             },
             Command::RevokePermission {
                 permission: "read".to_string(),
+                pattern: "app:*".to_string(),
                 role: "readonly".to_string(),
             },
             Command::ShowUsers,

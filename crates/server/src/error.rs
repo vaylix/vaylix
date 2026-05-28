@@ -61,6 +61,10 @@ pub enum ServerError {
     AuthStoreEncode(String),
     #[error("auth store deserialization failed: {0}")]
     AuthStoreDecode(String),
+    #[error("backup path is outside the configured backup directory: {0}")]
+    BackupPathRejected(String),
+    #[error("audit log hash chain verification failed: {0}")]
+    AuditChainVerification(String),
 }
 
 impl ServerError {
@@ -94,6 +98,8 @@ impl ServerError {
             Self::LastAdminUser => "SRV-024",
             Self::AuthStoreEncode(_) => "SRV-025",
             Self::AuthStoreDecode(_) => "SRV-026",
+            Self::BackupPathRejected(_) => "SRV-027",
+            Self::AuditChainVerification(_) => "SRV-028",
         }
     }
 
@@ -127,6 +133,8 @@ impl ServerError {
             Self::LastAdminUser => "Last Admin User",
             Self::AuthStoreEncode(_) => "Auth Store Serialization Failure",
             Self::AuthStoreDecode(_) => "Auth Store Deserialization Failure",
+            Self::BackupPathRejected(_) => "Backup Path Rejected",
+            Self::AuditChainVerification(_) => "Audit Chain Verification Failure",
         }
     }
 }
