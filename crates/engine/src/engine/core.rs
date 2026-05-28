@@ -541,10 +541,13 @@ impl Engine {
             }
             Command::Info
             | Command::Metrics
+            | Command::MetricsProm
             | Command::Save
             | Command::Snapshot
             | Command::Backup
             | Command::BackupTo { .. }
+            | Command::BackupVerify { .. }
+            | Command::BackupVerifyFrom { .. }
             | Command::Restore { .. }
             | Command::RestoreFrom { .. }
             | Command::RestoreCheck { .. }
@@ -560,6 +563,9 @@ impl Engine {
             | Command::RevokePermission { .. }
             | Command::ShowUsers
             | Command::ShowRoles
+            | Command::ShowGrants
+            | Command::ShowGrantsForUser { .. }
+            | Command::ShowGrantsForRole { .. }
             | Command::WhoAmI
             | Command::Multi
             | Command::Exec
@@ -1098,6 +1104,7 @@ mod tests {
     use crate::{
         EngineOptions, Expiration, Paths, SetCondition, SetOptions, StorageEngine, StorageKey,
         StorageKeyring, WalSyncPolicy,
+        store::{Manifest, save_manifest},
     };
     use command::Command;
     use std::fs;
@@ -1322,6 +1329,54 @@ mod tests {
         );
 
         assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_unsupported_manifest_storage_format_on_recovery() {
+        let root = temp_dir("unsupported-manifest");
+        let paths = Paths::from_data_dir(&root).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        save_manifest(
+            &Manifest {
+                storage_format_version: 999,
+                engine_version: 2,
+                last_snapshot_sequence: 0,
+                last_snapshot_at_ms: now_ms(),
+                snapshot_size_bytes: 0,
+                snapshot_checksum: 0,
+            },
+            &paths.manifest_path,
+            &paths.manifest_tmp_path,
+        )
+        .unwrap();
+
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+            },
+        );
+
+        assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_unsupported_logical_backup_version() {
+        let (mut engine, root) = engine();
+        let dump = serde_json::json!({
+            "version": 999,
+            "created_at_ms": now_ms(),
+            "source_engine_version": 2,
+            "source_sequence": 0,
+            "entries": []
+        })
+        .to_string();
+
+        assert!(engine.validate_logical_backup(&dump).is_err());
+        assert!(engine.restore_logical_backup(&dump).is_err());
         fs::remove_dir_all(root).ok();
     }
 

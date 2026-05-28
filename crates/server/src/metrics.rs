@@ -76,4 +76,21 @@ impl Metrics {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect()
     }
+
+    /// Renders counters and gauges in Prometheus text exposition format.
+    pub fn prometheus(&self) -> String {
+        let mut lines = Vec::new();
+        for (name, value) in self.snapshot() {
+            let metric = format!("vaylix_{name}");
+            let metric_type = if name == "active_connections" {
+                "gauge"
+            } else {
+                "counter"
+            };
+            lines.push(format!("# HELP {metric} Vaylix server metric {name}."));
+            lines.push(format!("# TYPE {metric} {metric_type}"));
+            lines.push(format!("{metric} {value}"));
+        }
+        lines.join("\n")
+    }
 }

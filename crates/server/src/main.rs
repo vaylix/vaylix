@@ -103,6 +103,13 @@ async fn try_main() -> server::Result<()> {
         audit_logger: std::sync::Arc::new(audit_logger),
         backup_dir,
         mtls_enabled,
+        slow_command_threshold: if args.slow_command_threshold_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                args.slow_command_threshold_ms,
+            ))
+        },
     };
     let server = Server::new(
         args.bind,

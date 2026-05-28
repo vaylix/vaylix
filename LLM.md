@@ -18,6 +18,7 @@ The current implementation is a single-node, string-to-string key/value database
 - append-only audit logging
 - default-on negotiated outbound frame-level zstd compression
 - deterministic command parsing and explicit error codes
+- protocol-level Prometheus metrics export through `METRICS PROM`
 
 The long-term target is broader:
 - scale from a single node to replicated and sharded deployments
@@ -53,14 +54,14 @@ The long-term target is broader:
   - incr/decr
   - expire/ttl/persist
   - rename/renamenx
-  - scan/dbsize/info/metrics/list/count
+  - scan/dbsize/info/metrics/metrics-prom/list/count
   - clear/save/snapshot
   - backup/restore
-  - backup-to-file/restore-from-file/restore-check
+  - backup-to-file/backup-verify/restore-from-file/restore-check
   - create/drop user and role
   - alter user password
   - grant/revoke role and permission
-  - show users/show roles/whoami
+  - show users/show roles/show grants/whoami
   - multi/exec/discard
 
 ## Transaction and ACID Status
@@ -188,9 +189,17 @@ Current admin commands:
 - `revoke permission <permission> on <pattern> from <role>`
 - `show users`
 - `show roles`
+- `show grants`
+- `show grants for user <username>`
+- `show grants for role <role>`
 - `whoami`
 
 Permission grants are pattern-scoped. The legacy syntax `grant permission <permission> to <role>` is an alias for `grant permission <permission> on * to <role>`. Patterns are glob-like over keys, not SQL schemas or tables. Key-bearing commands require every key to match the relevant permission grant. The `admin` permission bypasses pattern checks. Destructive and administrative operations use explicit permissions: `CLEAR` / `FLUSHDB` require `clear`, restore commands require `restore`, user management requires `user_admin`, and role/grant management requires `role_admin`.
+
+Grant inspection rules:
+- `show grants` returns the current authenticated user's roles and resolved grants
+- `show grants for user <username>` requires `user_admin` or `admin`
+- `show grants for role <role>` requires `role_admin` or `admin`
 
 Authorization happens in the server after authentication and before engine execution. The engine must remain unaware of users, credentials, roles, and permissions. Existing authenticated sessions remain valid after password rotation; new authentication attempts use the rotated password.
 
@@ -241,6 +250,8 @@ Vaylix also supports logical backups through database commands:
 - `BACKUP`
 - `RESTORE <logical-dump-json>`
 - `BACKUP TO <path>`
+- `BACKUP VERIFY <logical-dump-json>`
+- `BACKUP VERIFY FROM <path>`
 - `RESTORE FROM <path>`
 - `RESTORE CHECK <logical-dump-json>`
 - `RESTORE CHECK FROM <path>`
@@ -250,6 +261,8 @@ Vaylix also supports logical backups through database commands:
 `RESTORE` accepts the logical JSON dump and replaces the current keyspace with live dump entries through one WAL-backed atomic engine batch. Entries whose absolute expiration timestamp is already in the past are skipped. This is separate from physical `SAVE` / `SNAPSHOT`, which persist the local node’s encrypted snapshot and flush/rotate the WAL.
 
 `BACKUP TO <path>` and `RESTORE FROM <path>` operate on server-local files under the configured backup directory only. The server resolves and canonicalizes paths, rejects `..` traversal, and rejects paths outside the backup directory. `RESTORE CHECK` validates backup JSON, backup version, entry schema, string fields, and expired-entry handling without mutating engine state or WAL; it returns the count of live entries that would be restored.
+
+When `BACKUP TO <path>` writes a server-side dump, the server also writes `<path>.manifest.json`. The sidecar manifest records backup version, creation timestamp, source engine version, source sequence, entry count, dump byte length, SHA-256 digest, and hash algorithm. `BACKUP VERIFY <logical-dump-json>` validates inline backup JSON and returns deterministic entries such as `status=ok`, `entries=<n>`, and `sha256=<hash>`. `BACKUP VERIFY FROM <path>` verifies both the sidecar manifest and the dump before validating backup contents.
 
 Backup directory:
 - server arg/env: `--backup-dir` / `VAYLIX_BACKUP_DIR`
@@ -290,10 +303,12 @@ Each event records:
 - response status
 - error code when applicable
 - latency in milliseconds
+- event type
+- sanitized details map
 
 The audit chain uses a fixed zero genesis hash for the first event. On startup, the server verifies existing audit lines and fails closed if a line has malformed JSON, invalid sequence, mismatched previous hash, mismatched event hash, or an unsupported hash algorithm. This makes local tampering detectable, but it is not non-repudiation: a local attacker who can rewrite the entire log can recompute a fresh chain unless the latest hash is anchored externally.
 
-Passwords and payload contents are not written to the audit log.
+Passwords and payload contents are not written to the audit log. Semantic event types are recorded for authentication success/failure and RBAC/auth mutations such as create/drop user, password rotation, create/drop role, grant/revoke role, and grant/revoke permission. Slow command audit events are emitted when command latency is at or above `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`; the default is `100`, and `0` disables slow-command events.
 
 ## Scalability Direction
 
@@ -358,7 +373,9 @@ Current runtime protections:
 
 Examples include `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.requests_total`.
 
-Runtime/security examples also include quota and operational settings such as `runtime.max_key_bytes`, `runtime.max_value_bytes`, `runtime.max_keys_per_batch`, `runtime.max_transaction_queue_len`, `runtime.requests_per_second`, `runtime.request_burst`, `runtime.backup_dir`, `security.auth_enabled`, `security.rbac_enabled`, `security.mtls_enabled`, and `transport.compression_mode`.
+Runtime/security examples also include quota and operational settings such as `runtime.max_key_bytes`, `runtime.max_value_bytes`, `runtime.max_keys_per_batch`, `runtime.max_transaction_queue_len`, `runtime.requests_per_second`, `runtime.request_burst`, `runtime.backup_dir`, `runtime.slow_command_threshold_ms`, `security.auth_enabled`, `security.rbac_enabled`, `security.mtls_enabled`, and `transport.compression_mode`.
+
+`METRICS` returns deterministic key/value metric entries. `METRICS PROM` returns Prometheus text exposition format over the database protocol; there is intentionally no separate HTTP listener in this pass.
 
 ## Client Runtime
 
@@ -400,6 +417,8 @@ Release workflow goal:
 - publish multi-OS client binaries
 - publish multi-OS server binaries
 - publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.2.0`
+- publish SBOMs for release archives and Docker images
+- use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 
 ## Current Gaps
 

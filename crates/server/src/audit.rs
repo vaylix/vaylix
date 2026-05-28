@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -23,6 +24,8 @@ pub struct AuditEvent {
     pub status: String,
     pub error_code: Option<String>,
     pub latency_ms: u64,
+    pub event_type: String,
+    pub details: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +43,8 @@ struct HashPayload {
     status: String,
     error_code: Option<String>,
     latency_ms: u64,
+    event_type: String,
+    details: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +63,8 @@ struct ChainedAuditEvent {
     status: String,
     error_code: Option<String>,
     latency_ms: u64,
+    event_type: String,
+    details: BTreeMap<String, String>,
 }
 
 struct AuditChainState {
@@ -122,6 +129,8 @@ impl AuditLogger {
             status: event.status.clone(),
             error_code: event.error_code.clone(),
             latency_ms: event.latency_ms,
+            event_type: event.event_type.clone(),
+            details: event.details.clone(),
         };
 
         serde_json::to_writer(&mut *file, &chained).map_err(std::io::Error::other)?;
@@ -194,6 +203,8 @@ fn verify_existing_chain(path: &Path) -> Result<AuditChainState> {
                 status: event.status.clone(),
                 error_code: event.error_code.clone(),
                 latency_ms: event.latency_ms,
+                event_type: event.event_type.clone(),
+                details: event.details.clone(),
             },
         )?;
         if event.event_hash != computed_hash {
@@ -225,6 +236,8 @@ fn compute_hash(sequence: u64, previous_hash: &str, event: &AuditEvent) -> Resul
         status: event.status.clone(),
         error_code: event.error_code.clone(),
         latency_ms: event.latency_ms,
+        event_type: event.event_type.clone(),
+        details: event.details.clone(),
     };
     let bytes = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
     let digest = Sha256::digest(bytes);
@@ -239,15 +252,20 @@ fn chain_error(line: usize, message: impl Into<String>) -> ServerError {
 mod tests {
     use super::{AUDIT_VERSION, AuditEvent, AuditLogger, GENESIS_HASH, HASH_ALGORITHM};
     use serde_json::Value;
+    use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn temp_path() -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("veyra-audit-{unique}.log"))
+        let suffix = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("veyra-audit-{unique}-{suffix}.log"))
     }
 
     fn event(opcode: &str) -> AuditEvent {
@@ -261,6 +279,8 @@ mod tests {
             status: "ok".to_string(),
             error_code: None,
             latency_ms: 3,
+            event_type: "command".to_string(),
+            details: BTreeMap::new(),
         }
     }
 
@@ -285,6 +305,7 @@ mod tests {
         assert_eq!(lines[0]["previous_hash"], GENESIS_HASH);
         assert_eq!(lines[0]["hash_algorithm"], HASH_ALGORITHM);
         assert_eq!(lines[0]["opcode"], "GET");
+        assert_eq!(lines[0]["event_type"], "command");
         assert_eq!(lines[0]["event_hash"].as_str().unwrap().len(), 64);
         fs::remove_file(path).ok();
     }

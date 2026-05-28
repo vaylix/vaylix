@@ -128,6 +128,7 @@ impl Request {
             Command::DbSize => Ok(Self::new(request_id, Opcode::DbSize, Vec::new())),
             Command::Info => Ok(Self::new(request_id, Opcode::Info, Vec::new())),
             Command::Metrics => Ok(Self::new(request_id, Opcode::Metrics, Vec::new())),
+            Command::MetricsProm => Ok(Self::new(request_id, Opcode::MetricsProm, Vec::new())),
             Command::List => Ok(Self::new(request_id, Opcode::List, Vec::new())),
             Command::Clear => Ok(Self::new(request_id, Opcode::Clear, Vec::new())),
             Command::Count => Ok(Self::new(request_id, Opcode::Count, Vec::new())),
@@ -137,6 +138,16 @@ impl Request {
             Command::BackupTo { path } => {
                 Ok(Self::new(request_id, Opcode::BackupTo, encode_key(&path)?))
             }
+            Command::BackupVerify { dump } => Ok(Self::new(
+                request_id,
+                Opcode::BackupVerify,
+                encode_dump(&dump)?,
+            )),
+            Command::BackupVerifyFrom { path } => Ok(Self::new(
+                request_id,
+                Opcode::BackupVerifyFrom,
+                encode_key(&path)?,
+            )),
             Command::Restore { dump } => {
                 Ok(Self::new(request_id, Opcode::Restore, encode_dump(&dump)?))
             }
@@ -208,6 +219,17 @@ impl Request {
             )),
             Command::ShowUsers => Ok(Self::new(request_id, Opcode::ShowUsers, Vec::new())),
             Command::ShowRoles => Ok(Self::new(request_id, Opcode::ShowRoles, Vec::new())),
+            Command::ShowGrants => Ok(Self::new(request_id, Opcode::ShowGrants, Vec::new())),
+            Command::ShowGrantsForUser { username } => Ok(Self::new(
+                request_id,
+                Opcode::ShowGrantsForUser,
+                encode_key(&username)?,
+            )),
+            Command::ShowGrantsForRole { role } => Ok(Self::new(
+                request_id,
+                Opcode::ShowGrantsForRole,
+                encode_key(&role)?,
+            )),
             Command::WhoAmI => Ok(Self::new(request_id, Opcode::WhoAmI, Vec::new())),
             Command::Multi => Ok(Self::new(request_id, Opcode::Multi, Vec::new())),
             Command::Exec => Ok(Self::new(request_id, Opcode::Exec, Vec::new())),
@@ -306,6 +328,7 @@ impl Request {
             Opcode::DbSize => decode_empty(&self.payload).map(|()| Command::DbSize),
             Opcode::Info => decode_empty(&self.payload).map(|()| Command::Info),
             Opcode::Metrics => decode_empty(&self.payload).map(|()| Command::Metrics),
+            Opcode::MetricsProm => decode_empty(&self.payload).map(|()| Command::MetricsProm),
             Opcode::List => decode_empty(&self.payload).map(|()| Command::List),
             Opcode::Clear => decode_empty(&self.payload).map(|()| Command::Clear),
             Opcode::Count => decode_empty(&self.payload).map(|()| Command::Count),
@@ -313,6 +336,12 @@ impl Request {
             Opcode::Snapshot => decode_empty(&self.payload).map(|()| Command::Snapshot),
             Opcode::Backup => decode_empty(&self.payload).map(|()| Command::Backup),
             Opcode::BackupTo => Ok(Command::BackupTo {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::BackupVerify => Ok(Command::BackupVerify {
+                dump: decode_dump(&self.payload)?,
+            }),
+            Opcode::BackupVerifyFrom => Ok(Command::BackupVerifyFrom {
                 path: decode_single_key(&self.payload)?,
             }),
             Opcode::Restore => Ok(Command::Restore {
@@ -370,6 +399,13 @@ impl Request {
             }
             Opcode::ShowUsers => decode_empty(&self.payload).map(|()| Command::ShowUsers),
             Opcode::ShowRoles => decode_empty(&self.payload).map(|()| Command::ShowRoles),
+            Opcode::ShowGrants => decode_empty(&self.payload).map(|()| Command::ShowGrants),
+            Opcode::ShowGrantsForUser => Ok(Command::ShowGrantsForUser {
+                username: decode_single_key(&self.payload)?,
+            }),
+            Opcode::ShowGrantsForRole => Ok(Command::ShowGrantsForRole {
+                role: decode_single_key(&self.payload)?,
+            }),
             Opcode::WhoAmI => decode_empty(&self.payload).map(|()| Command::WhoAmI),
             Opcode::Multi => decode_empty(&self.payload).map(|()| Command::Multi),
             Opcode::Exec => decode_empty(&self.payload).map(|()| Command::Exec),
@@ -849,6 +885,7 @@ mod tests {
             },
             Command::DbSize,
             Command::Info,
+            Command::MetricsProm,
             Command::List,
             Command::Clear,
             Command::Count,
@@ -856,6 +893,12 @@ mod tests {
             Command::Snapshot,
             Command::Backup,
             Command::BackupTo {
+                path: "nightly.json".to_string(),
+            },
+            Command::BackupVerify {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::BackupVerifyFrom {
                 path: "nightly.json".to_string(),
             },
             Command::Restore {
@@ -907,6 +950,13 @@ mod tests {
             },
             Command::ShowUsers,
             Command::ShowRoles,
+            Command::ShowGrants,
+            Command::ShowGrantsForUser {
+                username: "alice".to_string(),
+            },
+            Command::ShowGrantsForRole {
+                role: "readonly".to_string(),
+            },
             Command::WhoAmI,
         ];
 

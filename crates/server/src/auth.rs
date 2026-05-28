@@ -127,6 +127,14 @@ impl Identity {
             .collect::<Vec<_>>()
             .join(",")
     }
+
+    pub fn grants_csv(&self) -> String {
+        self.grants
+            .iter()
+            .map(|grant| format!("{} on {}", grant.permission.as_str(), grant.pattern))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -271,6 +279,14 @@ impl AuthConfig {
 
     pub async fn roles(&self) -> Vec<(String, String)> {
         self.store.read().await.roles()
+    }
+
+    pub async fn grants_for_user(&self, username: &str) -> Result<Vec<(String, String)>> {
+        self.store.read().await.grants_for_user(username)
+    }
+
+    pub async fn grants_for_role(&self, role: &str) -> Result<Vec<(String, String)>> {
+        self.store.read().await.grants_for_role(role)
     }
 }
 
@@ -467,6 +483,48 @@ impl AuthStore {
             .iter()
             .map(|(role, record)| (role.clone(), role_grants(record).join(",")))
             .collect()
+    }
+
+    fn grants_for_user(&self, username: &str) -> Result<Vec<(String, String)>> {
+        let user = self
+            .stored
+            .users
+            .get(username)
+            .ok_or_else(|| ServerError::UserNotFound(username.to_string()))?;
+        let mut entries = Vec::new();
+        entries.push((
+            format!("user.{username}.roles"),
+            user.roles.iter().cloned().collect::<Vec<_>>().join(","),
+        ));
+        let mut index = 0;
+        for role in &user.roles {
+            if let Some(record) = self.stored.roles.get(role) {
+                for grant in role_grants(record) {
+                    entries.push((
+                        format!("user.{username}.grant.{index:03}"),
+                        format!("role={role} {grant}"),
+                    ));
+                    index += 1;
+                }
+            }
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
+    }
+
+    fn grants_for_role(&self, role: &str) -> Result<Vec<(String, String)>> {
+        let record = self
+            .stored
+            .roles
+            .get(role)
+            .ok_or_else(|| ServerError::RoleNotFound(role.to_string()))?;
+        let mut entries = role_grants(record)
+            .into_iter()
+            .enumerate()
+            .map(|(index, grant)| (format!("role.{role}.grant.{index:03}"), grant))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(entries)
     }
 
     fn resolve_permissions(

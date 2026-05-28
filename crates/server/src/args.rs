@@ -129,6 +129,10 @@ pub struct Args {
     /// Optional audit log path override. Defaults to <data-dir>/audit.log.
     #[arg(long)]
     pub audit_log_path: Option<PathBuf>,
+
+    /// Record slow-command audit events at or above this latency in milliseconds. Use 0 to disable.
+    #[arg(long, env = "VAYLIX_SLOW_COMMAND_THRESHOLD_MS", default_value_t = 100)]
+    pub slow_command_threshold_ms: u64,
 }
 
 #[cfg(test)]

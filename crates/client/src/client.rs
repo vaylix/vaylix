@@ -371,7 +371,8 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::Get { .. }
             | Command::GetDel { .. }
             | Command::GetEx { .. }
-            | Command::Backup => Ok(response.decode_value()?),
+            | Command::Backup
+            | Command::MetricsProm => Ok(response.decode_value()?),
             Command::Set { options, .. } => {
                 if options.return_previous {
                     Ok(response.decode_value()?)
@@ -438,8 +439,13 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             Command::Info
             | Command::Metrics
             | Command::List
+            | Command::BackupVerify { .. }
+            | Command::BackupVerifyFrom { .. }
             | Command::ShowUsers
             | Command::ShowRoles
+            | Command::ShowGrants
+            | Command::ShowGrantsForUser { .. }
+            | Command::ShowGrantsForRole { .. }
             | Command::WhoAmI => {
                 let entries = response.decode_entries()?;
                 render_entries(&entries, output)

@@ -256,6 +256,7 @@ fn runtime_with_tls(
         transport: CodecOptions::default(),
         backup_dir: temp_dir("tcp-backups"),
         mtls_enabled: false,
+        slow_command_threshold: Some(Duration::from_millis(100)),
         audit_logger: std::sync::Arc::new(AuditLogger::open(&audit_path).unwrap()),
     }
 }
@@ -586,6 +587,30 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
     let backup_to_response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(backup_to_response.status, Status::Ok);
     assert!(backup_dir.join("tcp-backup.json").exists());
+    assert!(backup_dir.join("tcp-backup.json.manifest.json").exists());
+
+    let backup_verify = Request::from_command(
+        id(323),
+        Command::BackupVerifyFrom {
+            path: "tcp-backup.json".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &backup_verify)
+        .await
+        .unwrap();
+    let backup_verify_response = read_response_from_async(&mut stream).await.unwrap();
+    let backup_verify_entries = backup_verify_response.decode_entries().unwrap();
+    assert!(
+        backup_verify_entries
+            .iter()
+            .any(|(key, value)| key == "status" && value == "ok")
+    );
+    assert!(
+        backup_verify_entries
+            .iter()
+            .any(|(key, value)| key == "entries" && value == "1")
+    );
 
     let restore_check = Request::from_command(
         id(322),
@@ -599,6 +624,15 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         .unwrap();
     let restore_check_response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(restore_check_response.decode_count().unwrap(), 1);
+
+    let metrics_prom = Request::from_command(id(324), Command::MetricsProm).unwrap();
+    write_request_to_async(&mut stream, &metrics_prom)
+        .await
+        .unwrap();
+    let metrics_prom_response = read_response_from_async(&mut stream).await.unwrap();
+    let metrics_body = metrics_prom_response.decode_value().unwrap();
+    assert!(metrics_body.contains("# HELP vaylix_requests_total"));
+    assert!(metrics_body.contains("# TYPE vaylix_active_connections gauge"));
 
     let getdel = Request::from_command(
         id(4),
@@ -717,6 +751,18 @@ async fn enforces_rbac_over_tcp() {
     let read_response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(read_response.status, Status::NotFound);
 
+    let show_own_grants = Request::from_command(id(460), Command::ShowGrants).unwrap();
+    write_request_to_async(&mut stream, &show_own_grants)
+        .await
+        .unwrap();
+    let show_own_grants_response = read_response_from_async(&mut stream).await.unwrap();
+    let own_grants = show_own_grants_response.decode_entries().unwrap();
+    assert!(
+        own_grants
+            .iter()
+            .any(|(_, value)| value == "role=readonly read on app:*")
+    );
+
     let out_of_pattern_read = Request::from_command(
         id(461),
         Command::Get {
@@ -763,6 +809,24 @@ async fn enforces_rbac_over_tcp() {
         .unwrap();
     let rotate_response = read_response_from_async(&mut admin_stream).await.unwrap();
     assert_eq!(rotate_response.status, Status::Ok);
+
+    let show_role_grants = Request::from_command(
+        id(481),
+        Command::ShowGrantsForRole {
+            role: "readonly".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut admin_stream, &show_role_grants)
+        .await
+        .unwrap();
+    let show_role_grants_response = read_response_from_async(&mut admin_stream).await.unwrap();
+    let role_grants = show_role_grants_response.decode_entries().unwrap();
+    assert!(
+        role_grants
+            .iter()
+            .any(|(_, value)| value == "read on app:*")
+    );
 
     let existing_session_read = Request::from_command(
         id(49),

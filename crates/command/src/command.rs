@@ -131,7 +131,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "metrics",
-        usage: "metrics",
+        usage: "metrics [prom]",
     },
     CommandInfo {
         name: "list",
@@ -155,7 +155,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "backup",
-        usage: "backup [to <path>]",
+        usage: "backup [to <path>] | backup verify <logical-dump-json> | backup verify from <path>",
     },
     CommandInfo {
         name: "restore",
@@ -204,6 +204,10 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "show-roles",
         usage: "show roles",
+    },
+    CommandInfo {
+        name: "show-grants",
+        usage: "show grants | show grants for user <username> | show grants for role <role>",
     },
     CommandInfo {
         name: "whoami",
@@ -311,12 +315,19 @@ pub enum Command {
     DbSize,
     Info,
     Metrics,
+    MetricsProm,
     List,
     Clear,
     Count,
     Save,
     Backup,
     BackupTo {
+        path: String,
+    },
+    BackupVerify {
+        dump: String,
+    },
+    BackupVerifyFrom {
         path: String,
     },
     Restore {
@@ -368,6 +379,13 @@ pub enum Command {
     },
     ShowUsers,
     ShowRoles,
+    ShowGrants,
+    ShowGrantsForUser {
+        username: String,
+    },
+    ShowGrantsForRole {
+        role: String,
+    },
     WhoAmI,
     Multi,
     Exec,

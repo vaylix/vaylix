@@ -29,6 +29,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Expanded structured `INFO` with runtime guard, auth, TLS/mTLS, compression, and backup directory settings.
 - Added tests for key-pattern authorization, destructive permission denial, password rotation, sandboxed backup paths, restore dry-run validation, and TCP-level RBAC/backup flows.
 - Added SHA-256 hash chaining for audit JSON lines so event modification, deletion, and reordering are detected on server startup.
+- Added `show grants`, `show grants for user <username>`, and `show grants for role <role>` for deterministic RBAC introspection.
+- Added semantic audit event types and sanitized detail maps for authentication and RBAC/auth mutations.
+- Added slow-command audit events with `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`.
+- Added backup sidecar manifests for `backup to <path>` plus `backup verify <json>` and `backup verify from <path>`.
+- Added `metrics prom` for Prometheus text exposition over the database protocol.
+- Added storage compatibility tests for unsupported manifest, encrypted envelope, and logical backup versions.
+- Added release SBOM generation and keyless Sigstore/cosign signing/attestation workflow steps.
+
+### Changed
+
+- Shortened the README into an OSS-style usage entry point with detailed architecture kept in `LLM.md`.
 
 ## [0.1.0] - 2026-05-27
 

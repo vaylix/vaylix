@@ -588,6 +588,7 @@ mod tests {
             },
             Command::DbSize,
             Command::Info,
+            Command::MetricsProm,
             Command::List,
             Command::Clear,
             Command::Count,
@@ -595,6 +596,12 @@ mod tests {
             Command::Snapshot,
             Command::Backup,
             Command::BackupTo {
+                path: "nightly.json".to_string(),
+            },
+            Command::BackupVerify {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::BackupVerifyFrom {
                 path: "nightly.json".to_string(),
             },
             Command::Restore {
@@ -646,6 +653,13 @@ mod tests {
             },
             Command::ShowUsers,
             Command::ShowRoles,
+            Command::ShowGrants,
+            Command::ShowGrantsForUser {
+                username: "alice".to_string(),
+            },
+            Command::ShowGrantsForRole {
+                role: "readonly".to_string(),
+            },
             Command::WhoAmI,
         ];
 

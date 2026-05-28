@@ -65,6 +65,8 @@ pub enum ServerError {
     BackupPathRejected(String),
     #[error("audit log hash chain verification failed: {0}")]
     AuditChainVerification(String),
+    #[error("backup verification failed: {0}")]
+    BackupVerification(String),
 }
 
 impl ServerError {
@@ -100,6 +102,7 @@ impl ServerError {
             Self::AuthStoreDecode(_) => "SRV-026",
             Self::BackupPathRejected(_) => "SRV-027",
             Self::AuditChainVerification(_) => "SRV-028",
+            Self::BackupVerification(_) => "SRV-029",
         }
     }
 
@@ -135,6 +138,7 @@ impl ServerError {
             Self::AuthStoreDecode(_) => "Auth Store Deserialization Failure",
             Self::BackupPathRejected(_) => "Backup Path Rejected",
             Self::AuditChainVerification(_) => "Audit Chain Verification Failure",
+            Self::BackupVerification(_) => "Backup Verification Failure",
         }
     }
 }

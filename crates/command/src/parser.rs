@@ -43,7 +43,7 @@ impl Parser {
             "dbsize" => Self::parse_no_args(&tokens, Command::DbSize, "dbsize"),
             "count" => Self::parse_no_args(&tokens, Command::Count, "count"),
             "info" => Self::parse_no_args(&tokens, Command::Info, "info"),
-            "metrics" => Self::parse_no_args(&tokens, Command::Metrics, "metrics"),
+            "metrics" => Self::parse_metrics(&tokens),
             "list" => Self::parse_no_args(&tokens, Command::List, "list"),
             "clear" => Self::parse_no_args(&tokens, Command::Clear, "clear"),
             "flushdb" => Self::parse_no_args(&tokens, Command::Clear, "flushdb"),
@@ -423,8 +423,34 @@ impl Parser {
             3 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("to") => Ok(Command::BackupTo {
                 path: Self::token_text(&tokens[2]).to_string(),
             }),
+            3 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("verify")
+                && !Self::token_text(&tokens[2]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::BackupVerify {
+                    dump: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            4 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("verify")
+                && Self::token_text(&tokens[2]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::BackupVerifyFrom {
+                    path: Self::token_text(&tokens[3]).to_string(),
+                })
+            }
             _ => Err(CommandError::InvalidArity {
-                usage: "backup [to <path>]".to_string(),
+                usage: "backup [to <path>] | backup verify <logical-dump-json> | backup verify from <path>".to_string(),
+            }),
+        }
+    }
+
+    fn parse_metrics(tokens: &[Token]) -> Result<Command> {
+        match tokens.len() {
+            1 => Ok(Command::Metrics),
+            2 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("prom") => {
+                Ok(Command::MetricsProm)
+            }
+            _ => Err(CommandError::InvalidArity {
+                usage: "metrics [prom]".to_string(),
             }),
         }
     }
@@ -626,10 +652,34 @@ impl Parser {
     }
 
     fn parse_show(tokens: &[Token]) -> Result<Command> {
-        Self::expect_len(tokens, 2, "show users | show roles")?;
+        if tokens.len() != 2 && tokens.len() != 5 {
+            return Err(CommandError::InvalidArity {
+                usage: "show users | show roles | show grants | show grants for user <username> | show grants for role <role>"
+                    .to_string(),
+            });
+        }
         match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
-            "users" => Ok(Command::ShowUsers),
-            "roles" => Ok(Command::ShowRoles),
+            "users" if tokens.len() == 2 => Ok(Command::ShowUsers),
+            "roles" if tokens.len() == 2 => Ok(Command::ShowRoles),
+            "grants" if tokens.len() == 2 => Ok(Command::ShowGrants),
+            "grants"
+                if tokens.len() == 5
+                    && Self::token_text(&tokens[2]).eq_ignore_ascii_case("for")
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("user") =>
+            {
+                Ok(Command::ShowGrantsForUser {
+                    username: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "grants"
+                if tokens.len() == 5
+                    && Self::token_text(&tokens[2]).eq_ignore_ascii_case("for")
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("role") =>
+            {
+                Ok(Command::ShowGrantsForRole {
+                    role: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
             other => Err(CommandError::InvalidOption {
                 command: "show",
                 option: other.to_string(),
@@ -849,11 +899,25 @@ mod tests {
         );
         assert_eq!(Parser::parse("dbsize").unwrap(), Command::DbSize);
         assert_eq!(Parser::parse("info").unwrap(), Command::Info);
+        assert_eq!(Parser::parse("metrics").unwrap(), Command::Metrics);
+        assert_eq!(Parser::parse("metrics prom").unwrap(), Command::MetricsProm);
         assert_eq!(Parser::parse("save").unwrap(), Command::Save);
         assert_eq!(Parser::parse("backup").unwrap(), Command::Backup);
         assert_eq!(
             Parser::parse("backup to nightly.json").unwrap(),
             Command::BackupTo {
+                path: "nightly.json".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse(r#"backup verify "{\"version\":1}""#).unwrap(),
+            Command::BackupVerify {
+                dump: "{\"version\":1}".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("backup verify from nightly.json").unwrap(),
+            Command::BackupVerifyFrom {
                 path: "nightly.json".to_string()
             }
         );
@@ -955,6 +1019,19 @@ mod tests {
         );
         assert_eq!(Parser::parse("show users").unwrap(), Command::ShowUsers);
         assert_eq!(Parser::parse("show roles").unwrap(), Command::ShowRoles);
+        assert_eq!(Parser::parse("show grants").unwrap(), Command::ShowGrants);
+        assert_eq!(
+            Parser::parse("show grants for user alice").unwrap(),
+            Command::ShowGrantsForUser {
+                username: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("show grants for role readonly").unwrap(),
+            Command::ShowGrantsForRole {
+                role: "readonly".to_string()
+            }
+        );
         assert_eq!(Parser::parse("whoami").unwrap(), Command::WhoAmI);
     }
 
@@ -987,13 +1064,17 @@ mod tests {
         assert!(Parser::parse("create user alice").is_err());
         assert!(Parser::parse("alter user alice").is_err());
         assert!(Parser::parse("backup to").is_err());
+        assert!(Parser::parse("backup verify from").is_err());
+        assert!(Parser::parse("backup verify").is_err());
+        assert!(Parser::parse("metrics prom extra").is_err());
         assert!(Parser::parse("restore check from").is_err());
         assert!(Parser::parse("grant role readonly alice").is_err());
         assert!(Parser::parse("grant permission read on to readonly").is_err());
         assert!(Parser::parse("grant permission read app:* to readonly").is_err());
         assert!(Parser::parse("revoke permission read on from readonly").is_err());
         assert!(Parser::parse("revoke permission read app:* from readonly").is_err());
-        assert!(Parser::parse("show grants").is_err());
+        assert!(Parser::parse("show grants for user").is_err());
+        assert!(Parser::parse("show grants user alice").is_err());
     }
 
     #[test]
