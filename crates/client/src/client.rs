@@ -641,9 +641,11 @@ mod tests {
         assert!(help.contains("command"));
         assert!(help.contains("auth"));
         assert!(help.contains("auth <username> <password>"));
-        assert!(help.contains("backup"));
-        assert!(help.contains("restore <logical-dump-json>"));
-        assert!(help.contains("Examples:"));
+        assert!(help.contains("backup verify from <path>"));
+        assert!(help.contains("create user <username> password <password>"));
+        assert!(help.contains("show grants for user <username>"));
+        assert!(help.contains("maintenance status"));
+        assert!(!help.contains("Examples:"));
     }
 
     #[test]
