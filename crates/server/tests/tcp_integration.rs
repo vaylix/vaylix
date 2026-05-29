@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use command::{Command, Expiration, SetCondition, SetOptions};
 use engine::{Engine, EngineOptions, Paths, WalSyncPolicy};
 use rcgen::{
-    BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-    generate_simple_self_signed,
+    BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+    KeyUsagePurpose, generate_simple_self_signed,
 };
 use rustls::pki_types::ServerName;
 use rustls::pki_types::pem::PemObject;
@@ -79,9 +79,9 @@ where
 
 fn tls_config_for(root: &Path) -> (Arc<rustls::ServerConfig>, String) {
     fs::create_dir_all(root).unwrap();
-    let cert = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
-    let cert_pem = cert.cert.pem();
-    let key_pem = cert.key_pair.serialize_pem();
+    let certified = generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+    let cert_pem = certified.cert.pem();
+    let key_pem = certified.signing_key.serialize_pem();
     let cert_path = root.join("server.crt");
     let key_path = root.join("server.key");
     fs::write(&cert_path, cert_pem.as_bytes()).unwrap();
@@ -106,7 +106,7 @@ fn mutual_tls_config_for(root: &Path) -> MutualTlsMaterial {
     let mut ca_params = CertificateParams::default();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+    let ca_cert = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
 
     let server_key = KeyPair::generate().unwrap();
     let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
@@ -115,9 +115,7 @@ fn mutual_tls_config_for(root: &Path) -> MutualTlsMaterial {
         KeyUsagePurpose::KeyEncipherment,
     ];
     server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-    let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
-        .unwrap();
+    let server_cert = server_params.signed_by(&server_key, &ca_cert).unwrap();
 
     let client_key = KeyPair::generate().unwrap();
     let mut client_params = CertificateParams::default();
@@ -126,9 +124,7 @@ fn mutual_tls_config_for(root: &Path) -> MutualTlsMaterial {
         KeyUsagePurpose::KeyEncipherment,
     ];
     client_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-    let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
-        .unwrap();
+    let client_cert = client_params.signed_by(&client_key, &ca_cert).unwrap();
 
     let server_cert_path = root.join("server.crt");
     let server_key_path = root.join("server.key");

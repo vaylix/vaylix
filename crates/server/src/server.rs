@@ -1228,8 +1228,13 @@ fn parse_backup_document(dump: &str) -> Result<LogicalBackup> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    let digest = Sha256::digest(bytes).to_vec();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in &digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 async fn process_command(
