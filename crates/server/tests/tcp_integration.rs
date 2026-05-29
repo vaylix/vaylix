@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use command::{Command, Expiration, SetCondition, SetOptions};
-use engine::{Engine, EngineOptions, Paths, WalSyncPolicy};
+use engine::{Engine, EngineOptions, Paths, WalSyncPolicy, inspect_wal};
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, ExtendedKeyUsagePurpose, IsCa, KeyPair,
     KeyUsagePurpose, generate_simple_self_signed,
@@ -1023,7 +1023,7 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
     let root = temp_dir("snapshotter");
     let paths = Paths::from_data_dir(&root).unwrap();
     let engine = Engine::from_paths_with_options(
-        paths,
+        paths.clone(),
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
@@ -1060,32 +1060,46 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
     let response = read_response_from_async(&mut stream).await.unwrap();
     assert_eq!(response.status, Status::Ok);
 
-    let snapshot_path = root.join("snapshot.bin");
-    let manifest_path = root.join("manifest.bin");
-    for _ in 0..20 {
+    let snapshot_path = paths.snapshot_path.clone();
+    let manifest_path = paths.manifest_path.clone();
+    for _ in 0..100 {
         if snapshot_path.exists() && manifest_path.exists() {
             break;
         }
         sleep(Duration::from_millis(50)).await;
     }
 
-    assert!(snapshot_path.exists());
-    assert!(manifest_path.exists());
+    assert!(
+        snapshot_path.exists(),
+        "expected snapshot at {}",
+        snapshot_path.display()
+    );
+    assert!(
+        manifest_path.exists(),
+        "expected manifest at {}",
+        manifest_path.display()
+    );
 
-    let wal_path = root.join("wal.log");
-    let mut wal_len = fs::metadata(&wal_path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0);
-    for _ in 0..20 {
-        if wal_len == 0 {
+    let wal_dir = paths.wal_dir.clone();
+    let mut wal_report = inspect_wal(&wal_dir).unwrap();
+    for _ in 0..100 {
+        if wal_report.sealed_segment_count >= 1 && wal_report.active_segment_count == 1 {
             break;
         }
         sleep(Duration::from_millis(50)).await;
-        wal_len = fs::metadata(&wal_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        wal_report = inspect_wal(&wal_dir).unwrap();
     }
-    assert_eq!(wal_len, 0);
+    assert!(
+        wal_dir.exists(),
+        "expected wal dir at {}",
+        wal_dir.display()
+    );
+    assert!(
+        wal_report.sealed_segment_count >= 1,
+        "expected at least one sealed segment, got {:?}",
+        wal_report
+    );
+    assert_eq!(wal_report.active_segment_count, 1, "{wal_report:?}");
 
     server_task.abort();
     fs::remove_dir_all(root).ok();

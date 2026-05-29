@@ -34,15 +34,15 @@ pub struct Args {
     pub max_connections: usize,
 
     /// Background snapshot interval in seconds. Disabled when omitted.
-    #[arg(long)]
+    #[arg(long, env = "VAYLIX_SNAPSHOT_INTERVAL_SECONDS")]
     pub snapshot_interval_seconds: Option<u64>,
 
     /// Background expiration sweep interval in seconds. Disabled when omitted.
-    #[arg(long)]
+    #[arg(long, env = "VAYLIX_EXPIRATION_SWEEP_INTERVAL_SECONDS")]
     pub expiration_sweep_interval_seconds: Option<u64>,
 
     /// Disconnect idle clients after this many seconds. Disabled when omitted.
-    #[arg(long)]
+    #[arg(long, env = "VAYLIX_IDLE_TIMEOUT_SECONDS")]
     pub idle_timeout_seconds: Option<u64>,
 
     /// Enable TLS for client/server transport.
@@ -102,35 +102,39 @@ pub struct Args {
     pub disable_compression: bool,
 
     /// Maximum request payload bytes accepted per command after framing.
-    #[arg(long, default_value_t = 1_048_576)]
+    #[arg(
+        long,
+        env = "VAYLIX_MAX_REQUEST_PAYLOAD_BYTES",
+        default_value_t = 1_048_576
+    )]
     pub max_request_payload_bytes: usize,
 
     /// Maximum key size in bytes accepted by the server.
-    #[arg(long, default_value_t = 1_024)]
+    #[arg(long, env = "VAYLIX_MAX_KEY_BYTES", default_value_t = 1_024)]
     pub max_key_bytes: usize,
 
     /// Maximum string value size in bytes accepted by the server.
-    #[arg(long, default_value_t = 262_144)]
+    #[arg(long, env = "VAYLIX_MAX_VALUE_BYTES", default_value_t = 262_144)]
     pub max_value_bytes: usize,
 
     /// Maximum number of keys allowed in a multi-key command.
-    #[arg(long, default_value_t = 256)]
+    #[arg(long, env = "VAYLIX_MAX_KEYS_PER_BATCH", default_value_t = 256)]
     pub max_keys_per_batch: usize,
 
     /// Maximum queued commands allowed inside a session transaction.
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, env = "VAYLIX_MAX_TRANSACTION_QUEUE_LEN", default_value_t = 128)]
     pub max_transaction_queue_len: usize,
 
     /// Sustained request rate per connection.
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, env = "VAYLIX_REQUESTS_PER_SECOND", default_value_t = 200)]
     pub requests_per_second: u32,
 
     /// Burst size for the per-connection request limiter.
-    #[arg(long, default_value_t = 400)]
+    #[arg(long, env = "VAYLIX_REQUEST_BURST", default_value_t = 400)]
     pub request_burst: u32,
 
     /// Optional audit log path override. Defaults to <data-dir>/audit.log.
-    #[arg(long)]
+    #[arg(long, env = "VAYLIX_AUDIT_LOG_PATH")]
     pub audit_log_path: Option<PathBuf>,
 
     /// Record slow-command audit events at or above this latency in milliseconds. Use 0 to disable.
