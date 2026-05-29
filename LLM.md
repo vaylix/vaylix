@@ -9,6 +9,7 @@ Vaylix is a Rust database workspace centered on a transport-first architecture:
 `client -> transport -> TCP/TLS -> transport -> server -> engine`
 
 The current implementation is a single-node, string-to-string key/value database with:
+
 - a custom framed binary protocol v2 with startup capability negotiation
 - a shared transport crate used by both client and server
 - a Tokio multi-client server
@@ -22,6 +23,7 @@ The current implementation is a single-node, string-to-string key/value database
 - protocol-level Prometheus metrics export through `METRICS PROM`
 
 The long-term target is broader:
+
 - scale from a single node to replicated and sharded deployments
 - keep the transport layer evolvable enough for replication traffic and cluster coordination
 - harden transactional behavior toward stronger ACID guarantees than the current session-queued model
@@ -69,6 +71,7 @@ The long-term target is broader:
 ## Transaction and ACID Status
 
 Current state:
+
 - writes are durable through WAL + snapshot
 - command execution within the engine is serialized through a dedicated engine worker
 - session transactions are queued with `MULTI` / `EXEC` / `DISCARD`
@@ -77,12 +80,14 @@ Current state:
 - sequence-tagged or pipelined requests are rejected while a transaction is active on a connection
 
 Not yet true:
+
 - MVCC
 - distributed transactions
 - formal isolation levels
 - replication-aware commit coordination
 
 Design direction:
+
 - keep transaction boundaries explicit in transport and server layers
 - move toward WAL-backed atomic commit groups and stronger isolation in engine internals
 - avoid protocol choices that assume single-node execution forever
@@ -119,6 +124,7 @@ Agents should describe the current implementation honestly. Do not claim full AC
 Every client connection sends a required startup hello before command frames. The client hello carries protocol version, client name/version, supported capabilities, desired compression, maximum frame size, and auth intent. The server hello returns accepted capabilities, selected compression, effective maximum frame size, server id, and structured startup rejection details when negotiation fails.
 
 Current negotiated capabilities:
+
 - `zstd`
 - `request_deadline`
 - `server_metrics`
@@ -136,6 +142,7 @@ Request IDs are UUIDs, not random integers. This removes the old local counter/r
 TLS is supported but disabled by default.
 
 Client behavior:
+
 - the client uses plaintext TCP by default
 - `--ssl` opens a TLS connection
 - connection URL query `ssl=true` also enables TLS
@@ -145,6 +152,7 @@ Client behavior:
 - connection URL query params `client_cert=/path/to/client.crt` and `client_key=/path/to/client.key` can also provide mTLS material
 
 Server inputs:
+
 - `--ssl`
 - `--tls-cert`
 - `--tls-key`
@@ -155,6 +163,7 @@ When `--ssl` is enabled on the server, both `--tls-cert` and `--tls-key` are req
 When `--tls-client-ca` is provided, the server requires clients to present a certificate chaining to that CA. mTLS is additive to username/password authentication; it should not be described as replacing application-level auth.
 
 Operational hardening:
+
 - TLS startup fails if the certificate is already expired or the certificate/key pair cannot be loaded together.
 - TLS metadata such as certificate expiry and last reload timestamps is surfaced in `INFO`.
 - On Unix, the server reloads the configured TLS certificate, key, and client CA on `SIGHUP`. Reload failures keep the previous live TLS config.
@@ -164,6 +173,7 @@ Operational hardening:
 Authentication is enabled by default.
 
 Development defaults:
+
 - username: `vaylix`
 - password: `vaylix`
 
@@ -171,6 +181,7 @@ These defaults exist for local development only. Production deployments should a
 Use `--disable-auth` only for local/trusted testing. When auth is disabled on the server, commands execute without an `AUTH` handshake and RBAC checks are bypassed.
 
 Password policy and auth throttling:
+
 - `CREATE USER` and `ALTER USER PASSWORD` require at least 12 characters with at least one ASCII letter and one ASCII digit.
 - The bootstrap default credentials remain accepted only for initial development bootstrap compatibility.
 - The server enforces auth failure windows and temporary lockouts per `(username, peer)` tuple using:
@@ -181,6 +192,7 @@ Password policy and auth throttling:
 RBAC is implemented inside the existing server binary and transport protocol. There is no separate admin binary. On first startup, the configured `--user` / `--password` account is bootstrapped as an admin user. Once `<data-dir>/auth.bin` exists, users and roles are loaded from encrypted RBAC metadata instead of being recreated from CLI defaults.
 
 Current permissions:
+
 - `read`
 - `write`
 - `admin`
@@ -193,6 +205,7 @@ Current permissions:
 - `role_admin`
 
 Current admin commands:
+
 - `create user <username> password <password>`
 - `alter user <username> password <password>`
 - `drop user <username>`
@@ -214,6 +227,7 @@ Current admin commands:
 Permission grants are pattern-scoped. The legacy syntax `grant permission <permission> to <role>` is an alias for `grant permission <permission> on * to <role>`. Patterns are glob-like over keys, not SQL schemas or tables. Key-bearing commands require every key to match the relevant permission grant. The `admin` permission bypasses pattern checks. Destructive and administrative operations use explicit permissions: `CLEAR` / `FLUSHDB` require `clear`, restore commands require `restore`, user management requires `user_admin`, and role/grant management requires `role_admin`.
 
 Grant inspection rules:
+
 - `show grants` returns the current authenticated user's roles and resolved grants
 - `show grants for user <username>` requires `user_admin` or `admin`
 - `show grants for role <role>` requires `role_admin` or `admin`
@@ -221,9 +235,11 @@ Grant inspection rules:
 Authorization happens in the server after authentication and before engine execution. The engine must remain unaware of users, credentials, roles, and permissions. Existing authenticated sessions remain valid after password rotation; new authentication attempts use the rotated password.
 
 Client connection string format:
+
 - `vaylix://user:password@host:port`
 
 Supported query parameters:
+
 - `ssl=true`
 - `output=plain|table|json`
 - `ca_cert=/path/to/ca.pem`
@@ -237,6 +253,7 @@ CLI flags override URL-derived values when both are provided.
 ## Persistence
 
 Durability model:
+
 - encrypted snapshot
 - segmented WAL replay on startup
 - manifest metadata for snapshot state
@@ -244,6 +261,7 @@ Durability model:
 - MessagePack-based engine serialization inside encrypted snapshot, WAL, manifest, and keyring files
 
 Snapshot flow:
+
 1. purge expired keys
 2. optionally rotate the active storage key if rotation is due
 3. seal the active WAL segment
@@ -258,12 +276,14 @@ Snapshot flow:
 12. prune sealed segments older than retention
 
 Recovery flow:
+
 1. load or create the storage keyring
 2. load and verify manifest
 3. decrypt and deserialize snapshot
 4. replay and verify retained WAL segments in order
 
 WAL management:
+
 - WAL lives under `<data-dir>/wal/`
 - active segment name: `active-<start_sequence>.wal`
 - sealed segment name: `<start_sequence>-<end_sequence>.wal`
@@ -276,6 +296,7 @@ Legacy `wal.log` from the pre-segmented layout is no longer accepted on normal s
 ### Logical Backup and Restore
 
 Vaylix also supports logical backups through database commands:
+
 - `BACKUP`
 - `RESTORE <logical-dump-json>`
 - `BACKUP TO <path>`
@@ -294,27 +315,57 @@ Vaylix also supports logical backups through database commands:
 When `BACKUP TO <path>` writes a server-side dump, the server also writes `<path>.manifest.json`. The sidecar manifest records backup version, creation timestamp, source engine version, source sequence, entry count, dump byte length, SHA-256 digest, and hash algorithm. `BACKUP VERIFY <logical-dump-json>` validates inline backup JSON and returns deterministic entries such as `status=ok`, `entries=<n>`, and `sha256=<hash>`. `BACKUP VERIFY FROM <path>` verifies both the sidecar manifest and the dump before validating backup contents.
 
 Backup directory:
+
 - server arg/env: `--backup-dir` / `VAYLIX_BACKUP_DIR`
 - default: `<data-dir>/backups`
 
 ### Offline Storage and PITR Operations
 
 The existing `vaylix` server binary also provides offline subcommands for storage maintenance:
+
 - `vaylix storage migrate --data-dir <dir>`
 - `vaylix storage verify --data-dir <dir>`
 - `vaylix pitr inspect --data-dir <dir>`
 - `vaylix pitr restore --source-dir <dir> --target-dir <dir> (--to-sequence <u64> | --to-timestamp-ms <u64>)`
 
 Current PITR scope:
+
 - offline-first only
 - restore writes a new target data directory and does not mutate the source directory in place
 - restore replays the latest valid snapshot plus retained WAL segments up to the requested sequence or timestamp
+
+### Logical Backup and Restore
+
+Vaylix also supports logical backups through database commands:
+
+- `BACKUP`
+- `RESTORE <logical-dump-json>`
+- `BACKUP TO <path>`
+- `BACKUP VERIFY <logical-dump-json>`
+- `BACKUP VERIFY FROM <path>`
+- `RESTORE FROM <path>`
+- `RESTORE CHECK <logical-dump-json>`
+- `RESTORE CHECK FROM <path>`
+
+`BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live string key/value entries, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
+
+`RESTORE` accepts the logical JSON dump and replaces the current keyspace with live dump entries through one WAL-backed atomic engine batch. Entries whose absolute expiration timestamp is already in the past are skipped. This is separate from physical `SAVE` / `SNAPSHOT`, which persist the local node’s encrypted snapshot and flush/rotate the WAL.
+
+`BACKUP TO <path>` and `RESTORE FROM <path>` operate on server-local files under the configured backup directory only. The server resolves and canonicalizes paths, rejects `..` traversal, and rejects paths outside the backup directory. `RESTORE CHECK` validates backup JSON, backup version, entry schema, string fields, and expired-entry handling without mutating engine state or WAL; it returns the count of live entries that would be restored.
+
+When `BACKUP TO <path>` writes a server-side dump, the server also writes `<path>.manifest.json`. The sidecar manifest records backup version, creation timestamp, source engine version, source sequence, entry count, dump byte length, SHA-256 digest, and hash algorithm. `BACKUP VERIFY <logical-dump-json>` validates inline backup JSON and returns deterministic entries such as `status=ok`, `entries=<n>`, and `sha256=<hash>`. `BACKUP VERIFY FROM <path>` verifies both the sidecar manifest and the dump before validating backup contents.
+
+Backup directory:
+
+- server arg/env: `--backup-dir` / `VAYLIX_BACKUP_DIR`
+- default: `<data-dir>/backups`
 
 ### Storage Encryption
 
 At-rest encryption is server-managed. There is no user-facing `--data-key` flag anymore.
 
 Current model:
+
 - the server loads or creates a local storage keyring under the data directory
 - the active storage key is used to encrypt new snapshots and WAL entries
 - keys can be rotated by the server and old keys remain available for decryption of older persisted data
@@ -331,6 +382,7 @@ Audit logging is implemented as append-only JSON lines under the data directory 
 - optional override: `--audit-log-path`
 
 Each event records:
+
 - audit format version
 - monotonically increasing audit sequence
 - SHA-256 hash algorithm name
@@ -355,11 +407,13 @@ Passwords and payload contents are not written to the audit log. Semantic event 
 ## Scalability Direction
 
 Current state:
+
 - single node only
 - no replication
 - no sharding
 
 Architectural target:
+
 - replication traffic should reuse transport framing rather than invent a second ad hoc wire path
 - request routing should remain decoupled from the engine so a shard-router or replica applier can be introduced later
 - storage and protocol identifiers should remain stable enough for cluster metadata and log replication
@@ -369,6 +423,7 @@ Do not document distributed support as implemented today. It is a roadmap constr
 ## Compression
 
 Transport compression is enabled by default for outbound frames in the current client/server binaries:
+
 - default mode: `zstd`
 - default threshold: `0`
 - compression is selected during startup negotiation
@@ -377,12 +432,14 @@ Transport compression is enabled by default for outbound frames in the current c
 - `--disable-compression` disables outbound compression on that process
 
 Still missing:
+
 - compression policy coordination between mixed-version peers
 - replication-stream tuning
 
 ## Abuse Controls and Runtime Guards
 
 Current runtime protections:
+
 - per-session token-bucket rate limiting
 - request payload size limits
 - key/value size limits
@@ -409,6 +466,7 @@ Current runtime protections:
 ### Maintenance Mode
 
 Protocol admin commands:
+
 - `maintenance on`
 - `maintenance off`
 - `maintenance status`
@@ -416,12 +474,14 @@ Protocol admin commands:
 Maintenance mode is persisted with a sentinel file under the data directory so it survives restart.
 
 Current behavior:
+
 - allowed: reads, `INFO`, `METRICS`, `METRICS PROM`, backup verification flows, `SHOW *`, `WHOAMI`, and `maintenance status`
 - rejected: mutating writes, `MULTI` / `EXEC`, restore flows, and auth/RBAC mutation commands
 
 ## Structured INFO
 
 `INFO` returns deterministic key/value entries with section prefixes rather than one unstructured blob. Current sections:
+
 - `server.*`
 - `transport.*`
 - `storage.*`
@@ -458,6 +518,7 @@ The local `help` command is formatted as a readable command reference with usage
   - `-v vaylix-data:/var/lib/vaylix`
 
 This path is the durable storage root for:
+
 - snapshots
 - WAL segments
 - manifest
@@ -468,12 +529,14 @@ This path is the durable storage root for:
 ## CI and Release
 
 Pull request CI runs:
+
 - `cargo fmt --check`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
 - `cargo test --workspace`
 - `cargo audit`
 
 Release workflow goal:
+
 - publish multi-OS client binaries
 - publish multi-OS server binaries
 - publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.2.0`
