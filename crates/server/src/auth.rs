@@ -19,6 +19,7 @@ pub const DEFAULT_PASSWORD: &str = "vaylix";
 const AUTH_RESOURCE: &str = "auth metadata";
 const AUTH_FORMAT_VERSION: u32 = 1;
 const ADMIN_ROLE: &str = "admin";
+const MIN_PASSWORD_LEN: usize = 12;
 
 /// Coarse command permissions granted to roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -316,6 +317,7 @@ impl AuthStore {
     }
 
     fn create_user(&mut self, username: String, password: String) -> Result<()> {
+        validate_password_policy(&password)?;
         if self.stored.users.contains_key(&username) {
             return Err(ServerError::UserAlreadyExists(username));
         }
@@ -331,6 +333,7 @@ impl AuthStore {
     }
 
     fn alter_user_password(&mut self, username: &str, password: String) -> Result<()> {
+        validate_password_policy(&password)?;
         let user = self
             .stored
             .users
@@ -617,6 +620,18 @@ fn hash_password(password: &str) -> Result<String> {
         .to_string())
 }
 
+fn validate_password_policy(password: &str) -> Result<()> {
+    if password.len() < MIN_PASSWORD_LEN {
+        return Err(ServerError::PasswordPolicyViolation);
+    }
+    let has_letter = password.chars().any(|char| char.is_ascii_alphabetic());
+    let has_digit = password.chars().any(|char| char.is_ascii_digit());
+    if !has_letter || !has_digit {
+        return Err(ServerError::PasswordPolicyViolation);
+    }
+    Ok(())
+}
+
 fn load_store(persist: &PersistConfig) -> Result<Option<StoredAuth>> {
     match fs::read(&persist.path) {
         Ok(bytes) => {
@@ -727,7 +742,7 @@ mod tests {
     #[tokio::test]
     async fn grants_roles_and_permissions_to_users() {
         let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
-        auth.create_user("alice".to_string(), "pw".to_string())
+        auth.create_user("alice".to_string(), "password1234".to_string())
             .await
             .unwrap();
         auth.create_role("readonly".to_string()).await.unwrap();
@@ -736,7 +751,7 @@ mod tests {
             .unwrap();
         auth.grant_role("readonly", "alice").await.unwrap();
 
-        let identity = auth.verify("alice", "pw").await.unwrap().unwrap();
+        let identity = auth.verify("alice", "password1234").await.unwrap().unwrap();
         assert!(identity.has(Permission::Read));
         assert!(identity.allows_key(Permission::Read, "anything"));
         assert!(!identity.has(Permission::Write));
@@ -745,7 +760,7 @@ mod tests {
     #[tokio::test]
     async fn grants_pattern_scoped_permissions() {
         let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
-        auth.create_user("alice".to_string(), "pw".to_string())
+        auth.create_user("alice".to_string(), "password1234".to_string())
             .await
             .unwrap();
         auth.create_role("app_reader".to_string()).await.unwrap();
@@ -754,7 +769,7 @@ mod tests {
             .unwrap();
         auth.grant_role("app_reader", "alice").await.unwrap();
 
-        let identity = auth.verify("alice", "pw").await.unwrap().unwrap();
+        let identity = auth.verify("alice", "password1234").await.unwrap().unwrap();
         assert!(!identity.has(Permission::Read));
         assert!(identity.allows_key(Permission::Read, "app:1"));
         assert!(identity.allows_pattern(Permission::Read, "app:*"));
@@ -765,18 +780,32 @@ mod tests {
     #[tokio::test]
     async fn rotates_password_for_future_auth_attempts() {
         let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
-        auth.create_user("alice".to_string(), "old".to_string())
+        auth.create_user("alice".to_string(), "oldpassword1234".to_string())
             .await
             .unwrap();
 
-        let existing = auth.verify("alice", "old").await.unwrap().unwrap();
-        auth.alter_user_password("alice", "new".to_string())
+        let existing = auth
+            .verify("alice", "oldpassword1234")
+            .await
+            .unwrap()
+            .unwrap();
+        auth.alter_user_password("alice", "newpassword1234".to_string())
             .await
             .unwrap();
 
         assert_eq!(existing.username, "alice");
-        assert!(auth.verify("alice", "old").await.unwrap().is_none());
-        assert!(auth.verify("alice", "new").await.unwrap().is_some());
+        assert!(
+            auth.verify("alice", "oldpassword1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            auth.verify("alice", "newpassword1234")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -791,10 +820,10 @@ mod tests {
             "secret".to_string(),
         )
         .unwrap();
-        auth.create_user("alice".to_string(), "pw".to_string())
+        auth.create_user("alice".to_string(), "password1234".to_string())
             .await
             .unwrap();
-        auth.alter_user_password("alice", "rotated".to_string())
+        auth.alter_user_password("alice", "rotated12345".to_string())
             .await
             .unwrap();
 
@@ -809,8 +838,20 @@ mod tests {
             "ignored".to_string(),
         )
         .unwrap();
-        assert!(reloaded.verify("alice", "pw").await.unwrap().is_none());
-        assert!(reloaded.verify("alice", "rotated").await.unwrap().is_some());
+        assert!(
+            reloaded
+                .verify("alice", "password1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .verify("alice", "rotated12345")
+                .await
+                .unwrap()
+                .is_some()
+        );
 
         fs::remove_file(path).ok();
         fs::remove_file(temp).ok();

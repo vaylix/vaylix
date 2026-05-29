@@ -9,7 +9,7 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "veyra", "veyra")
+        let dirs = ProjectDirs::from("dev", "vaylix", "vaylix")
             .ok_or(ClientError::ProjectDirsUnavailable)?;
 
         let data_dir = dirs.data_dir().to_path_buf();

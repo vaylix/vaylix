@@ -22,6 +22,12 @@ pub enum EngineError {
     CryptoFailure { resource: &'static str },
     #[error("unsupported storage format for {resource}")]
     UnsupportedStorageFormat { resource: &'static str },
+    #[error("storage migration is required for {resource}")]
+    StorageMigrationRequired { resource: &'static str },
+    #[error("invalid storage operation: {0}")]
+    InvalidStorageOperation(String),
+    #[error("restore point is unavailable: {0}")]
+    RestorePointUnavailable(String),
     #[error("write-ahead log serialization failed: {0}")]
     WalSerialize(String),
     #[error("write-ahead log deserialization failed: {0}")]
@@ -46,11 +52,14 @@ impl EngineError {
             Self::ChecksumMismatch { .. } => "ENG-007",
             Self::CryptoFailure { .. } => "ENG-008",
             Self::UnsupportedStorageFormat { .. } => "ENG-009",
-            Self::WalSerialize(_) => "ENG-010",
-            Self::WalDeserialize(_) => "ENG-011",
-            Self::InvalidIntegerValue { .. } => "ENG-012",
-            Self::NumericOverflow { .. } => "ENG-013",
-            Self::UnsupportedCommand(_) => "ENG-014",
+            Self::StorageMigrationRequired { .. } => "ENG-010",
+            Self::InvalidStorageOperation(_) => "ENG-011",
+            Self::RestorePointUnavailable(_) => "ENG-012",
+            Self::WalSerialize(_) => "ENG-013",
+            Self::WalDeserialize(_) => "ENG-014",
+            Self::InvalidIntegerValue { .. } => "ENG-015",
+            Self::NumericOverflow { .. } => "ENG-016",
+            Self::UnsupportedCommand(_) => "ENG-017",
         }
     }
 
@@ -65,6 +74,9 @@ impl EngineError {
             Self::ChecksumMismatch { .. } => "Checksum Validation Failure",
             Self::CryptoFailure { .. } => "Encrypted Storage Failure",
             Self::UnsupportedStorageFormat { .. } => "Unsupported Storage Format",
+            Self::StorageMigrationRequired { .. } => "Storage Migration Required",
+            Self::InvalidStorageOperation(_) => "Invalid Storage Operation",
+            Self::RestorePointUnavailable(_) => "Restore Point Unavailable",
             Self::WalSerialize(_) => "WAL Serialization Failure",
             Self::WalDeserialize(_) => "WAL Deserialization Failure",
             Self::InvalidIntegerValue { .. } => "Invalid Integer Value",

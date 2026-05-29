@@ -131,7 +131,11 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "metrics",
-        usage: "metrics [prom]",
+        usage: "metrics",
+    },
+    CommandInfo {
+        name: "metrics prom",
+        usage: "metrics prom",
     },
     CommandInfo {
         name: "list",
@@ -155,59 +159,91 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "backup",
-        usage: "backup [to <path>] | backup verify <logical-dump-json> | backup verify from <path>",
+        usage: "backup",
+    },
+    CommandInfo {
+        name: "backup to",
+        usage: "backup to <path>",
+    },
+    CommandInfo {
+        name: "backup verify",
+        usage: "backup verify <logical-dump-json>",
+    },
+    CommandInfo {
+        name: "backup verify from",
+        usage: "backup verify from <path>",
     },
     CommandInfo {
         name: "restore",
-        usage: "restore <logical-dump-json> | restore from <path> | restore check <logical-dump-json> | restore check from <path>",
+        usage: "restore <logical-dump-json>",
     },
     CommandInfo {
-        name: "alter-user",
+        name: "restore from",
+        usage: "restore from <path>",
+    },
+    CommandInfo {
+        name: "restore check",
+        usage: "restore check <logical-dump-json>",
+    },
+    CommandInfo {
+        name: "restore check from",
+        usage: "restore check from <path>",
+    },
+    CommandInfo {
+        name: "alter user",
         usage: "alter user <username> password <password>",
     },
     CommandInfo {
-        name: "create-user",
+        name: "create user",
         usage: "create user <username> password <password>",
     },
     CommandInfo {
-        name: "drop-user",
-        usage: "drop user <username>",
-    },
-    CommandInfo {
-        name: "create-role",
+        name: "create role",
         usage: "create role <role>",
     },
     CommandInfo {
-        name: "drop-role",
+        name: "drop user",
+        usage: "drop user <username>",
+    },
+    CommandInfo {
+        name: "drop role",
         usage: "drop role <role>",
     },
     CommandInfo {
-        name: "grant-role",
+        name: "grant role",
         usage: "grant role <role> to <username>",
     },
     CommandInfo {
-        name: "revoke-role",
-        usage: "revoke role <role> from <username>",
-    },
-    CommandInfo {
-        name: "grant-permission",
+        name: "grant permission",
         usage: "grant permission <permission> [on <pattern>] to <role>",
     },
     CommandInfo {
-        name: "revoke-permission",
+        name: "revoke role",
+        usage: "revoke role <role> from <username>",
+    },
+    CommandInfo {
+        name: "revoke permission",
         usage: "revoke permission <permission> [on <pattern>] from <role>",
     },
     CommandInfo {
-        name: "show-users",
+        name: "show users",
         usage: "show users",
     },
     CommandInfo {
-        name: "show-roles",
+        name: "show roles",
         usage: "show roles",
     },
     CommandInfo {
-        name: "show-grants",
-        usage: "show grants | show grants for user <username> | show grants for role <role>",
+        name: "show grants",
+        usage: "show grants",
+    },
+    CommandInfo {
+        name: "show grants for user",
+        usage: "show grants for user <username>",
+    },
+    CommandInfo {
+        name: "show grants for role",
+        usage: "show grants for role <role>",
     },
     CommandInfo {
         name: "whoami",
@@ -226,6 +262,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "discard",
     },
     CommandInfo {
+        name: "maintenance on",
+        usage: "maintenance on",
+    },
+    CommandInfo {
+        name: "maintenance off",
+        usage: "maintenance off",
+    },
+    CommandInfo {
+        name: "maintenance status",
+        usage: "maintenance status",
+    },
+    CommandInfo {
         name: "help",
         usage: "help",
     },
@@ -233,12 +281,36 @@ pub const COMMANDS: &[CommandInfo] = &[
         name: "exit",
         usage: "exit",
     },
+    CommandInfo {
+        name: "quit",
+        usage: "quit",
+    },
 ];
 
 pub fn command_info(name: &str) -> Option<&'static CommandInfo> {
     COMMANDS
         .iter()
         .find(|command| command.name.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::COMMANDS;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn command_metadata_is_unique_and_non_empty() {
+        let mut names = BTreeSet::new();
+        for command in COMMANDS {
+            assert!(!command.name.trim().is_empty());
+            assert!(!command.usage.trim().is_empty());
+            assert!(
+                names.insert(command.name),
+                "duplicate command metadata entry: {}",
+                command.name
+            );
+        }
+    }
 }
 
 /// Parsed client command independent of transport framing and engine internals.
@@ -390,6 +462,9 @@ pub enum Command {
     Multi,
     Exec,
     Discard,
+    MaintenanceOn,
+    MaintenanceOff,
+    MaintenanceStatus,
     Help,
     Exit,
     Snapshot,

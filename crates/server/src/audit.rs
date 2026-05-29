@@ -240,12 +240,21 @@ fn compute_hash(sequence: u64, previous_hash: &str, event: &AuditEvent) -> Resul
         details: event.details.clone(),
     };
     let bytes = serde_json::to_vec(&payload).map_err(std::io::Error::other)?;
-    let digest = Sha256::digest(bytes);
-    Ok(format!("{digest:x}"))
+    let digest = Sha256::digest(bytes).to_vec();
+    Ok(hex_encode(&digest))
 }
 
 fn chain_error(line: usize, message: impl Into<String>) -> ServerError {
     ServerError::AuditChainVerification(format!("line {line}: {}", message.into()))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
 }
 
 #[cfg(test)]
@@ -265,7 +274,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let suffix = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("veyra-audit-{unique}-{suffix}.log"))
+        std::env::temp_dir().join(format!("vaylix-audit-{unique}-{suffix}.log"))
     }
 
     fn event(opcode: &str) -> AuditEvent {

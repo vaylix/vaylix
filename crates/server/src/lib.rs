@@ -6,6 +6,8 @@ pub mod metrics;
 pub mod server;
 pub mod tls;
 
-pub use args::{Args, WalSyncMode};
+pub use args::{
+    AdminCommand, Args, PitrAction, PitrCommand, StorageAction, StorageCommand, WalSyncMode,
+};
 pub use error::{Result, ServerError};
 pub use server::Server;

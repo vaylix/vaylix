@@ -55,7 +55,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("veyra-{name}-{unique}.bin"))
+        std::env::temp_dir().join(format!("vaylix-{name}-{unique}.bin"))
     }
 
     #[test]

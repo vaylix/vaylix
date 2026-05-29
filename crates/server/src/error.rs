@@ -67,6 +67,19 @@ pub enum ServerError {
     AuditChainVerification(String),
     #[error("backup verification failed: {0}")]
     BackupVerification(String),
+    #[error("invalid command-line arguments: {0}")]
+    InvalidArguments(String),
+    #[error("authentication lockout active for {username}")]
+    AuthenticationLocked {
+        username: String,
+        remaining_seconds: u64,
+    },
+    #[error("password does not satisfy the configured policy")]
+    PasswordPolicyViolation,
+    #[error("maintenance mode is enabled")]
+    MaintenanceModeEnabled,
+    #[error("transaction expired after {seconds} seconds")]
+    TransactionExpired { seconds: u64 },
 }
 
 impl ServerError {
@@ -103,6 +116,11 @@ impl ServerError {
             Self::BackupPathRejected(_) => "SRV-027",
             Self::AuditChainVerification(_) => "SRV-028",
             Self::BackupVerification(_) => "SRV-029",
+            Self::InvalidArguments(_) => "SRV-030",
+            Self::AuthenticationLocked { .. } => "SRV-031",
+            Self::PasswordPolicyViolation => "SRV-032",
+            Self::MaintenanceModeEnabled => "SRV-033",
+            Self::TransactionExpired { .. } => "SRV-034",
         }
     }
 
@@ -139,6 +157,11 @@ impl ServerError {
             Self::BackupPathRejected(_) => "Backup Path Rejected",
             Self::AuditChainVerification(_) => "Audit Chain Verification Failure",
             Self::BackupVerification(_) => "Backup Verification Failure",
+            Self::InvalidArguments(_) => "Invalid Arguments",
+            Self::AuthenticationLocked { .. } => "Authentication Locked",
+            Self::PasswordPolicyViolation => "Password Policy Violation",
+            Self::MaintenanceModeEnabled => "Maintenance Mode Enabled",
+            Self::TransactionExpired { .. } => "Transaction Expired",
         }
     }
 }

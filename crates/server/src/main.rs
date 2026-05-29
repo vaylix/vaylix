@@ -1,5 +1,5 @@
 use clap::Parser;
-use server::{Args, Server, WalSyncMode};
+use server::{AdminCommand, Args, PitrAction, Server, StorageAction, WalSyncMode};
 use transport::{CodecOptions, CompressionMode};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -11,17 +11,22 @@ async fn main() {
 }
 
 async fn try_main() -> server::Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    if let Some(command) = args.command.take() {
+        return run_admin_command(&args, command);
+    }
     if !args.ssl
         && (args.tls_cert.is_some() || args.tls_key.is_some() || args.tls_client_ca.is_some())
     {
         return Err(server::ServerError::TlsConfiguration);
     }
-    let paths = match args.data_dir {
+    let paths = match args.data_dir.as_ref() {
         Some(data_dir) => engine::Paths::from_data_dir(data_dir)?,
         None => engine::Paths::new()?,
     };
     let keyring = engine::load_or_create_keyring(&paths.keyring_path, &paths.keyring_tmp_path)?;
+    let insecure_default_credentials = args.user == server::auth::DEFAULT_USERNAME
+        && args.password == server::auth::DEFAULT_PASSWORD;
     let auth_config = if args.disable_auth {
         None
     } else {
@@ -29,19 +34,12 @@ async fn try_main() -> server::Result<()> {
             paths.auth_path.clone(),
             paths.auth_tmp_path.clone(),
             keyring.clone(),
-            args.user,
-            args.password,
+            args.user.clone(),
+            args.password.clone(),
         )?)
     };
-    let engine_options = engine::EngineOptions {
-        wal_sync: match args.wal_sync {
-            WalSyncMode::Buffered => engine::WalSyncPolicy::Buffered,
-            WalSyncMode::Flush => engine::WalSyncPolicy::Flush,
-            WalSyncMode::Sync => engine::WalSyncPolicy::SyncData,
-        },
-        keyring: Some(keyring),
-    };
-    let tls_config = if args.ssl {
+    let engine_options = engine_options(&args, Some(keyring));
+    let tls_state = if args.ssl {
         let cert = args
             .tls_cert
             .as_deref()
@@ -50,7 +48,7 @@ async fn try_main() -> server::Result<()> {
             .tls_key
             .as_deref()
             .ok_or(server::ServerError::TlsConfiguration)?;
-        Some(server::tls::load_server_config(
+        Some(server::tls::TlsState::load(
             cert,
             key,
             args.tls_client_ca.as_deref(),
@@ -98,7 +96,7 @@ async fn try_main() -> server::Result<()> {
             requests_per_second: args.requests_per_second,
             request_burst: args.request_burst,
         },
-        tls_config,
+        tls_state,
         transport,
         audit_logger: std::sync::Arc::new(audit_logger),
         backup_dir,
@@ -110,6 +108,20 @@ async fn try_main() -> server::Result<()> {
                 args.slow_command_threshold_ms,
             ))
         },
+        auth_lockouts: std::sync::Arc::new(tokio::sync::Mutex::new(
+            server::server::AuthLockoutState::default(),
+        )),
+        wal_segment_size_bytes: args.wal_segment_size_bytes,
+        wal_retain_segments: args.wal_retain_segments,
+        auth_failure_window: std::time::Duration::from_secs(args.auth_failure_window_seconds),
+        auth_failure_limit: args.auth_failure_limit,
+        auth_lockout: std::time::Duration::from_secs(args.auth_lockout_seconds),
+        transaction_max_duration: std::time::Duration::from_secs(args.transaction_max_seconds),
+        maintenance: std::sync::Arc::new(server::server::MaintenanceMode::load(
+            paths.maintenance_path.clone(),
+        )?),
+        insecure_auth_disabled: args.disable_auth,
+        insecure_default_credentials,
     };
     let server = Server::new(
         args.bind,
@@ -123,4 +135,131 @@ async fn try_main() -> server::Result<()> {
     server.start().await?;
 
     Ok(())
+}
+
+fn engine_options(args: &Args, keyring: Option<engine::StorageKeyring>) -> engine::EngineOptions {
+    engine::EngineOptions {
+        wal_sync: match args.wal_sync {
+            WalSyncMode::Buffered => engine::WalSyncPolicy::Buffered,
+            WalSyncMode::Flush => engine::WalSyncPolicy::Flush,
+            WalSyncMode::Sync => engine::WalSyncPolicy::SyncData,
+        },
+        keyring,
+        wal_segment_size_bytes: args.wal_segment_size_bytes,
+        wal_retain_segments: args.wal_retain_segments,
+    }
+}
+
+fn run_admin_command(args: &Args, command: AdminCommand) -> server::Result<()> {
+    match command {
+        AdminCommand::Storage(command) => match command.action {
+            StorageAction::Migrate { data_dir } => {
+                let paths = engine::Paths::from_data_dir(data_dir)?;
+                let keyring = engine::load_keyring(&paths.keyring_path)?;
+                let inspection =
+                    engine::Engine::migrate_storage(&paths, &engine_options(args, keyring))?;
+                print_storage_inspection(&inspection);
+            }
+            StorageAction::Verify { data_dir } => {
+                let paths = engine::Paths::from_data_dir(data_dir)?;
+                let keyring = engine::load_keyring(&paths.keyring_path)?;
+                let inspection =
+                    engine::Engine::verify_storage(&paths, engine_options(args, keyring))?;
+                print_storage_inspection(&inspection);
+            }
+        },
+        AdminCommand::Pitr(command) => match command.action {
+            PitrAction::Inspect { data_dir } => {
+                let paths = engine::Paths::from_data_dir(data_dir)?;
+                let keyring = engine::load_keyring(&paths.keyring_path)?;
+                let inspection = engine::Engine::inspect_storage(&paths, keyring.as_ref())?;
+                print_storage_inspection(&inspection);
+            }
+            PitrAction::Restore {
+                source_dir,
+                target_dir,
+                to_sequence,
+                to_timestamp_ms,
+            } => {
+                let source_paths = engine::Paths::from_data_dir(source_dir)?;
+                let target_paths = engine::Paths::from_data_dir(target_dir)?;
+                let target = if let Some(sequence) = to_sequence {
+                    engine::PointInTimeTarget::Sequence(sequence)
+                } else if let Some(timestamp_ms) = to_timestamp_ms {
+                    engine::PointInTimeTarget::TimestampMs(timestamp_ms)
+                } else {
+                    return Err(server::ServerError::InvalidArguments(
+                        "pitr restore requires --to-sequence or --to-timestamp-ms".to_string(),
+                    ));
+                };
+                let keyring = engine::load_keyring(&source_paths.keyring_path)?;
+                let inspection = engine::Engine::restore_to_point(
+                    &source_paths,
+                    &target_paths,
+                    engine_options(args, keyring),
+                    target,
+                )?;
+                print_storage_inspection(&inspection);
+            }
+        },
+    }
+    Ok(())
+}
+
+fn print_storage_inspection(inspection: &engine::StorageInspection) {
+    for (key, value) in [
+        ("snapshot_present", inspection.snapshot_present.to_string()),
+        (
+            "storage_format_version",
+            inspection.storage_format_version.to_string(),
+        ),
+        (
+            "snapshot_size_bytes",
+            inspection.snapshot_size_bytes.to_string(),
+        ),
+        (
+            "last_snapshot_sequence",
+            inspection.last_snapshot_sequence.to_string(),
+        ),
+        (
+            "last_snapshot_at_ms",
+            inspection
+                .last_snapshot_at_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "wal_segment_count",
+            inspection.wal_segment_count.to_string(),
+        ),
+        (
+            "sealed_wal_segment_count",
+            inspection.sealed_wal_segment_count.to_string(),
+        ),
+        (
+            "active_wal_segment_count",
+            inspection.active_wal_segment_count.to_string(),
+        ),
+        (
+            "active_wal_start_sequence",
+            inspection.active_wal_start_sequence.to_string(),
+        ),
+        (
+            "oldest_retained_sequence",
+            inspection
+                .oldest_retained_sequence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "newest_sequence",
+            inspection
+                .newest_sequence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        ("wal_size_bytes", inspection.wal_size_bytes.to_string()),
+    ] {
+        println!("{key}={value}");
+    }
 }
