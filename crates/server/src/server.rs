@@ -18,9 +18,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
-use tokio_rustls::TlsAcceptor;
 use transport::{
     CodecOptions, Request, Response, Status, TransportError, negotiate_server_options,
     read_client_hello_from_async, read_request_from_async_with_options,
@@ -56,12 +55,22 @@ pub struct ServerRuntimeConfig {
     pub idle_timeout: Option<Duration>,
     pub auth_config: Option<AuthConfig>,
     pub guards: ServerGuards,
-    pub tls_config: Option<Arc<rustls::ServerConfig>>,
+    pub tls_state: Option<Arc<crate::tls::TlsState>>,
     pub transport: CodecOptions,
     pub audit_logger: Arc<AuditLogger>,
     pub backup_dir: PathBuf,
     pub mtls_enabled: bool,
     pub slow_command_threshold: Option<Duration>,
+    pub wal_segment_size_bytes: u64,
+    pub wal_retain_segments: usize,
+    pub auth_failure_window: Duration,
+    pub auth_failure_limit: u32,
+    pub auth_lockout: Duration,
+    pub transaction_max_duration: Duration,
+    pub maintenance: Arc<MaintenanceMode>,
+    pub auth_lockouts: Arc<Mutex<AuthLockoutState>>,
+    pub insecure_auth_disabled: bool,
+    pub insecure_default_credentials: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +278,7 @@ struct SessionState {
     identity: Option<Identity>,
     transaction_queue: Vec<Command>,
     rate_limiter: RateLimiter,
+    transaction_started_at_ms: Option<u64>,
 }
 
 impl SessionState {
@@ -277,6 +287,7 @@ impl SessionState {
             identity: None,
             transaction_queue: Vec::new(),
             rate_limiter: RateLimiter::new(guards.requests_per_second, guards.request_burst),
+            transaction_started_at_ms: None,
         }
     }
 
@@ -286,6 +297,105 @@ impl SessionState {
 
     fn in_transaction(&self) -> bool {
         !self.transaction_queue.is_empty()
+    }
+}
+
+pub struct MaintenanceMode {
+    path: PathBuf,
+    enabled: std::sync::atomic::AtomicBool,
+}
+
+impl MaintenanceMode {
+    pub fn load(path: PathBuf) -> Result<Self> {
+        Ok(Self {
+            enabled: std::sync::atomic::AtomicBool::new(path.exists()),
+            path,
+        })
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set(&self, enabled: bool) -> Result<()> {
+        if enabled {
+            std::fs::write(&self.path, b"maintenance=on\n")?;
+        } else if self.path.exists() {
+            std::fs::remove_file(&self.path)?;
+        }
+        self.enabled.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Default)]
+pub struct AuthLockoutState {
+    records: std::collections::BTreeMap<String, AuthLockoutRecord>,
+}
+
+struct AuthLockoutRecord {
+    first_failure_at_ms: u64,
+    failure_count: u32,
+    locked_until_ms: Option<u64>,
+}
+
+impl AuthLockoutState {
+    fn active_lockout_count(&mut self, now_ms: u64) -> usize {
+        self.records
+            .retain(|_, record| record.locked_until_ms.unwrap_or(now_ms) > now_ms);
+        self.records
+            .values()
+            .filter(|record| record.locked_until_ms.unwrap_or(0) > now_ms)
+            .count()
+    }
+
+    fn remaining_lockout_seconds(&mut self, key: &str, now_ms: u64) -> Option<u64> {
+        let remaining_ms = self
+            .records
+            .get(key)
+            .and_then(|record| record.locked_until_ms)
+            .and_then(|locked_until_ms| locked_until_ms.checked_sub(now_ms))?;
+        Some(remaining_ms.div_ceil(1_000))
+    }
+
+    fn clear_success(&mut self, key: &str) {
+        self.records.remove(key);
+    }
+
+    fn record_failure(
+        &mut self,
+        key: &str,
+        now_ms: u64,
+        failure_window: Duration,
+        failure_limit: u32,
+        lockout: Duration,
+    ) -> bool {
+        let record = self
+            .records
+            .entry(key.to_string())
+            .or_insert(AuthLockoutRecord {
+                first_failure_at_ms: now_ms,
+                failure_count: 0,
+                locked_until_ms: None,
+            });
+
+        if now_ms.saturating_sub(record.first_failure_at_ms) > failure_window.as_millis() as u64 {
+            record.first_failure_at_ms = now_ms;
+            record.failure_count = 0;
+            record.locked_until_ms = None;
+        }
+
+        record.failure_count = record.failure_count.saturating_add(1);
+        if record.failure_count >= failure_limit {
+            record.locked_until_ms = Some(now_ms.saturating_add(lockout.as_millis() as u64));
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -319,9 +429,16 @@ impl Server {
         bind: String,
         port: u16,
         max_connections: usize,
-        engine: Engine,
+        mut engine: Engine,
         runtime: ServerRuntimeConfig,
     ) -> Result<Self> {
+        let recovered_entries = engine
+            .info()?
+            .into_iter()
+            .find_map(|(key, value)| {
+                (key == "wal_entries_replayed_total").then(|| value.parse::<u64>().unwrap_or(0))
+            })
+            .unwrap_or(0);
         let addr = format!("{bind}:{port}");
         log_event(
             "INFO",
@@ -331,7 +448,7 @@ impl Server {
                 runtime.snapshot_interval,
                 runtime.expiration_sweep_interval,
                 runtime.idle_timeout,
-                runtime.tls_config.is_some(),
+                runtime.tls_state.is_some(),
                 runtime.auth_config.is_some(),
                 runtime.transport.compression.as_str(),
             ),
@@ -348,13 +465,45 @@ impl Server {
             ),
         );
 
+        if runtime.insecure_auth_disabled {
+            log_event(
+                "WARN",
+                "server.security",
+                "authentication is disabled; this is unsafe outside trusted local testing",
+            );
+        }
+        if runtime.insecure_default_credentials {
+            log_event(
+                "WARN",
+                "server.security",
+                "default bootstrap credentials are in use; override --user and --password for non-local deployments",
+            );
+        }
+        if let Some(tls_state) = &runtime.tls_state {
+            let metadata = tls_state.metadata_snapshot().await;
+            if let Some(days_remaining) = metadata.cert_days_remaining
+                && days_remaining <= 30
+            {
+                log_event(
+                    "WARN",
+                    "server.tls",
+                    &format!("server certificate expires in {days_remaining} days"),
+                );
+            }
+        }
+
+        let metrics = Arc::new(Metrics::default());
+        metrics
+            .wal_entries_replayed_total
+            .store(recovered_entries, Ordering::Relaxed);
+
         Ok(Self {
             listener,
             engine: EngineHandle::new(engine),
             connection_slots: Arc::new(Semaphore::new(max_connections)),
             next_connection_id: AtomicU64::new(1),
             runtime,
-            metrics: Arc::new(Metrics::default()),
+            metrics,
         })
     }
 
@@ -399,6 +548,8 @@ impl Server {
             );
         }
 
+        spawn_tls_reloader(runtime.clone(), shutdown_rx.clone());
+
         tokio::pin!(shutdown_signal);
 
         loop {
@@ -433,8 +584,10 @@ impl Server {
 
                             tokio::spawn(async move {
                                 let _permit = permit;
-                                let result = if let Some(tls_config) = runtime.tls_config.clone() {
-                                    let acceptor = TlsAcceptor::from(tls_config);
+                                let result = if let Some(tls_state) = runtime.tls_state.clone() {
+                                    let acceptor = tokio_rustls::TlsAcceptor::from(
+                                        tls_state.server_config().await,
+                                    );
                                     match acceptor.accept(stream).await {
                                         Ok(stream) => {
                                             handle_client(
@@ -533,6 +686,53 @@ fn spawn_expiration_sweeper(
                             metrics.expired_keys_removed.fetch_add(removed as u64, Ordering::Relaxed);
                         }
                         Err(err) => log_event("ERROR", "server.sweeper", &format!("[{}] {}: {err}", err.code(), err.name())),
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn spawn_tls_reloader(runtime: ServerRuntimeConfig, mut shutdown: watch::Receiver<bool>) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let Some(tls_state) = runtime.tls_state.clone() else {
+            return;
+        };
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                _ = signal.recv() => {
+                    match tls_state.reload().await {
+                        Ok(()) => {
+                            log_event("INFO", "server.tls", "reloaded TLS certificates after SIGHUP");
+                            record_runtime_event(
+                                &runtime.audit_logger,
+                                "tls_reload",
+                                [("result".to_string(), "ok".to_string())].into_iter().collect(),
+                            );
+                        }
+                        Err(err) => {
+                            log_event("ERROR", "server.tls", &format!("[{}] {}: {err}", err.code(), err.name()));
+                            record_runtime_event(
+                                &runtime.audit_logger,
+                                "tls_reload",
+                                [
+                                    ("result".to_string(), "error".to_string()),
+                                    ("error_code".to_string(), err.code().to_string()),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            );
+                        }
                     }
                 }
                 changed = shutdown.changed() => {
@@ -728,6 +928,7 @@ where
             Arc::clone(&metrics),
             &runtime,
             &mut session,
+            peer_addr,
             request_id,
             command.clone(),
         )
@@ -784,6 +985,11 @@ where
                 latency_ms: started_at.elapsed().as_millis(),
             },
         );
+        if let Some(threshold) = runtime.slow_command_threshold
+            && started_at.elapsed() >= threshold
+        {
+            metrics.slow_commands_total.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     Ok(())
@@ -1031,18 +1237,12 @@ async fn process_command(
     metrics: Arc<Metrics>,
     runtime: &ServerRuntimeConfig,
     session: &mut SessionState,
+    peer_addr: Option<SocketAddr>,
     request_id: Uuid,
     command: Command,
 ) -> Result<Response> {
     if matches!(command, Command::Auth { .. }) {
-        return handle_auth(
-            metrics,
-            runtime.auth_config.clone(),
-            session,
-            request_id,
-            command,
-        )
-        .await;
+        return handle_auth(metrics, runtime, session, peer_addr, request_id, command).await;
     }
 
     if runtime.auth_config.is_some()
@@ -1051,6 +1251,12 @@ async fn process_command(
     {
         metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
         return Err(ServerError::AuthenticationRequired);
+    }
+
+    expire_transaction_if_needed(metrics.clone(), runtime, session)?;
+
+    if runtime.maintenance.is_enabled() && !is_allowed_during_maintenance(&command) {
+        return Err(ServerError::MaintenanceModeEnabled);
     }
 
     if session.in_transaction() {
@@ -1066,9 +1272,45 @@ async fn process_command(
         Command::Multi => {
             metrics.transactions_started.fetch_add(1, Ordering::Relaxed);
             session.transaction_queue.push(Command::Multi);
+            session.transaction_started_at_ms = Some(current_time_millis());
             Ok(Response::ok(request_id))
         }
         Command::Exec | Command::Discard => Err(ServerError::NoActiveTransaction),
+        Command::MaintenanceOn => {
+            runtime.maintenance.set(true)?;
+            record_runtime_event(
+                &runtime.audit_logger,
+                "maintenance_mode",
+                [("enabled".to_string(), "true".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+            Ok(Response::ok(request_id))
+        }
+        Command::MaintenanceOff => {
+            runtime.maintenance.set(false)?;
+            record_runtime_event(
+                &runtime.audit_logger,
+                "maintenance_mode",
+                [("enabled".to_string(), "false".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+            Ok(Response::ok(request_id))
+        }
+        Command::MaintenanceStatus => Ok(Response::entries(
+            request_id,
+            &[
+                (
+                    "enabled".to_string(),
+                    runtime.maintenance.is_enabled().to_string(),
+                ),
+                (
+                    "path".to_string(),
+                    runtime.maintenance.path().display().to_string(),
+                ),
+            ],
+        )?),
         Command::Metrics => {
             let entries = metrics.snapshot();
             Ok(Response::entries(request_id, &entries)?)
@@ -1262,6 +1504,15 @@ async fn structured_info(
     runtime: &ServerRuntimeConfig,
 ) -> Result<Vec<(String, String)>> {
     let engine_entries = engine.info().await?;
+    let locked_auth_records = {
+        let mut lockouts = runtime.auth_lockouts.lock().await;
+        lockouts.active_lockout_count(current_time_millis())
+    };
+    let tls_metadata = if let Some(tls_state) = &runtime.tls_state {
+        Some(tls_state.metadata_snapshot().await)
+    } else {
+        None
+    };
     let lookup = |key: &str| {
         engine_entries
             .iter()
@@ -1284,6 +1535,10 @@ async fn structured_info(
         ),
         (
             "transport.compression".to_string(),
+            runtime.transport.compression.as_str().to_string(),
+        ),
+        (
+            "transport.compression_mode".to_string(),
             runtime.transport.compression.as_str().to_string(),
         ),
         (
@@ -1312,12 +1567,28 @@ async fn structured_info(
             lookup("wal_size_bytes"),
         ),
         (
+            "persistence.wal_segment_count".to_string(),
+            lookup("wal_segment_count"),
+        ),
+        (
+            "persistence.oldest_retained_sequence".to_string(),
+            lookup("oldest_retained_sequence"),
+        ),
+        (
             "persistence.wal_sync_policy".to_string(),
             lookup("wal_sync_policy"),
         ),
         (
+            "persistence.last_recovery_duration_ms".to_string(),
+            lookup("recovery_duration_ms"),
+        ),
+        (
             "persistence.last_snapshot_at_ms".to_string(),
             lookup("last_snapshot_at_ms"),
+        ),
+        (
+            "persistence.last_snapshot_duration_ms".to_string(),
+            lookup("last_snapshot_duration_ms"),
         ),
         (
             "security.auth_required".to_string(),
@@ -1333,16 +1604,24 @@ async fn structured_info(
             .to_string(),
         ),
         (
+            "security.insecure_auth_disabled".to_string(),
+            runtime.insecure_auth_disabled.to_string(),
+        ),
+        (
+            "security.insecure_default_credentials".to_string(),
+            runtime.insecure_default_credentials.to_string(),
+        ),
+        (
             "security.rbac_enabled".to_string(),
             runtime.auth_config.is_some().to_string(),
         ),
         (
             "security.tls_enabled".to_string(),
-            runtime.tls_config.is_some().to_string(),
+            runtime.tls_state.is_some().to_string(),
         ),
         (
             "security.tls_mode".to_string(),
-            if runtime.tls_config.is_some() {
+            if runtime.tls_state.is_some() {
                 "tls"
             } else {
                 "plaintext"
@@ -1352,6 +1631,38 @@ async fn structured_info(
         (
             "security.mtls_enabled".to_string(),
             runtime.mtls_enabled.to_string(),
+        ),
+        (
+            "security.cert_not_after_ms".to_string(),
+            tls_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.cert_not_after_ms)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "security.cert_days_remaining".to_string(),
+            tls_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.cert_days_remaining)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "security.last_tls_reload_success_at_ms".to_string(),
+            tls_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_reload_success_at_ms)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "security.last_tls_reload_failure_at_ms".to_string(),
+            tls_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.last_reload_failure_at_ms)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
         ),
         (
             "security.storage_encryption".to_string(),
@@ -1371,6 +1682,10 @@ async fn structured_info(
         (
             "runtime.backup_dir".to_string(),
             runtime.backup_dir.display().to_string(),
+        ),
+        (
+            "runtime.maintenance_mode".to_string(),
+            runtime.maintenance.is_enabled().to_string(),
         ),
         (
             "runtime.max_request_payload_bytes".to_string(),
@@ -1393,12 +1708,40 @@ async fn structured_info(
             runtime.guards.max_transaction_queue_len.to_string(),
         ),
         (
+            "runtime.transaction_max_seconds".to_string(),
+            runtime.transaction_max_duration.as_secs().to_string(),
+        ),
+        (
             "runtime.requests_per_second".to_string(),
             runtime.guards.requests_per_second.to_string(),
         ),
         (
             "runtime.request_burst".to_string(),
             runtime.guards.request_burst.to_string(),
+        ),
+        (
+            "runtime.auth_failure_window_seconds".to_string(),
+            runtime.auth_failure_window.as_secs().to_string(),
+        ),
+        (
+            "runtime.auth_failure_limit".to_string(),
+            runtime.auth_failure_limit.to_string(),
+        ),
+        (
+            "runtime.auth_lockout_seconds".to_string(),
+            runtime.auth_lockout.as_secs().to_string(),
+        ),
+        (
+            "runtime.wal_segment_size_bytes".to_string(),
+            runtime.wal_segment_size_bytes.to_string(),
+        ),
+        (
+            "runtime.wal_retain_segments".to_string(),
+            runtime.wal_retain_segments.to_string(),
+        ),
+        (
+            "runtime.locked_auth_records".to_string(),
+            locked_auth_records.to_string(),
         ),
         (
             "runtime.snapshot_interval_seconds".to_string(),
@@ -1435,8 +1778,9 @@ async fn structured_info(
 
 async fn handle_auth(
     metrics: Arc<Metrics>,
-    auth_config: Option<AuthConfig>,
+    runtime: &ServerRuntimeConfig,
     session: &mut SessionState,
+    peer_addr: Option<SocketAddr>,
     request_id: Uuid,
     command: Command,
 ) -> Result<Response> {
@@ -1444,7 +1788,7 @@ async fn handle_auth(
         unreachable!();
     };
 
-    let Some(auth_config) = auth_config else {
+    let Some(auth_config) = runtime.auth_config.clone() else {
         session.identity = Some(Identity {
             username: "anonymous".to_string(),
             permissions: Permission::all(),
@@ -1460,13 +1804,46 @@ async fn handle_auth(
         return Ok(Response::ok(request_id));
     };
 
+    let lockout_key = auth_lockout_key(&username, peer_addr);
+    {
+        let mut lockouts = runtime.auth_lockouts.lock().await;
+        if let Some(remaining_seconds) =
+            lockouts.remaining_lockout_seconds(&lockout_key, current_time_millis())
+        {
+            metrics
+                .locked_auth_attempts_total
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ServerError::AuthenticationLocked {
+                username,
+                remaining_seconds,
+            });
+        }
+    }
+
     if let Some(identity) = auth_config.verify(&username, &password).await? {
         session.identity = Some(identity);
+        runtime
+            .auth_lockouts
+            .lock()
+            .await
+            .clear_success(&lockout_key);
         metrics.auth_successes.fetch_add(1, Ordering::Relaxed);
         return Ok(Response::ok(request_id));
     }
 
+    let locked = runtime.auth_lockouts.lock().await.record_failure(
+        &lockout_key,
+        current_time_millis(),
+        runtime.auth_failure_window,
+        runtime.auth_failure_limit,
+        runtime.auth_lockout,
+    );
     metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
+    if locked {
+        metrics
+            .locked_auth_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
     Err(ServerError::AuthenticationFailed)
 }
 
@@ -1478,10 +1855,11 @@ async fn handle_transaction_command(
     request_id: Uuid,
     command: Command,
 ) -> Result<Response> {
+    expire_transaction_if_needed(metrics.clone(), runtime, session)?;
     match command {
         Command::Multi => Err(ServerError::TransactionAlreadyActive),
         Command::Discard => {
-            session.transaction_queue.clear();
+            clear_transaction(session);
             metrics
                 .transactions_discarded
                 .fetch_add(1, Ordering::Relaxed);
@@ -1489,6 +1867,7 @@ async fn handle_transaction_command(
         }
         Command::Exec => {
             let mut queued = std::mem::take(&mut session.transaction_queue);
+            session.transaction_started_at_ms = None;
             if matches!(queued.first(), Some(Command::Multi)) {
                 queued.remove(0);
             }
@@ -1521,6 +1900,65 @@ async fn handle_transaction_command(
     }
 }
 
+fn clear_transaction(session: &mut SessionState) {
+    session.transaction_queue.clear();
+    session.transaction_started_at_ms = None;
+}
+
+fn expire_transaction_if_needed(
+    metrics: Arc<Metrics>,
+    runtime: &ServerRuntimeConfig,
+    session: &mut SessionState,
+) -> Result<()> {
+    let Some(started_at_ms) = session.transaction_started_at_ms else {
+        return Ok(());
+    };
+    let elapsed_ms = current_time_millis().saturating_sub(started_at_ms);
+    if elapsed_ms <= runtime.transaction_max_duration.as_millis() as u64 {
+        return Ok(());
+    }
+    clear_transaction(session);
+    metrics
+        .transactions_discarded
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .transactions_timed_out
+        .fetch_add(1, Ordering::Relaxed);
+    Err(ServerError::TransactionExpired {
+        seconds: runtime.transaction_max_duration.as_secs(),
+    })
+}
+
+fn is_allowed_during_maintenance(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Ping { .. }
+            | Command::Get { .. }
+            | Command::Exists { .. }
+            | Command::GetEx { .. }
+            | Command::MGet { .. }
+            | Command::Ttl { .. }
+            | Command::Scan { .. }
+            | Command::DbSize
+            | Command::Count
+            | Command::List
+            | Command::Info
+            | Command::Metrics
+            | Command::MetricsProm
+            | Command::Backup
+            | Command::BackupVerify { .. }
+            | Command::BackupVerifyFrom { .. }
+            | Command::ShowUsers
+            | Command::ShowRoles
+            | Command::ShowGrants
+            | Command::ShowGrantsForUser { .. }
+            | Command::ShowGrantsForRole { .. }
+            | Command::WhoAmI
+            | Command::MaintenanceStatus
+            | Command::MaintenanceOff
+    )
+}
+
 fn authorize_command(command: &Command, session: &SessionState) -> Result<()> {
     let Some(permission) = command_permission(command) else {
         return Ok(());
@@ -1550,6 +1988,7 @@ fn command_permission(command: &Command) -> Option<Permission> {
         | Command::Multi
         | Command::Exec
         | Command::Discard
+        | Command::MaintenanceStatus
         | Command::WhoAmI => None,
         Command::Get { .. }
         | Command::Exists { .. }
@@ -1596,6 +2035,7 @@ fn command_permission(command: &Command) -> Option<Permission> {
         Command::ShowGrantsForUser { .. } => Some(Permission::UserAdmin),
         Command::ShowGrantsForRole { .. } => Some(Permission::RoleAdmin),
         Command::ShowUsers => Some(Permission::UserAdmin),
+        Command::MaintenanceOn | Command::MaintenanceOff => Some(Permission::Admin),
         Command::Help | Command::Exit => None,
     }
 }
@@ -1745,7 +2185,10 @@ where
         | Command::RestoreFrom { .. }
         | Command::RestoreCheck { .. }
         | Command::RestoreCheckFrom { .. }
-        | Command::AlterUserPassword { .. } => Err(ServerError::UnsupportedRemoteCommand),
+        | Command::AlterUserPassword { .. }
+        | Command::MaintenanceOn
+        | Command::MaintenanceOff
+        | Command::MaintenanceStatus => Err(ServerError::UnsupportedRemoteCommand),
         Command::Multi | Command::Exec | Command::Discard => {
             Err(ServerError::UnsupportedRemoteCommand)
         }
@@ -1823,6 +2266,9 @@ fn validate_transaction_command(command: &Command) -> Result<()> {
         | Command::ShowGrantsForUser { .. }
         | Command::ShowGrantsForRole { .. }
         | Command::WhoAmI
+        | Command::MaintenanceOn
+        | Command::MaintenanceOff
+        | Command::MaintenanceStatus
         | Command::Auth { .. }
         | Command::Help
         | Command::Exit
@@ -1897,6 +2343,15 @@ fn log_connection_event(
     }
 }
 
+fn auth_lockout_key(username: &str, peer_addr: Option<SocketAddr>) -> String {
+    format!(
+        "{username}|{}",
+        peer_addr
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
 fn opcode_name(command: &Command) -> &'static str {
     match command {
         Command::Auth { .. } => "AUTH",
@@ -1953,6 +2408,9 @@ fn opcode_name(command: &Command) -> &'static str {
         Command::Multi => "MULTI",
         Command::Exec => "EXEC",
         Command::Discard => "DISCARD",
+        Command::MaintenanceOn => "MAINTENANCE_ON",
+        Command::MaintenanceOff => "MAINTENANCE_OFF",
+        Command::MaintenanceStatus => "MAINTENANCE_STATUS",
         Command::Help => "HELP",
         Command::Exit => "EXIT",
     }
@@ -1965,6 +2423,26 @@ fn record_audit_event(logger: &AuditLogger, context: AuditContext<'_>) {
         "command",
         std::collections::BTreeMap::new(),
     );
+}
+
+fn record_runtime_event(
+    logger: &AuditLogger,
+    event_type: &str,
+    details: std::collections::BTreeMap<String, String>,
+) {
+    let _ = logger.record(&AuditEvent {
+        timestamp_ms: current_time_millis(),
+        connection_id: 0,
+        peer: None,
+        username: None,
+        request_id: Uuid::nil().to_string(),
+        opcode: "RUNTIME".to_string(),
+        status: "ok".to_string(),
+        error_code: None,
+        latency_ms: 0,
+        event_type: event_type.to_string(),
+        details,
+    });
 }
 
 fn record_audit_event_with(
@@ -2114,9 +2592,10 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AuditContext, RateLimiter, ServerGuards, SessionState, backup_manifest_path,
-        error_response, execute_command, handle_auth, handle_transaction_command, process_command,
-        record_semantic_audit_event, record_slow_command_event, structured_info, validate_command,
+        AuditContext, AuthLockoutState, MaintenanceMode, RateLimiter, ServerGuards, SessionState,
+        backup_manifest_path, error_response, execute_command, handle_auth,
+        handle_transaction_command, process_command, record_semantic_audit_event,
+        record_slow_command_event, structured_info, validate_command,
     };
     use crate::audit::AuditLogger;
     use crate::auth::{AuthConfig, Permission, PermissionGrant};
@@ -2138,7 +2617,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("veyra-server-test-{name}-{unique}"))
+        std::env::temp_dir().join(format!("vaylix-server-test-{name}-{unique}"))
     }
 
     fn id(value: u128) -> Uuid {
@@ -2177,19 +2656,64 @@ mod tests {
 
     fn runtime() -> ServerRuntimeConfig {
         let audit_path = temp_dir("audit").join("audit.log");
+        let backup_dir = temp_dir("backups");
+        let maintenance_path = temp_dir("maintenance").join("maintenance.mode");
         ServerRuntimeConfig {
             snapshot_interval: None,
             expiration_sweep_interval: None,
             idle_timeout: None,
             auth_config: Some(AuthConfig::new("dbuser".to_string(), "secret".to_string()).unwrap()),
             guards: guards(),
-            tls_config: None,
+            tls_state: None,
             transport: CodecOptions::default(),
-            backup_dir: temp_dir("backups"),
+            backup_dir,
             mtls_enabled: false,
             slow_command_threshold: Some(Duration::from_millis(100)),
             audit_logger: Arc::new(AuditLogger::open(&audit_path).unwrap()),
+            wal_segment_size_bytes: engine::DEFAULT_WAL_SEGMENT_SIZE_BYTES,
+            wal_retain_segments: engine::DEFAULT_WAL_RETAIN_SEGMENTS,
+            auth_failure_window: Duration::from_secs(300),
+            auth_failure_limit: 5,
+            auth_lockout: Duration::from_secs(900),
+            transaction_max_duration: Duration::from_secs(30),
+            maintenance: Arc::new(MaintenanceMode::load(maintenance_path).unwrap()),
+            auth_lockouts: Arc::new(tokio::sync::Mutex::new(AuthLockoutState::default())),
+            insecure_auth_disabled: false,
+            insecure_default_credentials: false,
         }
+    }
+
+    async fn authenticate(
+        metrics: Arc<Metrics>,
+        runtime: &ServerRuntimeConfig,
+        session: &mut SessionState,
+        request_id: Uuid,
+        username: &str,
+        password: &str,
+    ) -> crate::Result<Response> {
+        handle_auth(
+            metrics,
+            runtime,
+            session,
+            None,
+            request_id,
+            Command::Auth {
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn run_command(
+        engine: EngineHandle,
+        metrics: Arc<Metrics>,
+        runtime: &ServerRuntimeConfig,
+        session: &mut SessionState,
+        request_id: Uuid,
+        command: Command,
+    ) -> crate::Result<Response> {
+        process_command(engine, metrics, runtime, session, None, request_id, command).await
     }
 
     #[derive(Default)]
@@ -2474,31 +2998,27 @@ mod tests {
 
     #[test]
     fn handles_auth_and_transaction_queueing() {
-        let auth = AuthConfig::new("dbuser".to_string(), "secret".to_string()).unwrap();
         let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
         let mut session = SessionState::new(&guards());
         let runtime_handle = tokio::runtime::Runtime::new().unwrap();
-        let denied = runtime_handle.block_on(handle_auth(
+        let denied = runtime_handle.block_on(authenticate(
             Arc::clone(&metrics),
-            Some(auth.clone()),
+            &runtime,
             &mut session,
             id(1),
-            Command::Auth {
-                username: "dbuser".to_string(),
-                password: "wrong".to_string(),
-            },
+            "dbuser",
+            "wrong",
         ));
         assert!(denied.is_err());
         let ok = runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                Some(auth),
+                &runtime,
                 &mut session,
                 id(2),
-                Command::Auth {
-                    username: "dbuser".to_string(),
-                    password: "secret".to_string(),
-                },
+                "dbuser",
+                "secret",
             ))
             .unwrap();
         assert_eq!(ok.status, Status::Ok);
@@ -2510,6 +3030,7 @@ mod tests {
             engine::EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("tx-key")),
+                ..engine::EngineOptions::default()
             },
         )
         .unwrap();
@@ -2518,7 +3039,7 @@ mod tests {
             .block_on(handle_transaction_command(
                 handle,
                 metrics,
-                &runtime(),
+                &runtime,
                 &mut session,
                 id(3),
                 Command::Set {
@@ -2538,15 +3059,13 @@ mod tests {
         let runtime = runtime();
         let mut admin_session = SessionState::new(&guards());
         runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                runtime.auth_config.clone(),
+                &runtime,
                 &mut admin_session,
                 id(20),
-                Command::Auth {
-                    username: "dbuser".to_string(),
-                    password: "secret".to_string(),
-                },
+                "dbuser",
+                "secret",
             ))
             .unwrap();
 
@@ -2555,6 +3074,7 @@ mod tests {
             engine::EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("rbac-key")),
+                ..engine::EngineOptions::default()
             },
         )
         .unwrap();
@@ -2565,7 +3085,7 @@ mod tests {
                 id(21),
                 Command::CreateUser {
                     username: "alice".to_string(),
-                    password: "pw".to_string(),
+                    password: "password1234".to_string(),
                 },
             ),
             (
@@ -2591,7 +3111,7 @@ mod tests {
             ),
         ] {
             let response = runtime_handle
-                .block_on(process_command(
+                .block_on(run_command(
                     handle.clone(),
                     Arc::clone(&metrics),
                     &runtime,
@@ -2604,7 +3124,7 @@ mod tests {
         }
 
         let user_grants = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2629,7 +3149,7 @@ mod tests {
         );
 
         let role_grants = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2646,20 +3166,18 @@ mod tests {
 
         let mut readonly_session = SessionState::new(&guards());
         runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                runtime.auth_config.clone(),
+                &runtime,
                 &mut readonly_session,
                 id(25),
-                Command::Auth {
-                    username: "alice".to_string(),
-                    password: "pw".to_string(),
-                },
+                "alice",
+                "password1234",
             ))
             .unwrap();
 
         let read_response = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2673,7 +3191,7 @@ mod tests {
         assert_eq!(read_response.status, Status::NotFound);
 
         let own_grants = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2691,7 +3209,7 @@ mod tests {
         );
 
         let inspect_other_denied = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2708,7 +3226,7 @@ mod tests {
         ));
 
         let write_denied = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle,
                 metrics,
                 &runtime,
@@ -2731,15 +3249,13 @@ mod tests {
         let runtime = runtime();
         let mut admin_session = SessionState::new(&guards());
         runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                runtime.auth_config.clone(),
+                &runtime,
                 &mut admin_session,
                 id(30),
-                Command::Auth {
-                    username: "dbuser".to_string(),
-                    password: "secret".to_string(),
-                },
+                "dbuser",
+                "secret",
             ))
             .unwrap();
 
@@ -2748,6 +3264,7 @@ mod tests {
             engine::EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("rbac-pattern-key")),
+                ..engine::EngineOptions::default()
             },
         )
         .unwrap();
@@ -2758,7 +3275,7 @@ mod tests {
                 id(31),
                 Command::CreateUser {
                     username: "alice".to_string(),
-                    password: "pw".to_string(),
+                    password: "password1234".to_string(),
                 },
             ),
             (
@@ -2784,7 +3301,7 @@ mod tests {
             ),
         ] {
             let response = runtime_handle
-                .block_on(process_command(
+                .block_on(run_command(
                     handle.clone(),
                     Arc::clone(&metrics),
                     &runtime,
@@ -2798,20 +3315,18 @@ mod tests {
 
         let mut alice_session = SessionState::new(&guards());
         runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                runtime.auth_config.clone(),
+                &runtime,
                 &mut alice_session,
                 id(35),
-                Command::Auth {
-                    username: "alice".to_string(),
-                    password: "pw".to_string(),
-                },
+                "alice",
+                "password1234",
             ))
             .unwrap();
 
         let allowed = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2827,7 +3342,7 @@ mod tests {
         assert_eq!(allowed.status, Status::Ok);
 
         let denied = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2843,7 +3358,7 @@ mod tests {
         assert!(matches!(denied, crate::ServerError::PermissionDenied));
 
         let multi_key_denied = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2863,7 +3378,7 @@ mod tests {
         ));
 
         let clear_denied = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle,
                 metrics,
                 &runtime,
@@ -2921,15 +3436,13 @@ mod tests {
         let runtime = runtime();
         let mut session = SessionState::new(&guards());
         runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                runtime.auth_config.clone(),
+                &runtime,
                 &mut session,
                 id(50),
-                Command::Auth {
-                    username: "dbuser".to_string(),
-                    password: "secret".to_string(),
-                },
+                "dbuser",
+                "secret",
             ))
             .unwrap();
 
@@ -2938,13 +3451,14 @@ mod tests {
             engine::EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("backup-file-key")),
+                ..engine::EngineOptions::default()
             },
         )
         .unwrap();
         let handle = EngineHandle::new(engine);
 
         runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2959,7 +3473,7 @@ mod tests {
             .unwrap();
 
         let backup = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -2977,7 +3491,7 @@ mod tests {
         assert!(manifest_path.exists());
 
         let verified = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3008,7 +3522,7 @@ mod tests {
 
         let dump = fs::read_to_string(&backup_path).unwrap();
         let inline_verified = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3026,7 +3540,7 @@ mod tests {
         );
 
         let rejected = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3043,7 +3557,7 @@ mod tests {
         ));
 
         runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3058,7 +3572,7 @@ mod tests {
             .unwrap();
 
         let checked = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3072,7 +3586,7 @@ mod tests {
         assert_eq!(checked.decode_count().unwrap(), 1);
 
         let still_present = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3086,7 +3600,7 @@ mod tests {
         assert_eq!(still_present.decode_value().unwrap(), "temporary");
 
         let restored = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3100,7 +3614,7 @@ mod tests {
         assert_eq!(restored.decode_count().unwrap(), 1);
 
         let removed = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3115,7 +3629,7 @@ mod tests {
 
         fs::write(&manifest_path, br#"{"manifest_version":1}"#).unwrap();
         let corrupt_manifest = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle.clone(),
                 Arc::clone(&metrics),
                 &runtime,
@@ -3147,6 +3661,7 @@ mod tests {
             engine::EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("metrics-prom-key")),
+                ..engine::EngineOptions::default()
             },
         )
         .unwrap();
@@ -3154,20 +3669,18 @@ mod tests {
 
         let mut session = SessionState::new(&guards());
         runtime_handle
-            .block_on(handle_auth(
+            .block_on(authenticate(
                 Arc::clone(&metrics),
-                runtime.auth_config.clone(),
+                &runtime,
                 &mut session,
                 id(70),
-                Command::Auth {
-                    username: "dbuser".to_string(),
-                    password: "secret".to_string(),
-                },
+                "dbuser",
+                "secret",
             ))
             .unwrap();
 
         let response = runtime_handle
-            .block_on(process_command(
+            .block_on(run_command(
                 handle,
                 metrics,
                 &runtime,
@@ -3249,6 +3762,7 @@ mod tests {
             engine::EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("info-key")),
+                ..engine::EngineOptions::default()
             },
         )
         .unwrap();

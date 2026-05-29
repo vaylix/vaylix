@@ -234,6 +234,13 @@ impl Request {
             Command::Multi => Ok(Self::new(request_id, Opcode::Multi, Vec::new())),
             Command::Exec => Ok(Self::new(request_id, Opcode::Exec, Vec::new())),
             Command::Discard => Ok(Self::new(request_id, Opcode::Discard, Vec::new())),
+            Command::MaintenanceOn => Ok(Self::new(request_id, Opcode::MaintenanceOn, Vec::new())),
+            Command::MaintenanceOff => {
+                Ok(Self::new(request_id, Opcode::MaintenanceOff, Vec::new()))
+            }
+            Command::MaintenanceStatus => {
+                Ok(Self::new(request_id, Opcode::MaintenanceStatus, Vec::new()))
+            }
             Command::Help => Err(TransportError::UnsupportedCommand("help")),
             Command::Exit => Err(TransportError::UnsupportedCommand("exit")),
         }
@@ -410,6 +417,11 @@ impl Request {
             Opcode::Multi => decode_empty(&self.payload).map(|()| Command::Multi),
             Opcode::Exec => decode_empty(&self.payload).map(|()| Command::Exec),
             Opcode::Discard => decode_empty(&self.payload).map(|()| Command::Discard),
+            Opcode::MaintenanceOn => decode_empty(&self.payload).map(|()| Command::MaintenanceOn),
+            Opcode::MaintenanceOff => decode_empty(&self.payload).map(|()| Command::MaintenanceOff),
+            Opcode::MaintenanceStatus => {
+                decode_empty(&self.payload).map(|()| Command::MaintenanceStatus)
+            }
         }
     }
 }
@@ -958,6 +970,9 @@ mod tests {
                 role: "readonly".to_string(),
             },
             Command::WhoAmI,
+            Command::MaintenanceOn,
+            Command::MaintenanceOff,
+            Command::MaintenanceStatus,
         ];
 
         for command in commands {

@@ -1,4 +1,3 @@
-use crate::EngineMetadata;
 use crate::config::EngineOptions;
 use crate::engine::{
     EngineState, Expiration, LogicalBackup, LogicalBackupEntry, ScanPage, SetCondition, SetOptions,
@@ -7,20 +6,49 @@ use crate::engine::{
 use crate::error::Result;
 use crate::paths::Paths;
 use crate::store::{
-    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, append, deserialize, keyring, load,
-    load_manifest, replay, save, save_manifest, serialize, truncate,
+    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, WalReplayTarget, append,
+    create_active_segment, deserialize, inspect_wal, keyring, load, load_manifest,
+    migrate_legacy_wal, prune_sealed_segments, replay, replay_until, save, save_keyring,
+    save_manifest, seal_active, serialize,
 };
+use crate::{EngineMetadata, StorageKeyring};
 use command::Command;
 use crc32fast::hash;
+use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SCAN_COUNT: usize = 10;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageInspection {
+    pub snapshot_present: bool,
+    pub storage_format_version: u32,
+    pub snapshot_size_bytes: u64,
+    pub last_snapshot_sequence: u64,
+    pub last_snapshot_at_ms: Option<u64>,
+    pub wal_segment_count: usize,
+    pub sealed_wal_segment_count: usize,
+    pub active_wal_segment_count: usize,
+    pub active_wal_start_sequence: u64,
+    pub oldest_retained_sequence: Option<u64>,
+    pub newest_sequence: Option<u64>,
+    pub wal_size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PointInTimeTarget {
+    Sequence(u64),
+    TimestampMs(u64),
+}
 
 /// Core string-to-string storage engine backed by snapshots and a write-ahead log.
 pub struct Engine {
     state: EngineState,
     paths: Paths,
     options: EngineOptions,
+    recovery_duration_ms: u64,
+    wal_entries_replayed_total: u64,
+    last_snapshot_duration_ms: Option<u64>,
 }
 
 impl Engine {
@@ -41,6 +69,13 @@ impl Engine {
 
     /// Creates a new engine using an explicit filesystem layout and caller-provided options.
     pub fn from_paths_with_options(paths: Paths, options: EngineOptions) -> Result<Self> {
+        let recovery_started_at_ms = now_millis();
+        if paths.wal_path.exists() {
+            return Err(crate::EngineError::StorageMigrationRequired {
+                resource: "legacy wal layout",
+            });
+        }
+
         let loaded = load(&paths.snapshot_path, options.keyring.as_ref())?;
 
         let mut state = match &loaded {
@@ -68,7 +103,9 @@ impl Engine {
                 .max(manifest.last_snapshot_sequence);
         }
 
-        for entry in replay(&paths.wal_path, options.keyring.as_ref())? {
+        let replay = replay(&paths.wal_dir, options.keyring.as_ref())?;
+        let wal_entries_replayed_total = replay.entries.len() as u64;
+        for entry in replay.entries {
             state.apply_entry(&entry)?;
         }
 
@@ -76,7 +113,193 @@ impl Engine {
             state,
             paths,
             options,
+            recovery_duration_ms: now_millis().saturating_sub(recovery_started_at_ms),
+            wal_entries_replayed_total,
+            last_snapshot_duration_ms: None,
         })
+    }
+
+    pub fn inspect_storage(
+        paths: &Paths,
+        keyring: Option<&StorageKeyring>,
+    ) -> Result<StorageInspection> {
+        let loaded = load(&paths.snapshot_path, keyring)?;
+        let manifest = load_manifest(&paths.manifest_path)?;
+        let wal_report = inspect_wal(&paths.wal_dir)?;
+        Ok(build_storage_inspection(
+            loaded.as_ref(),
+            manifest.as_ref(),
+            &wal_report,
+        ))
+    }
+
+    pub fn verify_storage(paths: &Paths, options: EngineOptions) -> Result<StorageInspection> {
+        let engine = Self::from_paths_with_options(paths.clone(), options)?;
+        Ok(engine.storage_inspection())
+    }
+
+    pub fn migrate_storage(paths: &Paths, options: &EngineOptions) -> Result<StorageInspection> {
+        if paths.wal_path.exists() {
+            migrate_legacy_wal(
+                &paths.wal_path,
+                &paths.wal_dir,
+                options.wal_sync,
+                options.keyring.as_ref(),
+                options.wal_segment_size_bytes,
+            )?;
+        }
+        if inspect_wal(&paths.wal_dir)?.active_segment_count == 0 {
+            let start_sequence = load_manifest(&paths.manifest_path)?
+                .map(|manifest| manifest.last_snapshot_sequence.saturating_add(1))
+                .unwrap_or(1);
+            create_active_segment(&paths.wal_dir, start_sequence)?;
+        }
+        Self::inspect_storage(paths, options.keyring.as_ref())
+    }
+
+    pub fn restore_to_point(
+        source_paths: &Paths,
+        target_paths: &Paths,
+        options: EngineOptions,
+        target: PointInTimeTarget,
+    ) -> Result<StorageInspection> {
+        if source_paths.data_dir == target_paths.data_dir {
+            return Err(crate::EngineError::InvalidStorageOperation(
+                "source and target data directories must differ".to_string(),
+            ));
+        }
+        if source_paths.wal_path.exists() {
+            return Err(crate::EngineError::StorageMigrationRequired {
+                resource: "legacy wal layout",
+            });
+        }
+
+        let loaded = load(&source_paths.snapshot_path, options.keyring.as_ref())?;
+        let mut state = match &loaded {
+            Some(bytes) => deserialize(bytes)?,
+            None => EngineState::new(),
+        };
+        let manifest = load_manifest(&source_paths.manifest_path)?;
+        let snapshot_sequence = manifest
+            .as_ref()
+            .map(|value| value.last_snapshot_sequence)
+            .unwrap_or(0);
+        let snapshot_time_ms = manifest
+            .as_ref()
+            .map(|value| value.last_snapshot_at_ms)
+            .unwrap_or(0);
+
+        if let Some(manifest) = &manifest {
+            if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
+                return Err(crate::EngineError::UnsupportedStorageFormat {
+                    resource: "manifest",
+                });
+            }
+            if let Some(snapshot) = &loaded
+                && hash(snapshot) != manifest.snapshot_checksum
+            {
+                return Err(crate::EngineError::ChecksumMismatch {
+                    resource: "snapshot",
+                });
+            }
+            state.metadata.last_snapshot_at_ms = Some(manifest.last_snapshot_at_ms);
+            state.metadata.last_applied_sequence = state
+                .metadata
+                .last_applied_sequence
+                .max(manifest.last_snapshot_sequence);
+        }
+
+        match target {
+            PointInTimeTarget::Sequence(sequence) if sequence < snapshot_sequence => {
+                return Err(crate::EngineError::RestorePointUnavailable(format!(
+                    "sequence {sequence} is older than snapshot baseline {snapshot_sequence}"
+                )));
+            }
+            PointInTimeTarget::TimestampMs(timestamp_ms) if timestamp_ms < snapshot_time_ms => {
+                return Err(crate::EngineError::RestorePointUnavailable(format!(
+                    "timestamp {timestamp_ms} is older than snapshot baseline {snapshot_time_ms}"
+                )));
+            }
+            _ => {}
+        }
+
+        let replay_target = match target {
+            PointInTimeTarget::Sequence(sequence) => WalReplayTarget::Sequence(sequence),
+            PointInTimeTarget::TimestampMs(timestamp_ms) => {
+                WalReplayTarget::TimestampMs(timestamp_ms)
+            }
+        };
+        let replay = replay_until(
+            &source_paths.wal_dir,
+            options.keyring.as_ref(),
+            replay_target,
+        )?;
+        match target {
+            PointInTimeTarget::Sequence(sequence)
+                if sequence > replay.newest_sequence.unwrap_or(snapshot_sequence) =>
+            {
+                return Err(crate::EngineError::RestorePointUnavailable(format!(
+                    "sequence {sequence} is outside retained WAL history"
+                )));
+            }
+            _ => {}
+        }
+
+        for entry in replay.entries {
+            state.apply_entry(&entry)?;
+        }
+
+        if target_paths.data_dir.exists() {
+            for path in [
+                &target_paths.snapshot_path,
+                &target_paths.manifest_path,
+                &target_paths.keyring_path,
+                &target_paths.maintenance_path,
+                &target_paths.auth_path,
+            ] {
+                fs::remove_file(path).ok();
+            }
+            if target_paths.wal_dir.exists() {
+                fs::remove_dir_all(&target_paths.wal_dir)?;
+            }
+        }
+
+        if let Some(keyring) = options.keyring.as_ref() {
+            save_keyring(
+                keyring,
+                &target_paths.keyring_path,
+                &target_paths.keyring_tmp_path,
+            )?;
+        }
+
+        let restored_at_ms = now_millis();
+        let sequence = state.metadata.last_applied_sequence;
+        state.mark_snapshot(restored_at_ms, sequence);
+        let serialized = serialize(&state)?;
+        save(
+            &serialized,
+            &target_paths.snapshot_path,
+            &target_paths.snapshot_tmp_path,
+            options.keyring.as_ref(),
+        )?;
+        create_active_segment(&target_paths.wal_dir, sequence.saturating_add(1))?;
+        let manifest = Manifest {
+            storage_format_version: STORAGE_FORMAT_VERSION,
+            engine_version: state.metadata.version,
+            last_snapshot_sequence: sequence,
+            last_snapshot_at_ms: restored_at_ms,
+            snapshot_size_bytes: serialized.len() as u64,
+            snapshot_checksum: hash(&serialized),
+            active_wal_start_sequence: sequence.saturating_add(1),
+            oldest_retained_sequence: sequence.saturating_add(1),
+        };
+        save_manifest(
+            &manifest,
+            &target_paths.manifest_path,
+            &target_paths.manifest_tmp_path,
+        )?;
+
+        Self::inspect_storage(target_paths, options.keyring.as_ref())
     }
 
     /// Returns immutable access to the in-memory state for diagnostics and tests.
@@ -84,13 +307,29 @@ impl Engine {
         &self.state
     }
 
+    fn storage_inspection(&self) -> StorageInspection {
+        let snapshot_bytes = fs::read(&self.paths.snapshot_path).ok();
+        let manifest = load_manifest(&self.paths.manifest_path).ok().flatten();
+        let wal_report = inspect_wal(&self.paths.wal_dir).unwrap_or(crate::WalSegmentReport {
+            segment_count: 0,
+            sealed_segment_count: 0,
+            active_segment_count: 0,
+            oldest_retained_sequence: None,
+            active_start_sequence: 1,
+            newest_sequence: None,
+            total_size_bytes: 0,
+        });
+        build_storage_inspection(snapshot_bytes.as_ref(), manifest.as_ref(), &wal_report)
+    }
+
     fn append_and_apply(&mut self, operations: Vec<WalOperation>) -> Result<()> {
         let entry = self.next_entry(operations);
         append(
             &entry,
-            &self.paths.wal_path,
+            &self.paths.wal_dir,
             self.options.wal_sync,
             self.options.keyring.as_ref(),
+            self.options.wal_segment_size_bytes,
         )?;
         self.state.apply_entry(&entry)?;
         Ok(())
@@ -109,9 +348,20 @@ impl Engine {
     }
 
     fn info_entries(&self, metadata: &EngineMetadata, key_count: usize) -> Vec<(String, String)> {
-        let wal_size = std::fs::metadata(&self.paths.wal_path)
-            .map(|metadata| metadata.len())
+        let wal_report = inspect_wal(&self.paths.wal_dir).ok();
+        let wal_size = wal_report
+            .as_ref()
+            .map(|report| report.total_size_bytes)
             .unwrap_or(0);
+        let wal_segment_count = wal_report
+            .as_ref()
+            .map(|report| report.segment_count)
+            .unwrap_or(0);
+        let oldest_retained_sequence = wal_report
+            .as_ref()
+            .and_then(|report| report.oldest_retained_sequence)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
 
         vec![
             ("engine_version".to_string(), metadata.version.to_string()),
@@ -137,8 +387,38 @@ impl Engine {
             ("key_count".to_string(), key_count.to_string()),
             ("wal_size_bytes".to_string(), wal_size.to_string()),
             (
+                "wal_segment_count".to_string(),
+                wal_segment_count.to_string(),
+            ),
+            (
+                "oldest_retained_sequence".to_string(),
+                oldest_retained_sequence,
+            ),
+            (
                 "wal_sync_policy".to_string(),
                 self.options.wal_sync.as_str().to_string(),
+            ),
+            (
+                "wal_entries_replayed_total".to_string(),
+                self.wal_entries_replayed_total.to_string(),
+            ),
+            (
+                "recovery_duration_ms".to_string(),
+                self.recovery_duration_ms.to_string(),
+            ),
+            (
+                "last_snapshot_duration_ms".to_string(),
+                self.last_snapshot_duration_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "none".to_string()),
+            ),
+            (
+                "wal_segment_size_bytes".to_string(),
+                self.options.wal_segment_size_bytes.to_string(),
+            ),
+            (
+                "wal_retain_segments".to_string(),
+                self.options.wal_retain_segments.to_string(),
             ),
             (
                 "storage_encryption".to_string(),
@@ -214,9 +494,10 @@ impl Engine {
         let entry = self.next_entry(operations);
         append(
             &entry,
-            &self.paths.wal_path,
+            &self.paths.wal_dir,
             self.options.wal_sync,
             self.options.keyring.as_ref(),
+            self.options.wal_segment_size_bytes,
         )?;
         self.state.apply_entry(&entry)?;
 
@@ -567,6 +848,9 @@ impl Engine {
             | Command::ShowGrantsForUser { .. }
             | Command::ShowGrantsForRole { .. }
             | Command::WhoAmI
+            | Command::MaintenanceOn
+            | Command::MaintenanceOff
+            | Command::MaintenanceStatus
             | Command::Multi
             | Command::Exec
             | Command::Discard
@@ -940,6 +1224,7 @@ impl StorageEngine for Engine {
     }
 
     fn snapshot(&mut self) -> Result<()> {
+        let snapshot_started_at = now_millis();
         self.state.purge_expired(self.now());
 
         if let Some(keyring) = self.options.keyring.as_mut() {
@@ -964,6 +1249,16 @@ impl StorageEngine for Engine {
             self.options.keyring.as_ref(),
         )?;
 
+        let _ = seal_active(&self.paths.wal_dir, self.options.keyring.as_ref())?;
+        let active_wal_start_sequence = sequence.saturating_add(1);
+        create_active_segment(&self.paths.wal_dir, active_wal_start_sequence)?;
+        let _ = prune_sealed_segments(&self.paths.wal_dir, self.options.wal_retain_segments)?;
+        let wal_report = inspect_wal(&self.paths.wal_dir).ok();
+        let oldest_retained_sequence = wal_report
+            .as_ref()
+            .and_then(|report| report.oldest_retained_sequence)
+            .unwrap_or(active_wal_start_sequence);
+
         let manifest = Manifest {
             storage_format_version: STORAGE_FORMAT_VERSION,
             engine_version: durable_state.metadata.version,
@@ -971,6 +1266,8 @@ impl StorageEngine for Engine {
             last_snapshot_at_ms: snapshot_started_at_ms,
             snapshot_size_bytes: serialized.len() as u64,
             snapshot_checksum: hash(&serialized),
+            active_wal_start_sequence,
+            oldest_retained_sequence,
         };
         save_manifest(
             &manifest,
@@ -978,8 +1275,8 @@ impl StorageEngine for Engine {
             &self.paths.manifest_tmp_path,
         )?;
 
-        truncate(&self.paths.wal_path)?;
         self.state = durable_state;
+        self.last_snapshot_duration_ms = Some(now_millis().saturating_sub(snapshot_started_at));
 
         Ok(())
     }
@@ -1066,6 +1363,33 @@ fn parse_logical_backup(dump: &str) -> Result<LogicalBackup> {
     Ok(backup)
 }
 
+fn build_storage_inspection(
+    snapshot: Option<&Vec<u8>>,
+    manifest: Option<&Manifest>,
+    wal_report: &crate::WalSegmentReport,
+) -> StorageInspection {
+    StorageInspection {
+        snapshot_present: snapshot.is_some(),
+        storage_format_version: manifest
+            .map(|value| value.storage_format_version)
+            .unwrap_or(STORAGE_FORMAT_VERSION),
+        snapshot_size_bytes: manifest
+            .map(|value| value.snapshot_size_bytes)
+            .unwrap_or_else(|| snapshot.map(|bytes| bytes.len() as u64).unwrap_or(0)),
+        last_snapshot_sequence: manifest
+            .map(|value| value.last_snapshot_sequence)
+            .unwrap_or(0),
+        last_snapshot_at_ms: manifest.map(|value| value.last_snapshot_at_ms),
+        wal_segment_count: wal_report.segment_count,
+        sealed_wal_segment_count: wal_report.sealed_segment_count,
+        active_wal_segment_count: wal_report.active_segment_count,
+        active_wal_start_sequence: wal_report.active_start_sequence,
+        oldest_retained_sequence: wal_report.oldest_retained_sequence,
+        newest_sequence: wal_report.newest_sequence,
+        wal_size_bytes: wal_report.total_size_bytes,
+    }
+}
+
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1116,7 +1440,7 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         let unique = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("veyra-engine-{name}-{unique}"));
+        let path = std::env::temp_dir().join(format!("vaylix-engine-{name}-{unique}"));
         let _ = std::fs::remove_dir_all(&path);
         path
     }
@@ -1148,6 +1472,7 @@ mod tests {
                 EngineOptions {
                     wal_sync: WalSyncPolicy::Flush,
                     keyring: Some(test_keyring("test-data-key")),
+                    ..EngineOptions::default()
                 },
             )
             .unwrap(),
@@ -1246,14 +1571,23 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_persists_state_and_flushes_wal() {
+    fn snapshot_persists_state_and_retains_segmented_wal_history() {
         let (mut engine, root) = engine();
 
         engine.set("name".to_string(), "alice".to_string()).unwrap();
         engine.snapshot().unwrap();
 
-        let wal_len = fs::metadata(root.join("wal.log")).unwrap().len();
-        assert_eq!(wal_len, 0);
+        let wal_dir = root.join("wal");
+        assert!(wal_dir.exists());
+        assert!(
+            fs::read_dir(&wal_dir)
+                .unwrap()
+                .filter_map(|entry| entry.ok())
+                .any(
+                    |entry| entry.path().extension().and_then(|value| value.to_str())
+                        == Some("wal")
+                )
+        );
         assert!(root.join("snapshot.bin").exists());
         assert!(root.join("manifest.bin").exists());
 
@@ -1263,6 +1597,7 @@ mod tests {
             EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
             },
         )
         .unwrap();
@@ -1280,6 +1615,7 @@ mod tests {
             EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("source-key")),
+                ..EngineOptions::default()
             },
         )
         .unwrap();
@@ -1296,6 +1632,7 @@ mod tests {
             EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("restore-key")),
+                ..EngineOptions::default()
             },
         )
         .unwrap();
@@ -1325,6 +1662,7 @@ mod tests {
             EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("wrong-data-key")),
+                ..EngineOptions::default()
             },
         );
 
@@ -1345,6 +1683,8 @@ mod tests {
                 last_snapshot_at_ms: now_ms(),
                 snapshot_size_bytes: 0,
                 snapshot_checksum: 0,
+                active_wal_start_sequence: 1,
+                oldest_retained_sequence: 1,
             },
             &paths.manifest_path,
             &paths.manifest_tmp_path,
@@ -1356,6 +1696,7 @@ mod tests {
             EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
             },
         );
 

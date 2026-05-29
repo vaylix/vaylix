@@ -226,6 +226,10 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "discard",
     },
     CommandInfo {
+        name: "maintenance",
+        usage: "maintenance <on|off|status>",
+    },
+    CommandInfo {
         name: "help",
         usage: "help",
     },
@@ -390,6 +394,9 @@ pub enum Command {
     Multi,
     Exec,
     Discard,
+    MaintenanceOn,
+    MaintenanceOff,
+    MaintenanceStatus,
     Help,
     Exit,
     Snapshot,

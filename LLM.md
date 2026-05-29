@@ -14,7 +14,8 @@ The current implementation is a single-node, string-to-string key/value database
 - a Tokio multi-client server
 - authenticated client connections with in-server RBAC
 - optional TLS and mTLS client/server transport
-- encrypted-at-rest WAL and snapshots
+- segmented encrypted-at-rest WAL and encrypted snapshots
+- offline PITR-oriented storage inspection, migration, verification, and restore subcommands
 - append-only audit logging
 - default-on negotiated outbound frame-level zstd compression
 - deterministic command parsing and explicit error codes
@@ -33,9 +34,9 @@ The long-term target is broader:
 - `crates/transport`
   - frame layout, opcodes, request/response types, codec, sync/async framed I/O
 - `crates/engine`
-  - in-memory state, expirations, WAL, snapshots, manifest, recovery, storage encryption, key rotation
+  - in-memory state, expirations, segmented WAL, snapshots, manifest, recovery, storage encryption, key rotation
 - `crates/server`
-  - Tokio listener, authentication, RBAC, TLS accept, session handling, quotas, rate limiting, engine worker runtime
+  - Tokio listener, authentication, RBAC, TLS accept, session handling, quotas, rate limiting, maintenance mode, engine worker runtime
 - `crates/client`
   - REPL, URL parsing, TLS client connection, output rendering
 
@@ -58,6 +59,7 @@ The long-term target is broader:
   - clear/save/snapshot
   - backup/restore
   - backup-to-file/backup-verify/restore-from-file/restore-check
+  - maintenance on/off/status
   - create/drop user and role
   - alter user password
   - grant/revoke role and permission
@@ -71,6 +73,8 @@ Current state:
 - command execution within the engine is serialized through a dedicated engine worker
 - session transactions are queued with `MULTI` / `EXEC` / `DISCARD`
 - `EXEC` commits as one atomic WAL-backed batch on a single node
+- transactions are bounded by a server-side lifetime limit and are discarded on timeout
+- sequence-tagged or pipelined requests are rejected while a transaction is active on a connection
 
 Not yet true:
 - MVCC
@@ -150,6 +154,11 @@ When `--ssl` is enabled on the server, both `--tls-cert` and `--tls-key` are req
 
 When `--tls-client-ca` is provided, the server requires clients to present a certificate chaining to that CA. mTLS is additive to username/password authentication; it should not be described as replacing application-level auth.
 
+Operational hardening:
+- TLS startup fails if the certificate is already expired or the certificate/key pair cannot be loaded together.
+- TLS metadata such as certificate expiry and last reload timestamps is surfaced in `INFO`.
+- On Unix, the server reloads the configured TLS certificate, key, and client CA on `SIGHUP`. Reload failures keep the previous live TLS config.
+
 ## Authentication and RBAC
 
 Authentication is enabled by default.
@@ -160,6 +169,14 @@ Development defaults:
 
 These defaults exist for local development only. Production deployments should always override them.
 Use `--disable-auth` only for local/trusted testing. When auth is disabled on the server, commands execute without an `AUTH` handshake and RBAC checks are bypassed.
+
+Password policy and auth throttling:
+- `CREATE USER` and `ALTER USER PASSWORD` require at least 12 characters with at least one ASCII letter and one ASCII digit.
+- The bootstrap default credentials remain accepted only for initial development bootstrap compatibility.
+- The server enforces auth failure windows and temporary lockouts per `(username, peer)` tuple using:
+  - `--auth-failure-window-seconds`
+  - `--auth-failure-limit`
+  - `--auth-lockout-seconds`
 
 RBAC is implemented inside the existing server binary and transport protocol. There is no separate admin binary. On first startup, the configured `--user` / `--password` account is bootstrapped as an admin user. Once `<data-dir>/auth.bin` exists, users and roles are loaded from encrypted RBAC metadata instead of being recreated from CLI defaults.
 
@@ -221,28 +238,40 @@ CLI flags override URL-derived values when both are provided.
 
 Durability model:
 - encrypted snapshot
-- WAL replay on startup
+- segmented WAL replay on startup
 - manifest metadata for snapshot state
-- storage format version `2`
+- storage format version `3`
 - MessagePack-based engine serialization inside encrypted snapshot, WAL, manifest, and keyring files
 
 Snapshot flow:
 1. purge expired keys
 2. optionally rotate the active storage key if rotation is due
-3. serialize state
-4. encrypt the snapshot payload
-5. write temp file
-6. fsync temp file
-7. atomic rename
-8. write manifest
-9. fsync manifest
-10. truncate WAL
+3. seal the active WAL segment
+4. serialize state
+5. encrypt the snapshot payload
+6. write temp file
+7. fsync temp file
+8. atomic rename
+9. write manifest
+10. fsync manifest
+11. open a new active WAL segment
+12. prune sealed segments older than retention
 
 Recovery flow:
 1. load or create the storage keyring
 2. load and verify manifest
 3. decrypt and deserialize snapshot
-4. replay and verify WAL entries
+4. replay and verify retained WAL segments in order
+
+WAL management:
+- WAL lives under `<data-dir>/wal/`
+- active segment name: `active-<start_sequence>.wal`
+- sealed segment name: `<start_sequence>-<end_sequence>.wal`
+- runtime controls:
+  - `--wal-segment-size-bytes`
+  - `--wal-retain-segments`
+
+Legacy `wal.log` from the pre-segmented layout is no longer accepted on normal startup. Operators must migrate legacy storage explicitly with the server binary subcommands described below.
 
 ### Logical Backup and Restore
 
@@ -267,6 +296,19 @@ When `BACKUP TO <path>` writes a server-side dump, the server also writes `<path
 Backup directory:
 - server arg/env: `--backup-dir` / `VAYLIX_BACKUP_DIR`
 - default: `<data-dir>/backups`
+
+### Offline Storage and PITR Operations
+
+The existing `vaylix` server binary also provides offline subcommands for storage maintenance:
+- `vaylix storage migrate --data-dir <dir>`
+- `vaylix storage verify --data-dir <dir>`
+- `vaylix pitr inspect --data-dir <dir>`
+- `vaylix pitr restore --source-dir <dir> --target-dir <dir> (--to-sequence <u64> | --to-timestamp-ms <u64>)`
+
+Current PITR scope:
+- offline-first only
+- restore writes a new target data directory and does not mutate the source directory in place
+- restore replays the latest valid snapshot plus retained WAL segments up to the requested sequence or timestamp
 
 ### Storage Encryption
 
@@ -346,6 +388,8 @@ Current runtime protections:
 - key/value size limits
 - key-count limits for batch commands
 - transaction queue length limits
+- transaction lifetime limits
+- authentication failure lockouts
 - idle connection timeouts
 
 ## Server Runtime
@@ -356,9 +400,24 @@ Current runtime protections:
 - protocol startup negotiation is required before command execution
 - optional background snapshotter
 - optional background expiration sweeper
+- persisted maintenance mode with read-only admin behavior
 - plaintext TCP by default
 - TLS accept path when `--ssl` is enabled
+- Unix `SIGHUP` TLS reload support
 - auth and compression enabled by default with explicit disable flags
+
+### Maintenance Mode
+
+Protocol admin commands:
+- `maintenance on`
+- `maintenance off`
+- `maintenance status`
+
+Maintenance mode is persisted with a sentinel file under the data directory so it survives restart.
+
+Current behavior:
+- allowed: reads, `INFO`, `METRICS`, `METRICS PROM`, backup verification flows, `SHOW *`, `WHOAMI`, and `maintenance status`
+- rejected: mutating writes, `MULTI` / `EXEC`, restore flows, and auth/RBAC mutation commands
 
 ## Structured INFO
 
@@ -374,6 +433,7 @@ Current runtime protections:
 Examples include `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.requests_total`.
 
 Runtime/security examples also include quota and operational settings such as `runtime.max_key_bytes`, `runtime.max_value_bytes`, `runtime.max_keys_per_batch`, `runtime.max_transaction_queue_len`, `runtime.requests_per_second`, `runtime.request_burst`, `runtime.backup_dir`, `runtime.slow_command_threshold_ms`, `security.auth_enabled`, `security.rbac_enabled`, `security.mtls_enabled`, and `transport.compression_mode`.
+They also include operational hardening fields such as `runtime.transaction_max_seconds`, `runtime.auth_failure_window_seconds`, `runtime.auth_failure_limit`, `runtime.auth_lockout_seconds`, `runtime.wal_segment_size_bytes`, `runtime.wal_retain_segments`, `runtime.maintenance_mode`, `security.cert_not_after_ms`, `security.cert_days_remaining`, `security.last_tls_reload_success_at_ms`, and `security.last_tls_reload_failure_at_ms`.
 
 `METRICS` returns deterministic key/value metric entries. `METRICS PROM` returns Prometheus text exposition format over the database protocol; there is intentionally no separate HTTP listener in this pass.
 
@@ -399,7 +459,7 @@ The local `help` command is formatted as a readable command reference with usage
 
 This path is the durable storage root for:
 - snapshots
-- WAL
+- WAL segments
 - manifest
 - storage keyring
 - encrypted auth/RBAC metadata
@@ -424,7 +484,8 @@ Release workflow goal:
 
 - full distributed ACID semantics are not implemented
 - no replication or sharding yet
-- backup/restore is command-level logical JSON only; there is no separate streaming backup utility yet
+- PITR is offline-first and there is no online WAL archive/PITR workflow yet
+- backup/restore remains logical JSON based; there is no separate streaming backup utility yet
 - no TLS certificate automation or rotation workflow yet
 - TLS is opt-in rather than mandatory
 

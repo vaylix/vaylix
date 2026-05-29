@@ -265,7 +265,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let suffix = TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("veyra-audit-{unique}-{suffix}.log"))
+        std::env::temp_dir().join(format!("vaylix-audit-{unique}-{suffix}.log"))
     }
 
     fn event(opcode: &str) -> AuditEvent {

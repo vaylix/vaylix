@@ -18,8 +18,10 @@ pub struct Paths {
     pub manifest_path: PathBuf,
     /// Temporary manifest path used for atomic renames.
     pub manifest_tmp_path: PathBuf,
-    /// Write-ahead log path.
+    /// Legacy monolithic write-ahead log path used by storage format v2.
     pub wal_path: PathBuf,
+    /// Segmented write-ahead log directory used by storage format v3.
+    pub wal_dir: PathBuf,
     /// Storage keyring path used for server-managed encryption keys.
     pub keyring_path: PathBuf,
     /// Temporary keyring path used for atomic updates.
@@ -28,12 +30,14 @@ pub struct Paths {
     pub auth_path: PathBuf,
     /// Temporary authentication metadata path used for atomic updates.
     pub auth_tmp_path: PathBuf,
+    /// Maintenance mode sentinel file.
+    pub maintenance_path: PathBuf,
 }
 
 impl Paths {
     /// Builds the default project paths from the operating system data directory.
     pub fn new() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "veyra", "veyra")
+        let dirs = ProjectDirs::from("dev", "vaylix", "vaylix")
             .ok_or(EngineError::ProjectDirsUnavailable)?;
         Self::from_data_dir(dirs.data_dir())
     }
@@ -50,10 +54,12 @@ impl Paths {
             manifest_path: data_dir.join("manifest.bin"),
             manifest_tmp_path: data_dir.join("manifest.bin.tmp"),
             wal_path: data_dir.join("wal.log"),
+            wal_dir: data_dir.join("wal"),
             keyring_path: data_dir.join("keyring.bin"),
             keyring_tmp_path: data_dir.join("keyring.bin.tmp"),
             auth_path: data_dir.join("auth.bin"),
             auth_tmp_path: data_dir.join("auth.bin.tmp"),
+            maintenance_path: data_dir.join("maintenance.mode"),
             data_dir,
         })
     }
@@ -70,7 +76,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("veyra-paths-{unique}"));
+        let root = std::env::temp_dir().join(format!("vaylix-paths-{unique}"));
         let paths = Paths::from_data_dir(&root).unwrap();
 
         assert_eq!(paths.data_dir, root);
@@ -79,9 +85,11 @@ mod tests {
         assert!(paths.manifest_path.ends_with("manifest.bin"));
         assert!(paths.manifest_tmp_path.ends_with("manifest.bin.tmp"));
         assert!(paths.wal_path.ends_with("wal.log"));
+        assert!(paths.wal_dir.ends_with("wal"));
         assert!(paths.keyring_path.ends_with("keyring.bin"));
         assert!(paths.keyring_tmp_path.ends_with("keyring.bin.tmp"));
         assert!(paths.auth_path.ends_with("auth.bin"));
         assert!(paths.auth_tmp_path.ends_with("auth.bin.tmp"));
+        assert!(paths.maintenance_path.ends_with("maintenance.mode"));
     }
 }

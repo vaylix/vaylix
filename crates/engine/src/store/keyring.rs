@@ -80,7 +80,7 @@ fn from_runtime(keyring: &StorageKeyring) -> StoredKeyring {
     }
 }
 
-fn save(keyring: &StorageKeyring, path: &Path, temp_path: &Path) -> Result<()> {
+pub fn save(keyring: &StorageKeyring, path: &Path, temp_path: &Path) -> Result<()> {
     let bytes = binary::encode(&from_runtime(keyring))
         .map_err(|err| EngineError::ManifestSerialize(err.to_string()))?;
     let mut file = File::create(temp_path)?;
@@ -91,7 +91,7 @@ fn save(keyring: &StorageKeyring, path: &Path, temp_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn load(path: &Path) -> Result<Option<StorageKeyring>> {
+pub fn load(path: &Path) -> Result<Option<StorageKeyring>> {
     match fs::read(path) {
         Ok(bytes) => {
             let stored: StoredKeyring = binary::decode(&bytes)
@@ -149,7 +149,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("veyra-keyring-{name}-{unique}.bin"))
+        std::env::temp_dir().join(format!("vaylix-keyring-{name}-{unique}.bin"))
     }
 
     #[test]

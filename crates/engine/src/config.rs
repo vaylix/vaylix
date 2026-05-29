@@ -21,6 +21,9 @@ impl WalSyncPolicy {
     }
 }
 
+pub const DEFAULT_WAL_SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+pub const DEFAULT_WAL_RETAIN_SEGMENTS: usize = 128;
+
 use uuid::Uuid;
 
 /// A single durable storage-encryption key managed by the server.
@@ -53,10 +56,25 @@ impl StorageKeyring {
 }
 
 /// Engine configuration used when opening the database.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EngineOptions {
     /// WAL durability mode.
     pub wal_sync: WalSyncPolicy,
     /// Server-managed storage keyring used for WAL and snapshot encryption.
     pub keyring: Option<StorageKeyring>,
+    /// Maximum size of one WAL segment before rotating to the next segment.
+    pub wal_segment_size_bytes: u64,
+    /// Maximum number of sealed WAL segments retained after snapshot pruning.
+    pub wal_retain_segments: usize,
+}
+
+impl Default for EngineOptions {
+    fn default() -> Self {
+        Self {
+            wal_sync: WalSyncPolicy::default(),
+            keyring: None,
+            wal_segment_size_bytes: DEFAULT_WAL_SEGMENT_SIZE_BYTES,
+            wal_retain_segments: DEFAULT_WAL_RETAIN_SEGMENTS,
+        }
+    }
 }

@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::auth::{DEFAULT_PASSWORD, DEFAULT_USERNAME};
@@ -18,6 +18,9 @@ pub enum WalSyncMode {
 #[derive(Parser, Debug)]
 #[command(name = "vaylix", about = "Vaylix database server")]
 pub struct Args {
+    #[command(subcommand)]
+    pub command: Option<AdminCommand>,
+
     /// Address to bind to
     #[arg(long, env = "VAYLIX_BIND", default_value = "127.0.0.1")]
     pub bind: String,
@@ -133,11 +136,87 @@ pub struct Args {
     /// Record slow-command audit events at or above this latency in milliseconds. Use 0 to disable.
     #[arg(long, env = "VAYLIX_SLOW_COMMAND_THRESHOLD_MS", default_value_t = 100)]
     pub slow_command_threshold_ms: u64,
+
+    /// Maximum size of one WAL segment before rotation.
+    #[arg(long, env = "VAYLIX_WAL_SEGMENT_SIZE_BYTES", default_value_t = engine::DEFAULT_WAL_SEGMENT_SIZE_BYTES)]
+    pub wal_segment_size_bytes: u64,
+
+    /// Maximum number of sealed WAL segments retained after snapshot pruning.
+    #[arg(long, env = "VAYLIX_WAL_RETAIN_SEGMENTS", default_value_t = engine::DEFAULT_WAL_RETAIN_SEGMENTS)]
+    pub wal_retain_segments: usize,
+
+    /// Maximum time a transaction may remain open before automatic discard.
+    #[arg(long, env = "VAYLIX_TRANSACTION_MAX_SECONDS", default_value_t = 30)]
+    pub transaction_max_seconds: u64,
+
+    /// Rolling authentication failure window in seconds.
+    #[arg(
+        long,
+        env = "VAYLIX_AUTH_FAILURE_WINDOW_SECONDS",
+        default_value_t = 300
+    )]
+    pub auth_failure_window_seconds: u64,
+
+    /// Maximum failed authentication attempts allowed in one failure window before lockout.
+    #[arg(long, env = "VAYLIX_AUTH_FAILURE_LIMIT", default_value_t = 5)]
+    pub auth_failure_limit: u32,
+
+    /// Lockout duration in seconds after exceeding the auth failure limit.
+    #[arg(long, env = "VAYLIX_AUTH_LOCKOUT_SECONDS", default_value_t = 900)]
+    pub auth_lockout_seconds: u64,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AdminCommand {
+    Storage(StorageCommand),
+    Pitr(PitrCommand),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct StorageCommand {
+    #[command(subcommand)]
+    pub action: StorageAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum StorageAction {
+    Migrate {
+        #[arg(long, env = "VAYLIX_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+    Verify {
+        #[arg(long, env = "VAYLIX_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PitrCommand {
+    #[command(subcommand)]
+    pub action: PitrAction,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PitrAction {
+    Inspect {
+        #[arg(long, env = "VAYLIX_DATA_DIR")]
+        data_dir: PathBuf,
+    },
+    Restore {
+        #[arg(long)]
+        source_dir: PathBuf,
+        #[arg(long)]
+        target_dir: PathBuf,
+        #[arg(long, conflicts_with = "to_timestamp_ms")]
+        to_sequence: Option<u64>,
+        #[arg(long, conflicts_with = "to_sequence")]
+        to_timestamp_ms: Option<u64>,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Args;
+    use super::{AdminCommand, Args, PitrAction, StorageAction};
     use clap::Parser;
 
     #[test]
@@ -160,5 +239,34 @@ mod tests {
             parsed.tls_client_ca.as_deref(),
             Some(std::path::Path::new("/tmp/ca.crt"))
         );
+    }
+
+    #[test]
+    fn parses_storage_and_pitr_subcommands() {
+        let parsed =
+            Args::try_parse_from(["vaylix", "storage", "verify", "--data-dir", "/tmp/db"]).unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(AdminCommand::Storage(command))
+                if matches!(command.action, StorageAction::Verify { .. })
+        ));
+
+        let parsed = Args::try_parse_from([
+            "vaylix",
+            "pitr",
+            "restore",
+            "--source-dir",
+            "/tmp/source",
+            "--target-dir",
+            "/tmp/target",
+            "--to-sequence",
+            "42",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(AdminCommand::Pitr(command))
+                if matches!(command.action, PitrAction::Restore { to_sequence: Some(42), .. })
+        ));
     }
 }

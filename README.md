@@ -6,7 +6,7 @@ Vaylix is a Rust key/value database built around a strict transport boundary:
 client -> transport -> TCP/TLS -> transport -> server -> engine
 ```
 
-The current server is single-node and stores `String -> String` data with WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, and hash-chained audit logging.
+The current server is single-node and stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, and hash-chained audit logging.
 
 Detailed architecture context lives in [LLM.md](LLM.md).
 
@@ -80,6 +80,18 @@ cargo build --release -p server
 cargo build --release -p client
 ```
 
+Offline storage and PITR operations:
+
+```bash
+vaylix storage verify --data-dir /var/lib/vaylix
+vaylix storage migrate --data-dir /var/lib/vaylix
+vaylix pitr inspect --data-dir /var/lib/vaylix
+vaylix pitr restore \
+  --source-dir /var/lib/vaylix \
+  --target-dir /tmp/vaylix-restore \
+  --to-sequence 1234
+```
+
 Quality gates:
 
 ```bash
@@ -95,6 +107,9 @@ cargo audit
 - Development credentials default to `vaylix / vaylix`; production deployments should override them.
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
+- TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.
 - Backups created with `BACKUP TO <path>` are sandboxed under `--backup-dir` / `VAYLIX_BACKUP_DIR`, defaulting to `<data-dir>/backups`.
+- WAL is segmented under `<data-dir>/wal`, snapshots no longer discard all retained WAL history, and PITR restore is currently an offline operation that writes a new target data directory.
+- `maintenance on` switches the node into persisted read-only admin mode until `maintenance off`.
 - Audit JSONL records are SHA-256 hash chained and verified on startup. This is tamper-evident logging, not non-repudiation without external anchoring.
 - Vaylix is not distributed yet. Replication, sharding, MVCC, and distributed ACID semantics remain roadmap items.

@@ -8,7 +8,7 @@ use std::path::Path;
 use super::binary;
 
 /// Current durable storage serialization format.
-pub const STORAGE_FORMAT_VERSION: u32 = 2;
+pub const STORAGE_FORMAT_VERSION: u32 = 3;
 
 /// Metadata persisted alongside snapshots to describe the durable baseline.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -25,6 +25,10 @@ pub struct Manifest {
     pub snapshot_size_bytes: u64,
     /// CRC32 checksum of the durable snapshot payload.
     pub snapshot_checksum: u32,
+    /// Starting sequence of the next active WAL segment.
+    pub active_wal_start_sequence: u64,
+    /// Oldest retained WAL sequence still available for PITR.
+    pub oldest_retained_sequence: u64,
 }
 
 /// Saves a manifest atomically using a temporary file and rename.
@@ -64,7 +68,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("veyra-{name}-{unique}.bin"))
+        std::env::temp_dir().join(format!("vaylix-{name}-{unique}.bin"))
     }
 
     #[test]
@@ -78,6 +82,8 @@ mod tests {
             last_snapshot_at_ms: 999,
             snapshot_size_bytes: 123,
             snapshot_checksum: 991,
+            active_wal_start_sequence: 45,
+            oldest_retained_sequence: 12,
         };
 
         save(&manifest, &path, &temp_path).unwrap();

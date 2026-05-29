@@ -63,6 +63,7 @@ impl Parser {
             "multi" => Self::parse_no_args(&tokens, Command::Multi, "multi"),
             "exec" => Self::parse_no_args(&tokens, Command::Exec, "exec"),
             "discard" => Self::parse_no_args(&tokens, Command::Discard, "discard"),
+            "maintenance" => Self::parse_maintenance(&tokens),
             unknown => Err(CommandError::UnknownCommand {
                 command: unknown.to_string(),
             }),
@@ -481,6 +482,18 @@ impl Parser {
             }
             _ => Err(CommandError::InvalidArity {
                 usage: "restore <logical-dump-json> | restore from <path> | restore check <logical-dump-json> | restore check from <path>".to_string(),
+            }),
+        }
+    }
+
+    fn parse_maintenance(tokens: &[Token]) -> Result<Command> {
+        Self::expect_len(tokens, 2, "maintenance <on|off|status>")?;
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "on" => Ok(Command::MaintenanceOn),
+            "off" => Ok(Command::MaintenanceOff),
+            "status" => Ok(Command::MaintenanceStatus),
+            _ => Err(CommandError::InvalidArity {
+                usage: "maintenance <on|off|status>".to_string(),
             }),
         }
     }

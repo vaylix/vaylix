@@ -8,6 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Segmented WAL storage with manifest format `3`, active/sealed segment naming, and retention controls.
+- Offline storage subcommands: `storage migrate`, `storage verify`, `pitr inspect`, and offline `pitr restore`.
+- Maintenance mode with `maintenance on`, `maintenance off`, and `maintenance status`.
+- Auth password policy enforcement for user creation and password rotation.
+- Auth failure window and temporary lockout controls.
+- TLS operational metadata, startup expiry validation, and Unix `SIGHUP` reload support.
+- Runtime and `INFO` coverage for WAL segments, recovery duration, snapshot duration, lockouts, maintenance mode, and TLS reload state.
+- Transaction lifetime enforcement and rejection of sequence-tagged requests during active transactions.
 - Breaking transport protocol v2 using `VTP2` magic and protocol version `2`.
 - Required startup capability negotiation before command frames.
 - Negotiated capabilities for zstd compression, request deadlines, server metrics, pipelining, and trace context.
@@ -39,6 +47,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- Snapshots now seal the active WAL segment, rotate to a new active segment, and prune retained segments instead of truncating the entire WAL history.
 - Shortened the README into an OSS-style usage entry point with detailed architecture kept in `LLM.md`.
 
 ## [0.1.0] - 2026-05-27

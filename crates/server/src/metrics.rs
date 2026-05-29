@@ -9,13 +9,17 @@ pub struct Metrics {
     pub requests_total: AtomicU64,
     pub auth_successes: AtomicU64,
     pub auth_failures: AtomicU64,
+    pub locked_auth_attempts_total: AtomicU64,
     pub transactions_started: AtomicU64,
     pub transactions_committed: AtomicU64,
     pub transactions_discarded: AtomicU64,
+    pub transactions_timed_out: AtomicU64,
     pub idle_disconnects: AtomicU64,
     pub snapshots_completed: AtomicU64,
     pub expiration_sweeps: AtomicU64,
     pub expired_keys_removed: AtomicU64,
+    pub slow_commands_total: AtomicU64,
+    pub wal_entries_replayed_total: AtomicU64,
 }
 
 impl Metrics {
@@ -44,6 +48,10 @@ impl Metrics {
             ),
             ("auth_failures", self.auth_failures.load(Ordering::Relaxed)),
             (
+                "locked_auth_attempts_total",
+                self.locked_auth_attempts_total.load(Ordering::Relaxed),
+            ),
+            (
                 "transactions_started",
                 self.transactions_started.load(Ordering::Relaxed),
             ),
@@ -54,6 +62,10 @@ impl Metrics {
             (
                 "transactions_discarded",
                 self.transactions_discarded.load(Ordering::Relaxed),
+            ),
+            (
+                "transactions_timed_out",
+                self.transactions_timed_out.load(Ordering::Relaxed),
             ),
             (
                 "idle_disconnects",
@@ -70,6 +82,14 @@ impl Metrics {
             (
                 "expired_keys_removed",
                 self.expired_keys_removed.load(Ordering::Relaxed),
+            ),
+            (
+                "slow_commands_total",
+                self.slow_commands_total.load(Ordering::Relaxed),
+            ),
+            (
+                "wal_entries_replayed_total",
+                self.wal_entries_replayed_total.load(Ordering::Relaxed),
             ),
         ]
         .into_iter()

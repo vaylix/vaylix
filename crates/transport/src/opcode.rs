@@ -58,6 +58,9 @@ pub enum Opcode {
     ShowGrants = 0x34,
     ShowGrantsForUser = 0x35,
     ShowGrantsForRole = 0x36,
+    MaintenanceOn = 0x37,
+    MaintenanceOff = 0x38,
+    MaintenanceStatus = 0x39,
 }
 
 impl From<Opcode> for u8 {
@@ -125,6 +128,9 @@ impl TryFrom<u8> for Opcode {
             0x34 => Ok(Self::ShowGrants),
             0x35 => Ok(Self::ShowGrantsForUser),
             0x36 => Ok(Self::ShowGrantsForRole),
+            0x37 => Ok(Self::MaintenanceOn),
+            0x38 => Ok(Self::MaintenanceOff),
+            0x39 => Ok(Self::MaintenanceStatus),
             other => Err(TransportError::UnknownOpcode(other)),
         }
     }
@@ -192,6 +198,9 @@ mod tests {
             (0x34, Opcode::ShowGrants),
             (0x35, Opcode::ShowGrantsForUser),
             (0x36, Opcode::ShowGrantsForRole),
+            (0x37, Opcode::MaintenanceOn),
+            (0x38, Opcode::MaintenanceOff),
+            (0x39, Opcode::MaintenanceStatus),
         ];
 
         for (byte, opcode) in mappings {

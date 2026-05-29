@@ -333,18 +333,6 @@ fn help_text() -> String {
             usage_width = usage_width
         ));
     }
-    lines.extend([
-        "".to_string(),
-        "Examples:".to_string(),
-        "  set user:1 alice ex 60".to_string(),
-        "  get user:1".to_string(),
-        "  scan 0 match user:* count 20".to_string(),
-        "  backup".to_string(),
-        "  backup to nightly.json".to_string(),
-        "  restore check from nightly.json".to_string(),
-        r#"  restore "{\"version\":1,\"created_at_ms\":0,\"source_engine_version\":2,\"source_sequence\":0,\"entries\":[]}""#.to_string(),
-        "  info".to_string(),
-    ]);
 
     lines.join("\n")
 }
@@ -397,6 +385,8 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::GrantPermission { .. }
             | Command::RevokePermission { .. }
             | Command::Multi
+            | Command::MaintenanceOn
+            | Command::MaintenanceOff
             | Command::Discard => Ok("OK".to_string()),
             Command::Exec => Ok(response
                 .decode_strings()?
@@ -446,7 +436,8 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::ShowGrants
             | Command::ShowGrantsForUser { .. }
             | Command::ShowGrantsForRole { .. }
-            | Command::WhoAmI => {
+            | Command::WhoAmI
+            | Command::MaintenanceStatus => {
                 let entries = response.decode_entries()?;
                 render_entries(&entries, output)
             }

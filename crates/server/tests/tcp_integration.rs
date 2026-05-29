@@ -35,7 +35,7 @@ fn temp_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("veyra-server-test-{name}-{unique}"))
+    std::env::temp_dir().join(format!("vaylix-server-test-{name}-{unique}"))
 }
 
 fn id(value: u128) -> Uuid {
@@ -238,6 +238,8 @@ fn runtime_with_tls(
     tls_config: Option<Arc<rustls::ServerConfig>>,
 ) -> ServerRuntimeConfig {
     let audit_path = temp_dir("audit").join("audit.log");
+    let backup_dir = temp_dir("tcp-backups");
+    let maintenance_path = temp_dir("tcp-maintenance").join("maintenance.mode");
     ServerRuntimeConfig {
         snapshot_interval,
         expiration_sweep_interval: None,
@@ -252,12 +254,26 @@ fn runtime_with_tls(
             requests_per_second: 200,
             request_burst: 400,
         },
-        tls_config,
+        tls_state: tls_config.map(server::tls::TlsState::from_server_config),
         transport: CodecOptions::default(),
-        backup_dir: temp_dir("tcp-backups"),
+        backup_dir,
         mtls_enabled: false,
         slow_command_threshold: Some(Duration::from_millis(100)),
         audit_logger: std::sync::Arc::new(AuditLogger::open(&audit_path).unwrap()),
+        wal_segment_size_bytes: engine::DEFAULT_WAL_SEGMENT_SIZE_BYTES,
+        wal_retain_segments: engine::DEFAULT_WAL_RETAIN_SEGMENTS,
+        auth_failure_window: Duration::from_secs(300),
+        auth_failure_limit: 5,
+        auth_lockout: Duration::from_secs(900),
+        transaction_max_duration: Duration::from_secs(30),
+        maintenance: std::sync::Arc::new(
+            server::server::MaintenanceMode::load(maintenance_path).unwrap(),
+        ),
+        auth_lockouts: std::sync::Arc::new(tokio::sync::Mutex::new(
+            server::server::AuthLockoutState::default(),
+        )),
+        insecure_auth_disabled: false,
+        insecure_default_credentials: true,
     }
 }
 
@@ -270,6 +286,7 @@ async fn rejects_unauthenticated_requests() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -308,6 +325,7 @@ async fn rejects_old_v1_protocol_frames_before_handshake() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -354,6 +372,7 @@ async fn negotiates_compression_none_when_client_requests_it() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -411,6 +430,7 @@ async fn rejects_expired_request_deadline_metadata() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -452,6 +472,7 @@ async fn allows_unauthenticated_requests_when_auth_is_disabled() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -489,6 +510,7 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -677,6 +699,7 @@ async fn enforces_rbac_over_tcp() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -695,7 +718,7 @@ async fn enforces_rbac_over_tcp() {
             id(41),
             Command::CreateUser {
                 username: "alice".to_string(),
-                password: "pw".to_string(),
+                password: "password1234".to_string(),
             },
         ),
         (
@@ -730,7 +753,7 @@ async fn enforces_rbac_over_tcp() {
         id(45),
         Command::Auth {
             username: "alice".to_string(),
-            password: "pw".to_string(),
+            password: "password1234".to_string(),
         },
     )
     .unwrap();
@@ -800,7 +823,7 @@ async fn enforces_rbac_over_tcp() {
         id(48),
         Command::AlterUserPassword {
             username: "alice".to_string(),
-            password: "new-pw".to_string(),
+            password: "newpassword1234".to_string(),
         },
     )
     .unwrap();
@@ -846,7 +869,7 @@ async fn enforces_rbac_over_tcp() {
         id(50),
         Command::Auth {
             username: "alice".to_string(),
-            password: "pw".to_string(),
+            password: "password1234".to_string(),
         },
     )
     .unwrap();
@@ -863,7 +886,7 @@ async fn enforces_rbac_over_tcp() {
         id(51),
         Command::Auth {
             username: "alice".to_string(),
-            password: "new-pw".to_string(),
+            password: "newpassword1234".to_string(),
         },
     )
     .unwrap();
@@ -888,6 +911,7 @@ async fn preserves_request_ids_for_pipelined_commands() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -954,6 +978,7 @@ async fn rejects_sequence_marked_requests_inside_transactions() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1006,6 +1031,7 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1080,6 +1106,7 @@ async fn accepts_tls_connections_when_enabled() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1129,6 +1156,7 @@ async fn accepts_mutual_tls_connections_with_valid_client_certificate() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1170,6 +1198,7 @@ async fn rejects_tls_clients_without_certificate_when_mutual_tls_is_required() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1224,6 +1253,7 @@ async fn rejects_plain_tcp_frames_when_tls_is_required() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1276,6 +1306,7 @@ async fn enforces_rate_limits_over_the_network() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
@@ -1318,6 +1349,7 @@ async fn handles_concurrent_clients_against_serialized_engine() {
         EngineOptions {
             wal_sync: WalSyncPolicy::Flush,
             keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
         },
     )
     .unwrap();
