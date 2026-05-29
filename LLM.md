@@ -20,7 +20,7 @@ The current implementation is a single-node, string-to-string key/value database
 - append-only audit logging
 - default-on negotiated outbound frame-level zstd compression
 - deterministic command parsing and explicit error codes
-- protocol-level Prometheus metrics export through `METRICS PROM`
+- protocol-level OTel-aligned metrics with Prometheus text export through `METRICS PROM`
 
 The long-term target is broader:
 
@@ -490,12 +490,14 @@ Current behavior:
 - `runtime.*`
 - `metrics.*`
 
-Examples include `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.requests_total`.
+Examples include `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.vaylix.server.request.count`.
 
 Runtime/security examples also include quota and operational settings such as `runtime.max_key_bytes`, `runtime.max_value_bytes`, `runtime.max_keys_per_batch`, `runtime.max_transaction_queue_len`, `runtime.requests_per_second`, `runtime.request_burst`, `runtime.backup_dir`, `runtime.slow_command_threshold_ms`, `security.auth_enabled`, `security.rbac_enabled`, `security.mtls_enabled`, and `transport.compression_mode`.
 They also include operational hardening fields such as `runtime.transaction_max_seconds`, `runtime.auth_failure_window_seconds`, `runtime.auth_failure_limit`, `runtime.auth_lockout_seconds`, `runtime.wal_segment_size_bytes`, `runtime.wal_retain_segments`, `runtime.maintenance_mode`, `security.cert_not_after_ms`, `security.cert_days_remaining`, `security.last_tls_reload_success_at_ms`, and `security.last_tls_reload_failure_at_ms`.
 
-`METRICS` returns deterministic key/value metric entries. `METRICS PROM` returns Prometheus text exposition format over the database protocol; there is intentionally no separate HTTP listener in this pass.
+`METRICS` returns deterministic key/value metric entries using OpenTelemetry-aligned dotted names under the `vaylix.*` namespace, for example `vaylix.server.request.count` and `vaylix.server.connection.active`. The contract follows OpenTelemetry metric naming rules: dotted namespacing, no `_total` suffixes, and fixed instrument semantics and units per metric.
+
+`METRICS PROM` returns the same metric contract translated into Prometheus-safe text exposition names by replacing dots with underscores, for example `vaylix_server_request_count`. There is intentionally no separate HTTP listener in this pass.
 
 ## Client Runtime
 
@@ -509,7 +511,7 @@ They also include operational hardening fields such as `runtime.transaction_max_
   - `json`
 
 The interactive client should print command results cleanly. Per-command transport logs are intentionally suppressed in normal output.
-The local `help` command is formatted as a readable command reference with usage strings and examples rather than a single-line command list.
+The local `help` command is formatted as a readable command reference with grammar-aligned usage strings rather than a single-line command list.
 
 ## Packaging, Docker, and Data Directory
 

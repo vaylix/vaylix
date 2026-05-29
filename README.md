@@ -108,6 +108,7 @@ cargo audit
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
 - TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.
+- `METRICS` uses an OpenTelemetry-aligned metric contract under the `vaylix.*` namespace, and `METRICS PROM` exposes Prometheus-safe names translated from that contract.
 - Backups created with `BACKUP TO <path>` are sandboxed under `--backup-dir` / `VAYLIX_BACKUP_DIR`, defaulting to `<data-dir>/backups`.
 - WAL is segmented under `<data-dir>/wal`, snapshots no longer discard all retained WAL history, and PITR restore is currently an offline operation that writes a new target data directory.
 - `maintenance on` switches the node into persisted read-only admin mode until `maintenance off`.

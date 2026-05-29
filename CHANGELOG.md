@@ -50,6 +50,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - Snapshots now seal the active WAL segment, rotate to a new active segment, and prune retained segments instead of truncating the entire WAL history.
+- `METRICS` now uses OpenTelemetry-aligned dotted metric names under `vaylix.*`, and `METRICS PROM` exports Prometheus-safe underscore-translated names derived from that contract.
 - Shortened the README into an OSS-style usage entry point with detailed architecture kept in `LLM.md`.
 
 ## [0.1.0] - 2026-05-27

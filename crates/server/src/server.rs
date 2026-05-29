@@ -3690,11 +3690,11 @@ mod tests {
             ))
             .unwrap();
         let body = response.decode_value().unwrap();
-        assert!(body.contains("# HELP vaylix_requests_total"));
-        assert!(body.contains("# TYPE vaylix_requests_total counter"));
-        assert!(body.contains("vaylix_requests_total 7"));
-        assert!(body.contains("# TYPE vaylix_active_connections gauge"));
-        assert!(body.contains("vaylix_active_connections 2"));
+        assert!(body.contains("# HELP vaylix_server_request_count"));
+        assert!(body.contains("# TYPE vaylix_server_request_count counter"));
+        assert!(body.contains("vaylix_server_request_count 7"));
+        assert!(body.contains("# TYPE vaylix_server_connection_active gauge"));
+        assert!(body.contains("vaylix_server_connection_active 2"));
     }
 
     #[test]
@@ -3796,7 +3796,11 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "runtime.slow_command_threshold_ms" && value == "100")
         );
-        assert!(entries.iter().any(|(key, _)| key.starts_with("metrics.")));
+        assert!(
+            entries
+                .iter()
+                .any(|(key, _)| key == "metrics.vaylix.server.request.count")
+        );
     }
 
     #[test]

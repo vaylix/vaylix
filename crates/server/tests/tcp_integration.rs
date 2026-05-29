@@ -653,8 +653,8 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         .unwrap();
     let metrics_prom_response = read_response_from_async(&mut stream).await.unwrap();
     let metrics_body = metrics_prom_response.decode_value().unwrap();
-    assert!(metrics_body.contains("# HELP vaylix_requests_total"));
-    assert!(metrics_body.contains("# TYPE vaylix_active_connections gauge"));
+    assert!(metrics_body.contains("# HELP vaylix_server_request_count"));
+    assert!(metrics_body.contains("# TYPE vaylix_server_connection_active gauge"));
 
     let getdel = Request::from_command(
         id(4),
