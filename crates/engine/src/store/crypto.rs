@@ -179,4 +179,25 @@ mod tests {
         };
         assert!(decrypt(&wrong, "snapshot", &envelope).is_err());
     }
+
+    #[test]
+    fn rejects_unsupported_envelope_version_and_algorithm() {
+        let key = StorageKey {
+            id: Uuid::now_v7(),
+            secret: "secret-key".to_string(),
+            created_at_ms: 1,
+        };
+        let keyring = StorageKeyring {
+            active: key.clone(),
+            previous: Vec::new(),
+        };
+
+        let mut wrong_version = encrypt(&key, "snapshot", b"hello").unwrap();
+        wrong_version[4] = 99;
+        assert!(decrypt(&keyring, "snapshot", &wrong_version).is_err());
+
+        let mut wrong_algorithm = encrypt(&key, "snapshot", b"hello").unwrap();
+        wrong_algorithm[5] = 99;
+        assert!(decrypt(&keyring, "snapshot", &wrong_algorithm).is_err());
+    }
 }

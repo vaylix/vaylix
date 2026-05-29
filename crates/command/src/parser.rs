@@ -43,7 +43,7 @@ impl Parser {
             "dbsize" => Self::parse_no_args(&tokens, Command::DbSize, "dbsize"),
             "count" => Self::parse_no_args(&tokens, Command::Count, "count"),
             "info" => Self::parse_no_args(&tokens, Command::Info, "info"),
-            "metrics" => Self::parse_no_args(&tokens, Command::Metrics, "metrics"),
+            "metrics" => Self::parse_metrics(&tokens),
             "list" => Self::parse_no_args(&tokens, Command::List, "list"),
             "clear" => Self::parse_no_args(&tokens, Command::Clear, "clear"),
             "flushdb" => Self::parse_no_args(&tokens, Command::Clear, "flushdb"),
@@ -51,6 +51,15 @@ impl Parser {
             "exit" | "quit" => Self::parse_no_args(&tokens, Command::Exit, "exit"),
             "save" => Self::parse_no_args(&tokens, Command::Save, "save"),
             "snapshot" => Self::parse_no_args(&tokens, Command::Snapshot, "snapshot"),
+            "backup" => Self::parse_backup(&tokens),
+            "restore" => Self::parse_restore(&tokens),
+            "alter" => Self::parse_alter(&tokens),
+            "create" => Self::parse_create(&tokens),
+            "drop" => Self::parse_drop(&tokens),
+            "grant" => Self::parse_grant(&tokens),
+            "revoke" => Self::parse_revoke(&tokens),
+            "show" => Self::parse_show(&tokens),
+            "whoami" => Self::parse_no_args(&tokens, Command::WhoAmI, "whoami"),
             "multi" => Self::parse_no_args(&tokens, Command::Multi, "multi"),
             "exec" => Self::parse_no_args(&tokens, Command::Exec, "exec"),
             "discard" => Self::parse_no_args(&tokens, Command::Discard, "discard"),
@@ -408,6 +417,276 @@ impl Parser {
         })
     }
 
+    fn parse_backup(tokens: &[Token]) -> Result<Command> {
+        match tokens.len() {
+            1 => Ok(Command::Backup),
+            3 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("to") => Ok(Command::BackupTo {
+                path: Self::token_text(&tokens[2]).to_string(),
+            }),
+            3 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("verify")
+                && !Self::token_text(&tokens[2]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::BackupVerify {
+                    dump: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            4 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("verify")
+                && Self::token_text(&tokens[2]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::BackupVerifyFrom {
+                    path: Self::token_text(&tokens[3]).to_string(),
+                })
+            }
+            _ => Err(CommandError::InvalidArity {
+                usage: "backup [to <path>] | backup verify <logical-dump-json> | backup verify from <path>".to_string(),
+            }),
+        }
+    }
+
+    fn parse_metrics(tokens: &[Token]) -> Result<Command> {
+        match tokens.len() {
+            1 => Ok(Command::Metrics),
+            2 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("prom") => {
+                Ok(Command::MetricsProm)
+            }
+            _ => Err(CommandError::InvalidArity {
+                usage: "metrics [prom]".to_string(),
+            }),
+        }
+    }
+
+    fn parse_restore(tokens: &[Token]) -> Result<Command> {
+        match tokens.len() {
+            2 => Ok(Command::Restore {
+                dump: Self::token_text(&tokens[1]).to_string(),
+            }),
+            3 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("from") => {
+                Ok(Command::RestoreFrom {
+                    path: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            3 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("check")
+                && !Self::token_text(&tokens[2]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::RestoreCheck {
+                    dump: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            4 if Self::token_text(&tokens[1]).eq_ignore_ascii_case("check")
+                && Self::token_text(&tokens[2]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::RestoreCheckFrom {
+                    path: Self::token_text(&tokens[3]).to_string(),
+                })
+            }
+            _ => Err(CommandError::InvalidArity {
+                usage: "restore <logical-dump-json> | restore from <path> | restore check <logical-dump-json> | restore check from <path>".to_string(),
+            }),
+        }
+    }
+
+    fn parse_alter(tokens: &[Token]) -> Result<Command> {
+        Self::expect_len(tokens, 5, "alter user <username> password <password>")?;
+        if !Self::token_text(&tokens[1]).eq_ignore_ascii_case("user")
+            || !Self::token_text(&tokens[3]).eq_ignore_ascii_case("password")
+        {
+            return Err(CommandError::InvalidArity {
+                usage: "alter user <username> password <password>".to_string(),
+            });
+        }
+        Ok(Command::AlterUserPassword {
+            username: Self::token_text(&tokens[2]).to_string(),
+            password: Self::token_text(&tokens[4]).to_string(),
+        })
+    }
+
+    fn parse_create(tokens: &[Token]) -> Result<Command> {
+        if tokens.len() < 3 {
+            return Err(CommandError::InvalidArity {
+                usage: "create user <username> password <password> | create role <role>"
+                    .to_string(),
+            });
+        }
+
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "user" => {
+                Self::expect_len(tokens, 5, "create user <username> password <password>")?;
+                if !Self::token_text(&tokens[3]).eq_ignore_ascii_case("password") {
+                    return Err(CommandError::InvalidArity {
+                        usage: "create user <username> password <password>".to_string(),
+                    });
+                }
+                Ok(Command::CreateUser {
+                    username: Self::token_text(&tokens[2]).to_string(),
+                    password: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "role" => {
+                Self::expect_len(tokens, 3, "create role <role>")?;
+                Ok(Command::CreateRole {
+                    role: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            other => Err(CommandError::InvalidOption {
+                command: "create",
+                option: other.to_string(),
+            }),
+        }
+    }
+
+    fn parse_drop(tokens: &[Token]) -> Result<Command> {
+        if tokens.len() < 3 {
+            return Err(CommandError::InvalidArity {
+                usage: "drop user <username> | drop role <role>".to_string(),
+            });
+        }
+
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "user" => {
+                Self::expect_len(tokens, 3, "drop user <username>")?;
+                Ok(Command::DropUser {
+                    username: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            "role" => {
+                Self::expect_len(tokens, 3, "drop role <role>")?;
+                Ok(Command::DropRole {
+                    role: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            other => Err(CommandError::InvalidOption {
+                command: "drop",
+                option: other.to_string(),
+            }),
+        }
+    }
+
+    fn parse_grant(tokens: &[Token]) -> Result<Command> {
+        if tokens.len() != 5 && tokens.len() != 7 {
+            return Err(CommandError::InvalidArity {
+                usage: "grant role <role> to <username> | grant permission <permission> [on <pattern>] to <role>".to_string(),
+            });
+        }
+
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "role"
+                if tokens.len() == 5 && Self::token_text(&tokens[3]).eq_ignore_ascii_case("to") =>
+            {
+                Ok(Command::GrantRole {
+                    role: Self::token_text(&tokens[2]).to_string(),
+                    username: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "permission"
+                if tokens.len() == 5 && Self::token_text(&tokens[3]).eq_ignore_ascii_case("to") =>
+            {
+                Ok(Command::GrantPermission {
+                    permission: Self::token_text(&tokens[2]).to_string(),
+                    pattern: "*".to_string(),
+                    role: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "permission"
+                if tokens.len() == 7
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("on")
+                    && Self::token_text(&tokens[5]).eq_ignore_ascii_case("to") =>
+            {
+                Ok(Command::GrantPermission {
+                    permission: Self::token_text(&tokens[2]).to_string(),
+                    pattern: Self::token_text(&tokens[4]).to_string(),
+                    role: Self::token_text(&tokens[6]).to_string(),
+                })
+            }
+            other => Err(CommandError::InvalidOption {
+                command: "grant",
+                option: other.to_string(),
+            }),
+        }
+    }
+
+    fn parse_revoke(tokens: &[Token]) -> Result<Command> {
+        if tokens.len() != 5 && tokens.len() != 7 {
+            return Err(CommandError::InvalidArity {
+                usage:
+                    "revoke role <role> from <username> | revoke permission <permission> [on <pattern>] from <role>"
+                        .to_string(),
+            });
+        }
+
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "role"
+                if tokens.len() == 5
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::RevokeRole {
+                    role: Self::token_text(&tokens[2]).to_string(),
+                    username: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "permission"
+                if tokens.len() == 5
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::RevokePermission {
+                    permission: Self::token_text(&tokens[2]).to_string(),
+                    pattern: "*".to_string(),
+                    role: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "permission"
+                if tokens.len() == 7
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("on")
+                    && Self::token_text(&tokens[5]).eq_ignore_ascii_case("from") =>
+            {
+                Ok(Command::RevokePermission {
+                    permission: Self::token_text(&tokens[2]).to_string(),
+                    pattern: Self::token_text(&tokens[4]).to_string(),
+                    role: Self::token_text(&tokens[6]).to_string(),
+                })
+            }
+            other => Err(CommandError::InvalidOption {
+                command: "revoke",
+                option: other.to_string(),
+            }),
+        }
+    }
+
+    fn parse_show(tokens: &[Token]) -> Result<Command> {
+        if tokens.len() != 2 && tokens.len() != 5 {
+            return Err(CommandError::InvalidArity {
+                usage: "show users | show roles | show grants | show grants for user <username> | show grants for role <role>"
+                    .to_string(),
+            });
+        }
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "users" if tokens.len() == 2 => Ok(Command::ShowUsers),
+            "roles" if tokens.len() == 2 => Ok(Command::ShowRoles),
+            "grants" if tokens.len() == 2 => Ok(Command::ShowGrants),
+            "grants"
+                if tokens.len() == 5
+                    && Self::token_text(&tokens[2]).eq_ignore_ascii_case("for")
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("user") =>
+            {
+                Ok(Command::ShowGrantsForUser {
+                    username: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            "grants"
+                if tokens.len() == 5
+                    && Self::token_text(&tokens[2]).eq_ignore_ascii_case("for")
+                    && Self::token_text(&tokens[3]).eq_ignore_ascii_case("role") =>
+            {
+                Ok(Command::ShowGrantsForRole {
+                    role: Self::token_text(&tokens[4]).to_string(),
+                })
+            }
+            other => Err(CommandError::InvalidOption {
+                command: "show",
+                option: other.to_string(),
+            }),
+        }
+    }
+
     fn parse_single_key<F>(tokens: &[Token], usage: &str, constructor: F) -> Result<Command>
     where
         F: FnOnce(String) -> Command,
@@ -620,13 +899,140 @@ mod tests {
         );
         assert_eq!(Parser::parse("dbsize").unwrap(), Command::DbSize);
         assert_eq!(Parser::parse("info").unwrap(), Command::Info);
+        assert_eq!(Parser::parse("metrics").unwrap(), Command::Metrics);
+        assert_eq!(Parser::parse("metrics prom").unwrap(), Command::MetricsProm);
         assert_eq!(Parser::parse("save").unwrap(), Command::Save);
+        assert_eq!(Parser::parse("backup").unwrap(), Command::Backup);
+        assert_eq!(
+            Parser::parse("backup to nightly.json").unwrap(),
+            Command::BackupTo {
+                path: "nightly.json".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse(r#"backup verify "{\"version\":1}""#).unwrap(),
+            Command::BackupVerify {
+                dump: "{\"version\":1}".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("backup verify from nightly.json").unwrap(),
+            Command::BackupVerifyFrom {
+                path: "nightly.json".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse(r#"restore "{\"version\":1}""#).unwrap(),
+            Command::Restore {
+                dump: "{\"version\":1}".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("restore from nightly.json").unwrap(),
+            Command::RestoreFrom {
+                path: "nightly.json".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse(r#"restore check "{\"version\":1}""#).unwrap(),
+            Command::RestoreCheck {
+                dump: "{\"version\":1}".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("restore check from nightly.json").unwrap(),
+            Command::RestoreCheckFrom {
+                path: "nightly.json".to_string()
+            }
+        );
         assert_eq!(
             Parser::parse("del key").unwrap(),
             Command::Delete {
                 keys: vec!["key".to_string()]
             }
         );
+        assert_eq!(
+            Parser::parse("create user alice password secret").unwrap(),
+            Command::CreateUser {
+                username: "alice".to_string(),
+                password: "secret".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("alter user alice password new-secret").unwrap(),
+            Command::AlterUserPassword {
+                username: "alice".to_string(),
+                password: "new-secret".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("create role readonly").unwrap(),
+            Command::CreateRole {
+                role: "readonly".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("grant role readonly to alice").unwrap(),
+            Command::GrantRole {
+                role: "readonly".to_string(),
+                username: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("grant permission read to readonly").unwrap(),
+            Command::GrantPermission {
+                permission: "read".to_string(),
+                pattern: "*".to_string(),
+                role: "readonly".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("grant permission read on app:* to readonly").unwrap(),
+            Command::GrantPermission {
+                permission: "read".to_string(),
+                pattern: "app:*".to_string(),
+                role: "readonly".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("revoke role readonly from alice").unwrap(),
+            Command::RevokeRole {
+                role: "readonly".to_string(),
+                username: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("revoke permission read from readonly").unwrap(),
+            Command::RevokePermission {
+                permission: "read".to_string(),
+                pattern: "*".to_string(),
+                role: "readonly".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("revoke permission read on app:* from readonly").unwrap(),
+            Command::RevokePermission {
+                permission: "read".to_string(),
+                pattern: "app:*".to_string(),
+                role: "readonly".to_string()
+            }
+        );
+        assert_eq!(Parser::parse("show users").unwrap(), Command::ShowUsers);
+        assert_eq!(Parser::parse("show roles").unwrap(), Command::ShowRoles);
+        assert_eq!(Parser::parse("show grants").unwrap(), Command::ShowGrants);
+        assert_eq!(
+            Parser::parse("show grants for user alice").unwrap(),
+            Command::ShowGrantsForUser {
+                username: "alice".to_string()
+            }
+        );
+        assert_eq!(
+            Parser::parse("show grants for role readonly").unwrap(),
+            Command::ShowGrantsForRole {
+                role: "readonly".to_string()
+            }
+        );
+        assert_eq!(Parser::parse("whoami").unwrap(), Command::WhoAmI);
     }
 
     #[test]
@@ -655,6 +1061,20 @@ mod tests {
         assert!(Parser::parse("scan nope").is_err());
         assert!(Parser::parse("set key value ex").is_err());
         assert!(Parser::parse("getex key ex").is_err());
+        assert!(Parser::parse("create user alice").is_err());
+        assert!(Parser::parse("alter user alice").is_err());
+        assert!(Parser::parse("backup to").is_err());
+        assert!(Parser::parse("backup verify from").is_err());
+        assert!(Parser::parse("backup verify").is_err());
+        assert!(Parser::parse("metrics prom extra").is_err());
+        assert!(Parser::parse("restore check from").is_err());
+        assert!(Parser::parse("grant role readonly alice").is_err());
+        assert!(Parser::parse("grant permission read on to readonly").is_err());
+        assert!(Parser::parse("grant permission read app:* to readonly").is_err());
+        assert!(Parser::parse("revoke permission read on from readonly").is_err());
+        assert!(Parser::parse("revoke permission read app:* from readonly").is_err());
+        assert!(Parser::parse("show grants for user").is_err());
+        assert!(Parser::parse("show grants user alice").is_err());
     }
 
     #[test]

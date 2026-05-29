@@ -30,6 +30,16 @@ pub enum TransportError {
     InvalidUtf8(#[from] std::string::FromUtf8Error),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("protocol negotiation failed: {0}")]
+    NegotiationFailed(&'static str),
+    #[error("transport capability mismatch: {0}")]
+    CapabilityMismatch(&'static str),
+    #[error("request deadline exceeded")]
+    DeadlineExceeded,
+    #[error("decompressed frame too large: {length} bytes exceeds maximum {max} bytes")]
+    DecompressedFrameTooLarge { length: usize, max: usize },
+    #[error("protocol state violation: {0}")]
+    ProtocolStateViolation(&'static str),
 }
 
 impl TransportError {
@@ -48,6 +58,11 @@ impl TransportError {
             Self::CompressionFailure => "TRN-011",
             Self::InvalidUtf8(_) => "TRN-012",
             Self::Io(_) => "TRN-013",
+            Self::NegotiationFailed(_) => "TRN-014",
+            Self::CapabilityMismatch(_) => "TRN-015",
+            Self::DeadlineExceeded => "TRN-016",
+            Self::DecompressedFrameTooLarge { .. } => "TRN-017",
+            Self::ProtocolStateViolation(_) => "TRN-018",
         }
     }
 
@@ -66,6 +81,11 @@ impl TransportError {
             Self::CompressionFailure => "Compression Failure",
             Self::InvalidUtf8(_) => "Invalid UTF-8 Payload",
             Self::Io(_) => "Transport I/O Failure",
+            Self::NegotiationFailed(_) => "Protocol Negotiation Failed",
+            Self::CapabilityMismatch(_) => "Transport Capability Mismatch",
+            Self::DeadlineExceeded => "Request Deadline Exceeded",
+            Self::DecompressedFrameTooLarge { .. } => "Decompressed Frame Too Large",
+            Self::ProtocolStateViolation(_) => "Protocol State Violation",
         }
     }
 }

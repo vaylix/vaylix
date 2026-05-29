@@ -9,21 +9,22 @@ Vaylix is a Rust database workspace centered on a transport-first architecture:
 `client -> transport -> TCP/TLS -> transport -> server -> engine`
 
 The current implementation is a single-node, string-to-string key/value database with:
-- a custom framed binary protocol
+- a custom framed binary protocol v2 with startup capability negotiation
 - a shared transport crate used by both client and server
 - a Tokio multi-client server
-- authenticated client connections
+- authenticated client connections with in-server RBAC
 - optional TLS and mTLS client/server transport
 - encrypted-at-rest WAL and snapshots
 - append-only audit logging
-- default-on outbound frame-level zstd compression
+- default-on negotiated outbound frame-level zstd compression
 - deterministic command parsing and explicit error codes
+- protocol-level Prometheus metrics export through `METRICS PROM`
 
 The long-term target is broader:
 - scale from a single node to replicated and sharded deployments
 - keep the transport layer evolvable enough for replication traffic and cluster coordination
 - harden transactional behavior toward stronger ACID guarantees than the current session-queued model
-- add auditability and compression negotiation without breaking engine layering
+- add richer auditability and replication-oriented protocol sessions without breaking engine layering
 
 ## Workspace Layout
 
@@ -34,7 +35,7 @@ The long-term target is broader:
 - `crates/engine`
   - in-memory state, expirations, WAL, snapshots, manifest, recovery, storage encryption, key rotation
 - `crates/server`
-  - Tokio listener, authentication, TLS accept, session handling, quotas, rate limiting, engine worker runtime
+  - Tokio listener, authentication, RBAC, TLS accept, session handling, quotas, rate limiting, engine worker runtime
 - `crates/client`
   - REPL, URL parsing, TLS client connection, output rendering
 
@@ -53,8 +54,14 @@ The long-term target is broader:
   - incr/decr
   - expire/ttl/persist
   - rename/renamenx
-  - scan/dbsize/info/metrics/list/count
+  - scan/dbsize/info/metrics/metrics-prom/list/count
   - clear/save/snapshot
+  - backup/restore
+  - backup-to-file/backup-verify/restore-from-file/restore-check
+  - create/drop user and role
+  - alter user password
+  - grant/revoke role and permission
+  - show users/show roles/show grants/whoami
   - multi/exec/discard
 
 ## Transaction and ACID Status
@@ -81,6 +88,8 @@ Agents should describe the current implementation honestly. Do not claim full AC
 ## Transport Protocol
 
 - Framed binary protocol
+- Protocol magic: `VTP2`
+- Protocol version: `2`
 - Frame header includes:
   - magic
   - version
@@ -90,6 +99,7 @@ Agents should describe the current implementation honestly. Do not claim full AC
 - Requests contain:
   - `request_id: UUID`
   - opcode
+  - optional metadata: deadline milliseconds, trace id, sequence number
   - payload
 - Responses contain:
   - `request_id: UUID`
@@ -100,9 +110,22 @@ Agents should describe the current implementation honestly. Do not claim full AC
   - friendly error name
   - message
 
+### Startup Negotiation
+
+Every client connection sends a required startup hello before command frames. The client hello carries protocol version, client name/version, supported capabilities, desired compression, maximum frame size, and auth intent. The server hello returns accepted capabilities, selected compression, effective maximum frame size, server id, and structured startup rejection details when negotiation fails.
+
+Current negotiated capabilities:
+- `zstd`
+- `request_deadline`
+- `server_metrics`
+- `pipelining`
+- `trace_context`
+
+Protocol `0.2.x` intentionally rejects pre-v2 frames. `0.1.0` clients and servers are not wire-compatible with `0.2.0`.
+
 ### Request IDs
 
-Request IDs are UUIDs, not random integers. This removes the old local counter/random collision concerns and keeps the protocol ready for future pipelining and multiplexing.
+Request IDs are UUIDs, not random integers. This removes the old local counter/random collision concerns and supports pipelined response correlation.
 
 ## TLS
 
@@ -127,7 +150,7 @@ When `--ssl` is enabled on the server, both `--tls-cert` and `--tls-key` are req
 
 When `--tls-client-ca` is provided, the server requires clients to present a certificate chaining to that CA. mTLS is additive to username/password authentication; it should not be described as replacing application-level auth.
 
-## Authentication
+## Authentication and RBAC
 
 Authentication is enabled by default.
 
@@ -136,7 +159,49 @@ Development defaults:
 - password: `vaylix`
 
 These defaults exist for local development only. Production deployments should always override them.
-Use `--disable-auth` only for local/trusted testing. When auth is disabled on the server, commands execute without an `AUTH` handshake.
+Use `--disable-auth` only for local/trusted testing. When auth is disabled on the server, commands execute without an `AUTH` handshake and RBAC checks are bypassed.
+
+RBAC is implemented inside the existing server binary and transport protocol. There is no separate admin binary. On first startup, the configured `--user` / `--password` account is bootstrapped as an admin user. Once `<data-dir>/auth.bin` exists, users and roles are loaded from encrypted RBAC metadata instead of being recreated from CLI defaults.
+
+Current permissions:
+- `read`
+- `write`
+- `admin`
+- `backup`
+- `restore`
+- `metrics`
+- `snapshot`
+- `clear`
+- `user_admin`
+- `role_admin`
+
+Current admin commands:
+- `create user <username> password <password>`
+- `alter user <username> password <password>`
+- `drop user <username>`
+- `create role <role>`
+- `drop role <role>`
+- `grant role <role> to <username>`
+- `revoke role <role> from <username>`
+- `grant permission <permission> to <role>`
+- `grant permission <permission> on <pattern> to <role>`
+- `revoke permission <permission> from <role>`
+- `revoke permission <permission> on <pattern> from <role>`
+- `show users`
+- `show roles`
+- `show grants`
+- `show grants for user <username>`
+- `show grants for role <role>`
+- `whoami`
+
+Permission grants are pattern-scoped. The legacy syntax `grant permission <permission> to <role>` is an alias for `grant permission <permission> on * to <role>`. Patterns are glob-like over keys, not SQL schemas or tables. Key-bearing commands require every key to match the relevant permission grant. The `admin` permission bypasses pattern checks. Destructive and administrative operations use explicit permissions: `CLEAR` / `FLUSHDB` require `clear`, restore commands require `restore`, user management requires `user_admin`, and role/grant management requires `role_admin`.
+
+Grant inspection rules:
+- `show grants` returns the current authenticated user's roles and resolved grants
+- `show grants for user <username>` requires `user_admin` or `admin`
+- `show grants for role <role>` requires `role_admin` or `admin`
+
+Authorization happens in the server after authentication and before engine execution. The engine must remain unaware of users, credentials, roles, and permissions. Existing authenticated sessions remain valid after password rotation; new authentication attempts use the rotated password.
 
 Client connection string format:
 - `vaylix://user:password@host:port`
@@ -179,6 +244,30 @@ Recovery flow:
 3. decrypt and deserialize snapshot
 4. replay and verify WAL entries
 
+### Logical Backup and Restore
+
+Vaylix also supports logical backups through database commands:
+- `BACKUP`
+- `RESTORE <logical-dump-json>`
+- `BACKUP TO <path>`
+- `BACKUP VERIFY <logical-dump-json>`
+- `BACKUP VERIFY FROM <path>`
+- `RESTORE FROM <path>`
+- `RESTORE CHECK <logical-dump-json>`
+- `RESTORE CHECK FROM <path>`
+
+`BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live string key/value entries, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
+
+`RESTORE` accepts the logical JSON dump and replaces the current keyspace with live dump entries through one WAL-backed atomic engine batch. Entries whose absolute expiration timestamp is already in the past are skipped. This is separate from physical `SAVE` / `SNAPSHOT`, which persist the local node’s encrypted snapshot and flush/rotate the WAL.
+
+`BACKUP TO <path>` and `RESTORE FROM <path>` operate on server-local files under the configured backup directory only. The server resolves and canonicalizes paths, rejects `..` traversal, and rejects paths outside the backup directory. `RESTORE CHECK` validates backup JSON, backup version, entry schema, string fields, and expired-entry handling without mutating engine state or WAL; it returns the count of live entries that would be restored.
+
+When `BACKUP TO <path>` writes a server-side dump, the server also writes `<path>.manifest.json`. The sidecar manifest records backup version, creation timestamp, source engine version, source sequence, entry count, dump byte length, SHA-256 digest, and hash algorithm. `BACKUP VERIFY <logical-dump-json>` validates inline backup JSON and returns deterministic entries such as `status=ok`, `entries=<n>`, and `sha256=<hash>`. `BACKUP VERIFY FROM <path>` verifies both the sidecar manifest and the dump before validating backup contents.
+
+Backup directory:
+- server arg/env: `--backup-dir` / `VAYLIX_BACKUP_DIR`
+- default: `<data-dir>/backups`
+
 ### Storage Encryption
 
 At-rest encryption is server-managed. There is no user-facing `--data-key` flag anymore.
@@ -200,6 +289,11 @@ Audit logging is implemented as append-only JSON lines under the data directory 
 - optional override: `--audit-log-path`
 
 Each event records:
+- audit format version
+- monotonically increasing audit sequence
+- SHA-256 hash algorithm name
+- previous event hash
+- current event hash
 - timestamp
 - connection id
 - peer address
@@ -209,8 +303,12 @@ Each event records:
 - response status
 - error code when applicable
 - latency in milliseconds
+- event type
+- sanitized details map
 
-Passwords and payload contents are not written to the audit log.
+The audit chain uses a fixed zero genesis hash for the first event. On startup, the server verifies existing audit lines and fails closed if a line has malformed JSON, invalid sequence, mismatched previous hash, mismatched event hash, or an unsupported hash algorithm. This makes local tampering detectable, but it is not non-repudiation: a local attacker who can rewrite the entire log can recompute a fresh chain unless the latest hash is anchored externally.
+
+Passwords and payload contents are not written to the audit log. Semantic event types are recorded for authentication success/failure and RBAC/auth mutations such as create/drop user, password rotation, create/drop role, grant/revoke role, and grant/revoke permission. Slow command audit events are emitted when command latency is at or above `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`; the default is `100`, and `0` disables slow-command events.
 
 ## Scalability Direction
 
@@ -231,12 +329,12 @@ Do not document distributed support as implemented today. It is a roadmap constr
 Transport compression is enabled by default for outbound frames in the current client/server binaries:
 - default mode: `zstd`
 - default threshold: `0`
+- compression is selected during startup negotiation
 - readers decompress automatically based on the frame flag
 - frame checksums validate the on-wire compressed payload
 - `--disable-compression` disables outbound compression on that process
 
 Still missing:
-- compression negotiation
 - compression policy coordination between mixed-version peers
 - replication-stream tuning
 
@@ -255,11 +353,29 @@ Current runtime protections:
 - Tokio multi-thread runtime
 - concurrent client sessions
 - engine work is funneled through a dedicated engine worker
+- protocol startup negotiation is required before command execution
 - optional background snapshotter
 - optional background expiration sweeper
 - plaintext TCP by default
 - TLS accept path when `--ssl` is enabled
 - auth and compression enabled by default with explicit disable flags
+
+## Structured INFO
+
+`INFO` returns deterministic key/value entries with section prefixes rather than one unstructured blob. Current sections:
+- `server.*`
+- `transport.*`
+- `storage.*`
+- `persistence.*`
+- `security.*`
+- `runtime.*`
+- `metrics.*`
+
+Examples include `server.version`, `transport.protocol_version`, `storage.key_count`, `persistence.wal_size_bytes`, `security.tls_enabled`, `runtime.idle_timeout_seconds`, and `metrics.requests_total`.
+
+Runtime/security examples also include quota and operational settings such as `runtime.max_key_bytes`, `runtime.max_value_bytes`, `runtime.max_keys_per_batch`, `runtime.max_transaction_queue_len`, `runtime.requests_per_second`, `runtime.request_burst`, `runtime.backup_dir`, `runtime.slow_command_threshold_ms`, `security.auth_enabled`, `security.rbac_enabled`, `security.mtls_enabled`, and `transport.compression_mode`.
+
+`METRICS` returns deterministic key/value metric entries. `METRICS PROM` returns Prometheus text exposition format over the database protocol; there is intentionally no separate HTTP listener in this pass.
 
 ## Client Runtime
 
@@ -273,6 +389,7 @@ Current runtime protections:
   - `json`
 
 The interactive client should print command results cleanly. Per-command transport logs are intentionally suppressed in normal output.
+The local `help` command is formatted as a readable command reference with usage strings and examples rather than a single-line command list.
 
 ## Packaging, Docker, and Data Directory
 
@@ -285,6 +402,8 @@ This path is the durable storage root for:
 - WAL
 - manifest
 - storage keyring
+- encrypted auth/RBAC metadata
+- logical backup files under the backup directory
 
 ## CI and Release
 
@@ -297,14 +416,15 @@ Pull request CI runs:
 Release workflow goal:
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.2.0`
+- publish SBOMs for release archives and Docker images
+- use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 
 ## Current Gaps
 
 - full distributed ACID semantics are not implemented
 - no replication or sharding yet
-- no ACL or multi-user authorization model
-- no online backup/restore tool in the current tree
+- backup/restore is command-level logical JSON only; there is no separate streaming backup utility yet
 - no TLS certificate automation or rotation workflow yet
 - TLS is opt-in rather than mandatory
 

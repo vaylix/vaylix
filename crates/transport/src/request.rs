@@ -5,12 +5,25 @@ use uuid::Uuid;
 use crate::error::{Result, TransportError};
 use crate::opcode::Opcode;
 
+pub const REQUEST_META_DEADLINE_MS: u8 = 0x01;
+pub const REQUEST_META_TRACE_ID: u8 = 0x02;
+pub const REQUEST_META_SEQUENCE: u8 = 0x04;
+
+/// Optional per-request metadata negotiated by transport v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestMetadata {
+    pub deadline_ms: Option<u64>,
+    pub trace_id: Option<Uuid>,
+    pub sequence: Option<u64>,
+}
+
 /// A decoded client request without outer frame bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub request_id: Uuid,
     pub opcode: Opcode,
     pub payload: Vec<u8>,
+    pub metadata: RequestMetadata,
 }
 
 impl Request {
@@ -20,7 +33,14 @@ impl Request {
             request_id,
             opcode,
             payload,
+            metadata: RequestMetadata::default(),
         }
+    }
+
+    /// Builds a raw request with transport metadata.
+    pub fn with_metadata(mut self, metadata: RequestMetadata) -> Self {
+        self.metadata = metadata;
+        self
     }
 
     /// Encodes a parsed command into a transport request.
@@ -108,11 +128,109 @@ impl Request {
             Command::DbSize => Ok(Self::new(request_id, Opcode::DbSize, Vec::new())),
             Command::Info => Ok(Self::new(request_id, Opcode::Info, Vec::new())),
             Command::Metrics => Ok(Self::new(request_id, Opcode::Metrics, Vec::new())),
+            Command::MetricsProm => Ok(Self::new(request_id, Opcode::MetricsProm, Vec::new())),
             Command::List => Ok(Self::new(request_id, Opcode::List, Vec::new())),
             Command::Clear => Ok(Self::new(request_id, Opcode::Clear, Vec::new())),
             Command::Count => Ok(Self::new(request_id, Opcode::Count, Vec::new())),
             Command::Save => Ok(Self::new(request_id, Opcode::Save, Vec::new())),
             Command::Snapshot => Ok(Self::new(request_id, Opcode::Snapshot, Vec::new())),
+            Command::Backup => Ok(Self::new(request_id, Opcode::Backup, Vec::new())),
+            Command::BackupTo { path } => {
+                Ok(Self::new(request_id, Opcode::BackupTo, encode_key(&path)?))
+            }
+            Command::BackupVerify { dump } => Ok(Self::new(
+                request_id,
+                Opcode::BackupVerify,
+                encode_dump(&dump)?,
+            )),
+            Command::BackupVerifyFrom { path } => Ok(Self::new(
+                request_id,
+                Opcode::BackupVerifyFrom,
+                encode_key(&path)?,
+            )),
+            Command::Restore { dump } => {
+                Ok(Self::new(request_id, Opcode::Restore, encode_dump(&dump)?))
+            }
+            Command::RestoreFrom { path } => Ok(Self::new(
+                request_id,
+                Opcode::RestoreFrom,
+                encode_key(&path)?,
+            )),
+            Command::RestoreCheck { dump } => Ok(Self::new(
+                request_id,
+                Opcode::RestoreCheck,
+                encode_dump(&dump)?,
+            )),
+            Command::RestoreCheckFrom { path } => Ok(Self::new(
+                request_id,
+                Opcode::RestoreCheckFrom,
+                encode_key(&path)?,
+            )),
+            Command::AlterUserPassword { username, password } => Ok(Self::new(
+                request_id,
+                Opcode::AlterUserPassword,
+                encode_key_value(&username, &password)?,
+            )),
+            Command::CreateUser { username, password } => Ok(Self::new(
+                request_id,
+                Opcode::CreateUser,
+                encode_key_value(&username, &password)?,
+            )),
+            Command::DropUser { username } => Ok(Self::new(
+                request_id,
+                Opcode::DropUser,
+                encode_key(&username)?,
+            )),
+            Command::CreateRole { role } => Ok(Self::new(
+                request_id,
+                Opcode::CreateRole,
+                encode_key(&role)?,
+            )),
+            Command::DropRole { role } => {
+                Ok(Self::new(request_id, Opcode::DropRole, encode_key(&role)?))
+            }
+            Command::GrantRole { role, username } => Ok(Self::new(
+                request_id,
+                Opcode::GrantRole,
+                encode_key_value(&role, &username)?,
+            )),
+            Command::RevokeRole { role, username } => Ok(Self::new(
+                request_id,
+                Opcode::RevokeRole,
+                encode_key_value(&role, &username)?,
+            )),
+            Command::GrantPermission {
+                permission,
+                pattern,
+                role,
+            } => Ok(Self::new(
+                request_id,
+                Opcode::GrantPermission,
+                encode_three_strings(&permission, &pattern, &role)?,
+            )),
+            Command::RevokePermission {
+                permission,
+                pattern,
+                role,
+            } => Ok(Self::new(
+                request_id,
+                Opcode::RevokePermission,
+                encode_three_strings(&permission, &pattern, &role)?,
+            )),
+            Command::ShowUsers => Ok(Self::new(request_id, Opcode::ShowUsers, Vec::new())),
+            Command::ShowRoles => Ok(Self::new(request_id, Opcode::ShowRoles, Vec::new())),
+            Command::ShowGrants => Ok(Self::new(request_id, Opcode::ShowGrants, Vec::new())),
+            Command::ShowGrantsForUser { username } => Ok(Self::new(
+                request_id,
+                Opcode::ShowGrantsForUser,
+                encode_key(&username)?,
+            )),
+            Command::ShowGrantsForRole { role } => Ok(Self::new(
+                request_id,
+                Opcode::ShowGrantsForRole,
+                encode_key(&role)?,
+            )),
+            Command::WhoAmI => Ok(Self::new(request_id, Opcode::WhoAmI, Vec::new())),
             Command::Multi => Ok(Self::new(request_id, Opcode::Multi, Vec::new())),
             Command::Exec => Ok(Self::new(request_id, Opcode::Exec, Vec::new())),
             Command::Discard => Ok(Self::new(request_id, Opcode::Discard, Vec::new())),
@@ -210,11 +328,85 @@ impl Request {
             Opcode::DbSize => decode_empty(&self.payload).map(|()| Command::DbSize),
             Opcode::Info => decode_empty(&self.payload).map(|()| Command::Info),
             Opcode::Metrics => decode_empty(&self.payload).map(|()| Command::Metrics),
+            Opcode::MetricsProm => decode_empty(&self.payload).map(|()| Command::MetricsProm),
             Opcode::List => decode_empty(&self.payload).map(|()| Command::List),
             Opcode::Clear => decode_empty(&self.payload).map(|()| Command::Clear),
             Opcode::Count => decode_empty(&self.payload).map(|()| Command::Count),
             Opcode::Save => decode_empty(&self.payload).map(|()| Command::Save),
             Opcode::Snapshot => decode_empty(&self.payload).map(|()| Command::Snapshot),
+            Opcode::Backup => decode_empty(&self.payload).map(|()| Command::Backup),
+            Opcode::BackupTo => Ok(Command::BackupTo {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::BackupVerify => Ok(Command::BackupVerify {
+                dump: decode_dump(&self.payload)?,
+            }),
+            Opcode::BackupVerifyFrom => Ok(Command::BackupVerifyFrom {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::Restore => Ok(Command::Restore {
+                dump: decode_dump(&self.payload)?,
+            }),
+            Opcode::RestoreFrom => Ok(Command::RestoreFrom {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::RestoreCheck => Ok(Command::RestoreCheck {
+                dump: decode_dump(&self.payload)?,
+            }),
+            Opcode::RestoreCheckFrom => Ok(Command::RestoreCheckFrom {
+                path: decode_single_key(&self.payload)?,
+            }),
+            Opcode::AlterUserPassword => {
+                let (username, password) = decode_key_value(&self.payload)?;
+                Ok(Command::AlterUserPassword { username, password })
+            }
+            Opcode::CreateUser => {
+                let (username, password) = decode_key_value(&self.payload)?;
+                Ok(Command::CreateUser { username, password })
+            }
+            Opcode::DropUser => Ok(Command::DropUser {
+                username: decode_single_key(&self.payload)?,
+            }),
+            Opcode::CreateRole => Ok(Command::CreateRole {
+                role: decode_single_key(&self.payload)?,
+            }),
+            Opcode::DropRole => Ok(Command::DropRole {
+                role: decode_single_key(&self.payload)?,
+            }),
+            Opcode::GrantRole => {
+                let (role, username) = decode_key_value(&self.payload)?;
+                Ok(Command::GrantRole { role, username })
+            }
+            Opcode::RevokeRole => {
+                let (role, username) = decode_key_value(&self.payload)?;
+                Ok(Command::RevokeRole { role, username })
+            }
+            Opcode::GrantPermission => {
+                let (permission, pattern, role) = decode_three_strings(&self.payload)?;
+                Ok(Command::GrantPermission {
+                    permission,
+                    pattern,
+                    role,
+                })
+            }
+            Opcode::RevokePermission => {
+                let (permission, pattern, role) = decode_three_strings(&self.payload)?;
+                Ok(Command::RevokePermission {
+                    permission,
+                    pattern,
+                    role,
+                })
+            }
+            Opcode::ShowUsers => decode_empty(&self.payload).map(|()| Command::ShowUsers),
+            Opcode::ShowRoles => decode_empty(&self.payload).map(|()| Command::ShowRoles),
+            Opcode::ShowGrants => decode_empty(&self.payload).map(|()| Command::ShowGrants),
+            Opcode::ShowGrantsForUser => Ok(Command::ShowGrantsForUser {
+                username: decode_single_key(&self.payload)?,
+            }),
+            Opcode::ShowGrantsForRole => Ok(Command::ShowGrantsForRole {
+                role: decode_single_key(&self.payload)?,
+            }),
+            Opcode::WhoAmI => decode_empty(&self.payload).map(|()| Command::WhoAmI),
             Opcode::Multi => decode_empty(&self.payload).map(|()| Command::Multi),
             Opcode::Exec => decode_empty(&self.payload).map(|()| Command::Exec),
             Opcode::Discard => decode_empty(&self.payload).map(|()| Command::Discard),
@@ -226,6 +418,19 @@ fn encode_key(key: &str) -> Result<Vec<u8>> {
     let mut buf = BytesMut::new();
     put_string_u16(&mut buf, key)?;
     Ok(buf.to_vec())
+}
+
+fn encode_dump(dump: &str) -> Result<Vec<u8>> {
+    let mut buf = BytesMut::new();
+    put_string_u32(&mut buf, dump)?;
+    Ok(buf.to_vec())
+}
+
+fn decode_dump(payload: &[u8]) -> Result<String> {
+    let mut buf = payload;
+    let dump = read_string_u32(&mut buf)?;
+    ensure_empty(buf)?;
+    Ok(dump)
 }
 
 fn encode_set(key: &str, value: &str, options: &SetOptions) -> Result<Vec<u8>> {
@@ -251,6 +456,14 @@ fn encode_key_value(key: &str, value: &str) -> Result<Vec<u8>> {
     let mut buf = BytesMut::new();
     put_string_u16(&mut buf, key)?;
     put_string_u32(&mut buf, value)?;
+    Ok(buf.to_vec())
+}
+
+fn encode_three_strings(first: &str, second: &str, third: &str) -> Result<Vec<u8>> {
+    let mut buf = BytesMut::new();
+    put_string_u16(&mut buf, first)?;
+    put_string_u16(&mut buf, second)?;
+    put_string_u16(&mut buf, third)?;
     Ok(buf.to_vec())
 }
 
@@ -385,6 +598,15 @@ fn decode_key_value(payload: &[u8]) -> Result<(String, String)> {
     let value = read_string_u32(&mut buf)?;
     ensure_empty(buf)?;
     Ok((key, value))
+}
+
+fn decode_three_strings(payload: &[u8]) -> Result<(String, String, String)> {
+    let mut buf = payload;
+    let first = read_string_u16(&mut buf)?;
+    let second = read_string_u16(&mut buf)?;
+    let third = read_string_u16(&mut buf)?;
+    ensure_empty(buf)?;
+    Ok((first, second, third))
 }
 
 fn decode_key_u64(payload: &[u8]) -> Result<(String, u64)> {
@@ -663,11 +885,79 @@ mod tests {
             },
             Command::DbSize,
             Command::Info,
+            Command::MetricsProm,
             Command::List,
             Command::Clear,
             Command::Count,
             Command::Save,
             Command::Snapshot,
+            Command::Backup,
+            Command::BackupTo {
+                path: "nightly.json".to_string(),
+            },
+            Command::BackupVerify {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::BackupVerifyFrom {
+                path: "nightly.json".to_string(),
+            },
+            Command::Restore {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::RestoreFrom {
+                path: "nightly.json".to_string(),
+            },
+            Command::RestoreCheck {
+                dump: "{\"version\":1}".to_string(),
+            },
+            Command::RestoreCheckFrom {
+                path: "nightly.json".to_string(),
+            },
+            Command::CreateUser {
+                username: "alice".to_string(),
+                password: "secret".to_string(),
+            },
+            Command::AlterUserPassword {
+                username: "alice".to_string(),
+                password: "new-secret".to_string(),
+            },
+            Command::DropUser {
+                username: "alice".to_string(),
+            },
+            Command::CreateRole {
+                role: "readonly".to_string(),
+            },
+            Command::DropRole {
+                role: "readonly".to_string(),
+            },
+            Command::GrantRole {
+                role: "readonly".to_string(),
+                username: "alice".to_string(),
+            },
+            Command::RevokeRole {
+                role: "readonly".to_string(),
+                username: "alice".to_string(),
+            },
+            Command::GrantPermission {
+                permission: "read".to_string(),
+                pattern: "app:*".to_string(),
+                role: "readonly".to_string(),
+            },
+            Command::RevokePermission {
+                permission: "read".to_string(),
+                pattern: "app:*".to_string(),
+                role: "readonly".to_string(),
+            },
+            Command::ShowUsers,
+            Command::ShowRoles,
+            Command::ShowGrants,
+            Command::ShowGrantsForUser {
+                username: "alice".to_string(),
+            },
+            Command::ShowGrantsForRole {
+                role: "readonly".to_string(),
+            },
+            Command::WhoAmI,
         ];
 
         for command in commands {

@@ -131,7 +131,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "metrics",
-        usage: "metrics",
+        usage: "metrics [prom]",
     },
     CommandInfo {
         name: "list",
@@ -152,6 +152,66 @@ pub const COMMANDS: &[CommandInfo] = &[
     CommandInfo {
         name: "snapshot",
         usage: "snapshot",
+    },
+    CommandInfo {
+        name: "backup",
+        usage: "backup [to <path>] | backup verify <logical-dump-json> | backup verify from <path>",
+    },
+    CommandInfo {
+        name: "restore",
+        usage: "restore <logical-dump-json> | restore from <path> | restore check <logical-dump-json> | restore check from <path>",
+    },
+    CommandInfo {
+        name: "alter-user",
+        usage: "alter user <username> password <password>",
+    },
+    CommandInfo {
+        name: "create-user",
+        usage: "create user <username> password <password>",
+    },
+    CommandInfo {
+        name: "drop-user",
+        usage: "drop user <username>",
+    },
+    CommandInfo {
+        name: "create-role",
+        usage: "create role <role>",
+    },
+    CommandInfo {
+        name: "drop-role",
+        usage: "drop role <role>",
+    },
+    CommandInfo {
+        name: "grant-role",
+        usage: "grant role <role> to <username>",
+    },
+    CommandInfo {
+        name: "revoke-role",
+        usage: "revoke role <role> from <username>",
+    },
+    CommandInfo {
+        name: "grant-permission",
+        usage: "grant permission <permission> [on <pattern>] to <role>",
+    },
+    CommandInfo {
+        name: "revoke-permission",
+        usage: "revoke permission <permission> [on <pattern>] from <role>",
+    },
+    CommandInfo {
+        name: "show-users",
+        usage: "show users",
+    },
+    CommandInfo {
+        name: "show-roles",
+        usage: "show roles",
+    },
+    CommandInfo {
+        name: "show-grants",
+        usage: "show grants | show grants for user <username> | show grants for role <role>",
+    },
+    CommandInfo {
+        name: "whoami",
+        usage: "whoami",
     },
     CommandInfo {
         name: "multi",
@@ -255,10 +315,78 @@ pub enum Command {
     DbSize,
     Info,
     Metrics,
+    MetricsProm,
     List,
     Clear,
     Count,
     Save,
+    Backup,
+    BackupTo {
+        path: String,
+    },
+    BackupVerify {
+        dump: String,
+    },
+    BackupVerifyFrom {
+        path: String,
+    },
+    Restore {
+        dump: String,
+    },
+    RestoreFrom {
+        path: String,
+    },
+    RestoreCheck {
+        dump: String,
+    },
+    RestoreCheckFrom {
+        path: String,
+    },
+    AlterUserPassword {
+        username: String,
+        password: String,
+    },
+    CreateUser {
+        username: String,
+        password: String,
+    },
+    DropUser {
+        username: String,
+    },
+    CreateRole {
+        role: String,
+    },
+    DropRole {
+        role: String,
+    },
+    GrantRole {
+        role: String,
+        username: String,
+    },
+    RevokeRole {
+        role: String,
+        username: String,
+    },
+    GrantPermission {
+        permission: String,
+        pattern: String,
+        role: String,
+    },
+    RevokePermission {
+        permission: String,
+        pattern: String,
+        role: String,
+    },
+    ShowUsers,
+    ShowRoles,
+    ShowGrants,
+    ShowGrantsForUser {
+        username: String,
+    },
+    ShowGrantsForRole {
+        role: String,
+    },
+    WhoAmI,
     Multi,
     Exec,
     Discard,

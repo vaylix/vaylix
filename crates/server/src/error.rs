@@ -41,6 +41,32 @@ pub enum ServerError {
     NoActiveTransaction,
     #[error("unsupported remote command")]
     UnsupportedRemoteCommand,
+    #[error("permission denied")]
+    PermissionDenied,
+    #[error("unknown permission: {0}")]
+    InvalidPermission(String),
+    #[error("user already exists: {0}")]
+    UserAlreadyExists(String),
+    #[error("user not found: {0}")]
+    UserNotFound(String),
+    #[error("role already exists: {0}")]
+    RoleAlreadyExists(String),
+    #[error("role not found: {0}")]
+    RoleNotFound(String),
+    #[error("role is protected: {0}")]
+    ProtectedRole(String),
+    #[error("cannot remove the last admin user")]
+    LastAdminUser,
+    #[error("auth store serialization failed: {0}")]
+    AuthStoreEncode(String),
+    #[error("auth store deserialization failed: {0}")]
+    AuthStoreDecode(String),
+    #[error("backup path is outside the configured backup directory: {0}")]
+    BackupPathRejected(String),
+    #[error("audit log hash chain verification failed: {0}")]
+    AuditChainVerification(String),
+    #[error("backup verification failed: {0}")]
+    BackupVerification(String),
 }
 
 impl ServerError {
@@ -64,6 +90,19 @@ impl ServerError {
             Self::TransactionAlreadyActive => "SRV-014",
             Self::NoActiveTransaction => "SRV-015",
             Self::UnsupportedRemoteCommand => "SRV-016",
+            Self::PermissionDenied => "SRV-017",
+            Self::InvalidPermission(_) => "SRV-018",
+            Self::UserAlreadyExists(_) => "SRV-019",
+            Self::UserNotFound(_) => "SRV-020",
+            Self::RoleAlreadyExists(_) => "SRV-021",
+            Self::RoleNotFound(_) => "SRV-022",
+            Self::ProtectedRole(_) => "SRV-023",
+            Self::LastAdminUser => "SRV-024",
+            Self::AuthStoreEncode(_) => "SRV-025",
+            Self::AuthStoreDecode(_) => "SRV-026",
+            Self::BackupPathRejected(_) => "SRV-027",
+            Self::AuditChainVerification(_) => "SRV-028",
+            Self::BackupVerification(_) => "SRV-029",
         }
     }
 
@@ -87,6 +126,19 @@ impl ServerError {
             Self::TransactionAlreadyActive => "Transaction Already Active",
             Self::NoActiveTransaction => "No Active Transaction",
             Self::UnsupportedRemoteCommand => "Unsupported Remote Command",
+            Self::PermissionDenied => "Permission Denied",
+            Self::InvalidPermission(_) => "Invalid Permission",
+            Self::UserAlreadyExists(_) => "User Already Exists",
+            Self::UserNotFound(_) => "User Not Found",
+            Self::RoleAlreadyExists(_) => "Role Already Exists",
+            Self::RoleNotFound(_) => "Role Not Found",
+            Self::ProtectedRole(_) => "Protected Role",
+            Self::LastAdminUser => "Last Admin User",
+            Self::AuthStoreEncode(_) => "Auth Store Serialization Failure",
+            Self::AuthStoreDecode(_) => "Auth Store Deserialization Failure",
+            Self::BackupPathRejected(_) => "Backup Path Rejected",
+            Self::AuditChainVerification(_) => "Audit Chain Verification Failure",
+            Self::BackupVerification(_) => "Backup Verification Failure",
         }
     }
 }

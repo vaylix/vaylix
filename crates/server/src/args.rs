@@ -69,6 +69,10 @@ pub struct Args {
     #[arg(long, env = "VAYLIX_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
+    /// Directory used for server-side logical backup and restore files.
+    #[arg(long, env = "VAYLIX_BACKUP_DIR")]
+    pub backup_dir: Option<PathBuf>,
+
     /// WAL durability mode for each committed write.
     #[arg(
         long,
@@ -125,6 +129,10 @@ pub struct Args {
     /// Optional audit log path override. Defaults to <data-dir>/audit.log.
     #[arg(long)]
     pub audit_log_path: Option<PathBuf>,
+
+    /// Record slow-command audit events at or above this latency in milliseconds. Use 0 to disable.
+    #[arg(long, env = "VAYLIX_SLOW_COMMAND_THRESHOLD_MS", default_value_t = 100)]
+    pub slow_command_threshold_ms: u64,
 }
 
 #[cfg(test)]

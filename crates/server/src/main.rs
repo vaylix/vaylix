@@ -17,16 +17,22 @@ async fn try_main() -> server::Result<()> {
     {
         return Err(server::ServerError::TlsConfiguration);
     }
-    let auth_config = if args.disable_auth {
-        None
-    } else {
-        Some(server::auth::AuthConfig::new(args.user, args.password)?)
-    };
     let paths = match args.data_dir {
         Some(data_dir) => engine::Paths::from_data_dir(data_dir)?,
         None => engine::Paths::new()?,
     };
     let keyring = engine::load_or_create_keyring(&paths.keyring_path, &paths.keyring_tmp_path)?;
+    let auth_config = if args.disable_auth {
+        None
+    } else {
+        Some(server::auth::AuthConfig::load_or_bootstrap(
+            paths.auth_path.clone(),
+            paths.auth_tmp_path.clone(),
+            keyring.clone(),
+            args.user,
+            args.password,
+        )?)
+    };
     let engine_options = engine::EngineOptions {
         wal_sync: match args.wal_sync {
             WalSyncMode::Buffered => engine::WalSyncPolicy::Buffered,
@@ -56,6 +62,7 @@ async fn try_main() -> server::Result<()> {
         CodecOptions {
             compression: CompressionMode::None,
             compression_threshold_bytes: 0,
+            ..CodecOptions::default()
         }
     } else {
         CodecOptions::default()
@@ -65,6 +72,12 @@ async fn try_main() -> server::Result<()> {
         .clone()
         .unwrap_or_else(|| paths.data_dir.join("audit.log"));
     let audit_logger = server::audit::AuditLogger::open(&audit_log_path)?;
+    let backup_dir = args
+        .backup_dir
+        .clone()
+        .unwrap_or_else(|| paths.data_dir.join("backups"));
+    std::fs::create_dir_all(&backup_dir)?;
+    let mtls_enabled = args.tls_client_ca.is_some();
     let runtime = server::server::ServerRuntimeConfig {
         snapshot_interval: args
             .snapshot_interval_seconds
@@ -88,6 +101,15 @@ async fn try_main() -> server::Result<()> {
         tls_config,
         transport,
         audit_logger: std::sync::Arc::new(audit_logger),
+        backup_dir,
+        mtls_enabled,
+        slow_command_threshold: if args.slow_command_threshold_ms == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(
+                args.slow_command_threshold_ms,
+            ))
+        },
     };
     let server = Server::new(
         args.bind,

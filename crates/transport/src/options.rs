@@ -1,3 +1,5 @@
+use crate::constants::MAX_FRAME_LEN;
+
 /// Frame compression modes supported by the transport layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionMode {
@@ -25,6 +27,10 @@ pub struct CodecOptions {
     pub compression: CompressionMode,
     /// Minimum payload size required before compression is attempted.
     pub compression_threshold_bytes: usize,
+    /// Maximum on-wire frame payload size accepted or emitted.
+    pub max_frame_len: usize,
+    /// Maximum decompressed payload size accepted after frame decompression.
+    pub max_decompressed_frame_len: usize,
 }
 
 impl Default for CodecOptions {
@@ -32,6 +38,8 @@ impl Default for CodecOptions {
         Self {
             compression: CompressionMode::Zstd,
             compression_threshold_bytes: 0,
+            max_frame_len: MAX_FRAME_LEN,
+            max_decompressed_frame_len: MAX_FRAME_LEN,
         }
     }
 }
