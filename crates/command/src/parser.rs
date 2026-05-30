@@ -64,6 +64,10 @@ impl Parser {
             "exec" => Self::parse_no_args(&tokens, Command::Exec, "exec"),
             "discard" => Self::parse_no_args(&tokens, Command::Discard, "discard"),
             "maintenance" => Self::parse_maintenance(&tokens),
+            "health" => Self::parse_no_args(&tokens, Command::Health, "health"),
+            "promote" => Self::parse_promote(&tokens),
+            "pause" => Self::parse_replication_toggle(&tokens, true),
+            "resume" => Self::parse_replication_toggle(&tokens, false),
             unknown => Err(CommandError::UnknownCommand {
                 command: unknown.to_string(),
             }),
@@ -498,6 +502,35 @@ impl Parser {
         }
     }
 
+    fn parse_promote(tokens: &[Token]) -> Result<Command> {
+        Self::expect_len(tokens, 2, "promote follower")?;
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "follower" => Ok(Command::PromoteFollower),
+            _ => Err(CommandError::InvalidArity {
+                usage: "promote follower".to_string(),
+            }),
+        }
+    }
+
+    fn parse_replication_toggle(tokens: &[Token], pause: bool) -> Result<Command> {
+        let usage = if pause {
+            "pause replication"
+        } else {
+            "resume replication"
+        };
+        Self::expect_len(tokens, 2, usage)?;
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "replication" => Ok(if pause {
+                Command::PauseReplication
+            } else {
+                Command::ResumeReplication
+            }),
+            _ => Err(CommandError::InvalidArity {
+                usage: usage.to_string(),
+            }),
+        }
+    }
+
     fn parse_alter(tokens: &[Token]) -> Result<Command> {
         Self::expect_len(tokens, 5, "alter user <username> password <password>")?;
         if !Self::token_text(&tokens[1]).eq_ignore_ascii_case("user")
@@ -667,7 +700,7 @@ impl Parser {
     fn parse_show(tokens: &[Token]) -> Result<Command> {
         if tokens.len() != 2 && tokens.len() != 5 {
             return Err(CommandError::InvalidArity {
-                usage: "show users | show roles | show grants | show grants for user <username> | show grants for role <role>"
+                usage: "show users | show roles | show grants | show grants for user <username> | show grants for role <role> | show replication"
                     .to_string(),
             });
         }
@@ -675,6 +708,7 @@ impl Parser {
             "users" if tokens.len() == 2 => Ok(Command::ShowUsers),
             "roles" if tokens.len() == 2 => Ok(Command::ShowRoles),
             "grants" if tokens.len() == 2 => Ok(Command::ShowGrants),
+            "replication" if tokens.len() == 2 => Ok(Command::ShowReplication),
             "grants"
                 if tokens.len() == 5
                     && Self::token_text(&tokens[2]).eq_ignore_ascii_case("for")
@@ -914,6 +948,7 @@ mod tests {
         assert_eq!(Parser::parse("info").unwrap(), Command::Info);
         assert_eq!(Parser::parse("metrics").unwrap(), Command::Metrics);
         assert_eq!(Parser::parse("metrics prom").unwrap(), Command::MetricsProm);
+        assert_eq!(Parser::parse("health").unwrap(), Command::Health);
         assert_eq!(Parser::parse("save").unwrap(), Command::Save);
         assert_eq!(Parser::parse("backup").unwrap(), Command::Backup);
         assert_eq!(
@@ -1034,6 +1069,10 @@ mod tests {
         assert_eq!(Parser::parse("show roles").unwrap(), Command::ShowRoles);
         assert_eq!(Parser::parse("show grants").unwrap(), Command::ShowGrants);
         assert_eq!(
+            Parser::parse("show replication").unwrap(),
+            Command::ShowReplication
+        );
+        assert_eq!(
             Parser::parse("show grants for user alice").unwrap(),
             Command::ShowGrantsForUser {
                 username: "alice".to_string()
@@ -1046,6 +1085,18 @@ mod tests {
             }
         );
         assert_eq!(Parser::parse("whoami").unwrap(), Command::WhoAmI);
+        assert_eq!(
+            Parser::parse("promote follower").unwrap(),
+            Command::PromoteFollower
+        );
+        assert_eq!(
+            Parser::parse("pause replication").unwrap(),
+            Command::PauseReplication
+        );
+        assert_eq!(
+            Parser::parse("resume replication").unwrap(),
+            Command::ResumeReplication
+        );
     }
 
     #[test]
@@ -1080,6 +1131,9 @@ mod tests {
         assert!(Parser::parse("backup verify from").is_err());
         assert!(Parser::parse("backup verify").is_err());
         assert!(Parser::parse("metrics prom extra").is_err());
+        assert!(Parser::parse("promote").is_err());
+        assert!(Parser::parse("pause").is_err());
+        assert!(Parser::parse("resume").is_err());
         assert!(Parser::parse("restore check from").is_err());
         assert!(Parser::parse("grant role readonly alice").is_err());
         assert!(Parser::parse("grant permission read on to readonly").is_err());

@@ -6,7 +6,7 @@ Vaylix is a Rust key/value database built around a strict transport boundary:
 client -> transport -> TCP/TLS -> transport -> server -> engine
 ```
 
-The current server is single-node and stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, and hash-chained audit logging.
+The current server stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, hash-chained audit logging, and manual leader/follower replication with explicit write-ack modes.
 
 Detailed architecture context lives in [LLM.md](LLM.md).
 
@@ -16,7 +16,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.3.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.4.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -70,6 +70,18 @@ Useful runtime environment variables for containers:
 - `VAYLIX_AUTH_FAILURE_LIMIT`
 - `VAYLIX_AUTH_LOCKOUT_SECONDS`
 - `VAYLIX_TRANSACTION_MAX_SECONDS`
+- `VAYLIX_REPLICATION_ROLE`
+- `VAYLIX_NODE_ID`
+- `VAYLIX_REPLICATION_GROUP_ID`
+- `VAYLIX_REPLICATION_ADVERTISE_ADDR`
+- `VAYLIX_REPLICATION_UPSTREAM`
+- `VAYLIX_REPLICATION_USER`
+- `VAYLIX_REPLICATION_PASSWORD`
+- `VAYLIX_WRITE_ACK_MODE`
+- `VAYLIX_REPLICATION_ACK_TIMEOUT_MS`
+- `VAYLIX_REPLICATION_POLL_INTERVAL_MS`
+- `VAYLIX_REPLICATION_FETCH_BATCH_SIZE`
+- `VAYLIX_REPLICATION_STALE_AFTER_SECONDS`
 
 ## Run from Binaries
 

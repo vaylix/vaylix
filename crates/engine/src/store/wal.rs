@@ -228,6 +228,16 @@ pub fn seal_active(wal_dir: &Path, keyring: Option<&StorageKeyring>) -> Result<O
 
 /// Removes oldest sealed segments so that at most `retain_segments` sealed segments remain.
 pub fn prune_sealed_segments(wal_dir: &Path, retain_segments: usize) -> Result<usize> {
+    prune_sealed_segments_with_floor(wal_dir, retain_segments, None)
+}
+
+/// Removes oldest sealed segments so that at most `retain_segments` sealed segments remain, while
+/// preserving any segment range that may contain `minimum_sequence_to_keep`.
+pub fn prune_sealed_segments_with_floor(
+    wal_dir: &Path,
+    retain_segments: usize,
+    minimum_sequence_to_keep: Option<u64>,
+) -> Result<usize> {
     let segments = list_segments(wal_dir)?;
     let sealed = segments
         .into_iter()
@@ -238,10 +248,20 @@ pub fn prune_sealed_segments(wal_dir: &Path, retain_segments: usize) -> Result<u
     }
 
     let remove_count = sealed.len() - retain_segments;
+    let mut removed = 0;
     for segment in sealed.into_iter().take(remove_count) {
+        if let Some(minimum_sequence_to_keep) = minimum_sequence_to_keep {
+            let end_sequence = segment.end_sequence.unwrap_or(segment.start_sequence);
+            if minimum_sequence_to_keep >= segment.start_sequence
+                && minimum_sequence_to_keep <= end_sequence
+            {
+                continue;
+            }
+        }
         fs::remove_file(segment.path)?;
+        removed += 1;
     }
-    Ok(remove_count)
+    Ok(removed)
 }
 
 /// Writes a sequence of WAL entries into a fresh segmented WAL directory.
