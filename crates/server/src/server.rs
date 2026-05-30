@@ -21,8 +21,8 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use transport::{
-    CodecOptions, Request, Response, Status, TransportError, negotiate_server_options,
-    read_client_hello_from_async, read_request_from_async_with_options,
+    CodecOptions, ExecResultPayload, Request, Response, Status, TransportError,
+    negotiate_server_options, read_client_hello_from_async, read_request_from_async_with_options,
     write_response_to_async_with_options, write_server_hello_to_async,
 };
 use uuid::Uuid;
@@ -1880,14 +1880,14 @@ async fn handle_transaction_command(
                 validate_transaction_command(command)?;
             }
             let results = engine.execute_batch(request_id, queued.clone()).await?;
-            let mut rendered = Vec::with_capacity(results.len());
-            for (queued_command, result) in queued.iter().zip(results) {
-                rendered.push(Some(render_transaction_result(queued_command, result)?));
+            let mut encoded = Vec::with_capacity(results.len());
+            for (_queued_command, result) in queued.iter().zip(results) {
+                encoded.push(map_transaction_result_payload(result));
             }
             metrics
                 .transactions_committed
                 .fetch_add(1, Ordering::Relaxed);
-            Ok(Response::strings(request_id, &rendered)?)
+            Ok(Response::exec_results(request_id, &encoded)?)
         }
         Command::Auth { .. } => Err(ServerError::AuthenticationFailed),
         other => {
@@ -2215,29 +2215,20 @@ where
     }
 }
 
-fn render_transaction_result(_command: &Command, result: TransactionResult) -> Result<String> {
+fn map_transaction_result_payload(result: TransactionResult) -> ExecResultPayload {
     match result {
-        TransactionResult::Ok => Ok("OK".to_string()),
-        TransactionResult::NotFound => Ok("NOT_FOUND".to_string()),
-        TransactionResult::Value(value) => Ok(value),
-        TransactionResult::Boolean(value) => Ok(value.to_string()),
-        TransactionResult::Count(value) => Ok(value.to_string()),
-        TransactionResult::Integer(value) => Ok(value.to_string()),
-        TransactionResult::Entries(entries) => Ok(entries
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(", ")),
-        TransactionResult::Strings(values) => Ok(values
-            .into_iter()
-            .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
-            .collect::<Vec<_>>()
-            .join(", ")),
-        TransactionResult::Scan(scan) => Ok(format!(
-            "cursor={}, keys=[{}]",
-            scan.next_cursor,
-            scan.keys.join(", ")
-        )),
+        TransactionResult::Ok => ExecResultPayload::Ok,
+        TransactionResult::NotFound => ExecResultPayload::NotFound,
+        TransactionResult::Value(value) => ExecResultPayload::Value(value),
+        TransactionResult::Boolean(value) => ExecResultPayload::Boolean(value),
+        TransactionResult::Count(value) => ExecResultPayload::Count(value),
+        TransactionResult::Integer(value) => ExecResultPayload::Integer(value),
+        TransactionResult::Entries(entries) => ExecResultPayload::Entries(entries),
+        TransactionResult::Strings(values) => ExecResultPayload::Strings(values),
+        TransactionResult::Scan(scan) => ExecResultPayload::Scan(transport::ScanPayload {
+            next_cursor: scan.next_cursor,
+            keys: scan.keys,
+        }),
     }
 }
 

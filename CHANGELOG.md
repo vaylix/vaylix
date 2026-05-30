@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-30
+
+### Changed
+
+- `EXEC` now returns a structured typed transport payload instead of a lossy string list.
+- The Rust client now renders `EXEC` output from typed transport results rather than reparsing flattened strings.
+
+### Breaking
+
+- `0.3.0` changes the wire format of successful `EXEC` responses.
+- `0.2.x` clients that assume `EXEC` returns `Response::strings(...)` are not wire-compatible with `0.3.0` servers for transaction result decoding.
+
 ## [0.2.0] - 2026-05-29
 
 ### Added

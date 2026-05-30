@@ -16,7 +16,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.2.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.3.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 

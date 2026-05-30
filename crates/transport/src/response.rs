@@ -18,6 +18,20 @@ pub struct ScanPayload {
     pub keys: Vec<String>,
 }
 
+/// Typed result of one command inside a committed `EXEC` batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecResultPayload {
+    Ok,
+    NotFound,
+    Value(String),
+    Boolean(bool),
+    Count(u64),
+    Integer(i64),
+    Entries(Vec<(String, String)>),
+    Strings(Vec<Option<String>>),
+    Scan(ScanPayload),
+}
+
 /// Machine-readable status code for a transport response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -156,6 +170,20 @@ impl Response {
         Ok(Self::new(request_id, Status::Ok, buf.to_vec()))
     }
 
+    /// Builds a response containing typed `EXEC` results.
+    pub fn exec_results(request_id: Uuid, results: &[ExecResultPayload]) -> Result<Self> {
+        let result_count =
+            u32::try_from(results.len()).map_err(|_| TransportError::CorruptedPayload)?;
+        let mut buf = BytesMut::new();
+        buf.put_u32(result_count);
+
+        for result in results {
+            encode_exec_result(&mut buf, result)?;
+        }
+
+        Ok(Self::new(request_id, Status::Ok, buf.to_vec()))
+    }
+
     pub fn decode_value(&self) -> Result<String> {
         decode_string_u32(&self.payload)
     }
@@ -265,6 +293,24 @@ impl Response {
 
         Ok(ScanPayload { next_cursor, keys })
     }
+
+    pub fn decode_exec_results(&self) -> Result<Vec<ExecResultPayload>> {
+        let mut buf = self.payload.as_slice();
+
+        if buf.remaining() < 4 {
+            return Err(TransportError::UnexpectedEof);
+        }
+
+        let result_count = buf.get_u32() as usize;
+        let mut results = Vec::with_capacity(result_count);
+
+        for _ in 0..result_count {
+            results.push(decode_exec_result(&mut buf)?);
+        }
+
+        ensure_empty(buf)?;
+        Ok(results)
+    }
 }
 
 fn encode_string_u32(value: &str) -> Result<Vec<u8>> {
@@ -286,6 +332,132 @@ fn encode_error_payload(code: &str, name: &str, message: &str) -> Result<Vec<u8>
     put_string_u16(&mut buf, name)?;
     put_string_u32(&mut buf, message)?;
     Ok(buf.to_vec())
+}
+
+fn encode_exec_result(buf: &mut BytesMut, result: &ExecResultPayload) -> Result<()> {
+    match result {
+        ExecResultPayload::Ok => buf.put_u8(0x00),
+        ExecResultPayload::NotFound => buf.put_u8(0x01),
+        ExecResultPayload::Value(value) => {
+            buf.put_u8(0x02);
+            put_string_u32(buf, value)?;
+        }
+        ExecResultPayload::Boolean(value) => {
+            buf.put_u8(0x03);
+            buf.put_u8(u8::from(*value));
+        }
+        ExecResultPayload::Count(value) => {
+            buf.put_u8(0x04);
+            buf.put_u64(*value);
+        }
+        ExecResultPayload::Integer(value) => {
+            buf.put_u8(0x05);
+            buf.put_i64(*value);
+        }
+        ExecResultPayload::Entries(entries) => {
+            buf.put_u8(0x06);
+            let count =
+                u32::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
+            buf.put_u32(count);
+            for (key, value) in entries {
+                put_string_u16(buf, key)?;
+                put_string_u32(buf, value)?;
+            }
+        }
+        ExecResultPayload::Strings(values) => {
+            buf.put_u8(0x07);
+            let count =
+                u32::try_from(values.len()).map_err(|_| TransportError::CorruptedPayload)?;
+            buf.put_u32(count);
+            for value in values {
+                match value {
+                    Some(value) => {
+                        buf.put_u8(1);
+                        put_string_u32(buf, value)?;
+                    }
+                    None => buf.put_u8(0),
+                }
+            }
+        }
+        ExecResultPayload::Scan(scan) => {
+            buf.put_u8(0x08);
+            buf.put_u64(scan.next_cursor);
+            let count =
+                u32::try_from(scan.keys.len()).map_err(|_| TransportError::CorruptedPayload)?;
+            buf.put_u32(count);
+            for key in &scan.keys {
+                put_string_u16(buf, key)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_exec_result(buf: &mut &[u8]) -> Result<ExecResultPayload> {
+    if buf.remaining() < 1 {
+        return Err(TransportError::UnexpectedEof);
+    }
+
+    match buf.get_u8() {
+        0x00 => Ok(ExecResultPayload::Ok),
+        0x01 => Ok(ExecResultPayload::NotFound),
+        0x02 => Ok(ExecResultPayload::Value(read_string_u32(buf)?)),
+        0x03 => Ok(ExecResultPayload::Boolean(read_bool(buf)?)),
+        0x04 => {
+            if buf.remaining() < 8 {
+                return Err(TransportError::UnexpectedEof);
+            }
+            Ok(ExecResultPayload::Count(buf.get_u64()))
+        }
+        0x05 => {
+            if buf.remaining() < 8 {
+                return Err(TransportError::UnexpectedEof);
+            }
+            Ok(ExecResultPayload::Integer(buf.get_i64()))
+        }
+        0x06 => {
+            if buf.remaining() < 4 {
+                return Err(TransportError::UnexpectedEof);
+            }
+            let entry_count = buf.get_u32() as usize;
+            let mut entries = Vec::with_capacity(entry_count);
+            for _ in 0..entry_count {
+                entries.push((read_string_u16(buf)?, read_string_u32(buf)?));
+            }
+            Ok(ExecResultPayload::Entries(entries))
+        }
+        0x07 => {
+            if buf.remaining() < 4 {
+                return Err(TransportError::UnexpectedEof);
+            }
+            let value_count = buf.get_u32() as usize;
+            let mut values = Vec::with_capacity(value_count);
+            for _ in 0..value_count {
+                if buf.remaining() < 1 {
+                    return Err(TransportError::UnexpectedEof);
+                }
+                match buf.get_u8() {
+                    0 => values.push(None),
+                    1 => values.push(Some(read_string_u32(buf)?)),
+                    _ => return Err(TransportError::CorruptedPayload),
+                }
+            }
+            Ok(ExecResultPayload::Strings(values))
+        }
+        0x08 => {
+            if buf.remaining() < 12 {
+                return Err(TransportError::UnexpectedEof);
+            }
+            let next_cursor = buf.get_u64();
+            let key_count = buf.get_u32() as usize;
+            let mut keys = Vec::with_capacity(key_count);
+            for _ in 0..key_count {
+                keys.push(read_string_u16(buf)?);
+            }
+            Ok(ExecResultPayload::Scan(ScanPayload { next_cursor, keys }))
+        }
+        _ => Err(TransportError::CorruptedPayload),
+    }
 }
 
 fn decode_error_payload(payload: &[u8]) -> Result<ErrorPayload> {
@@ -344,6 +516,18 @@ fn read_string(buf: &mut &[u8], length: usize) -> Result<String> {
     Ok(String::from_utf8(bytes.to_vec())?)
 }
 
+fn read_bool(buf: &mut &[u8]) -> Result<bool> {
+    if buf.remaining() < 1 {
+        return Err(TransportError::UnexpectedEof);
+    }
+
+    match buf.get_u8() {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(TransportError::CorruptedPayload),
+    }
+}
+
 fn ensure_empty(buf: &[u8]) -> Result<()> {
     if buf.is_empty() {
         Ok(())
@@ -354,7 +538,7 @@ fn ensure_empty(buf: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Response, Status};
+    use super::{ExecResultPayload, Response, ScanPayload, Status};
     use crate::TransportError;
     use uuid::Uuid;
 
@@ -406,6 +590,40 @@ mod tests {
         let decoded = scan.decode_scan().unwrap();
         assert_eq!(decoded.next_cursor, 10);
         assert_eq!(decoded.keys, vec!["one".to_string(), "two".to_string()]);
+
+        let exec = Response::exec_results(
+            id(8),
+            &[
+                ExecResultPayload::Ok,
+                ExecResultPayload::Value("alpha".to_string()),
+                ExecResultPayload::Boolean(true),
+                ExecResultPayload::Count(7),
+                ExecResultPayload::Integer(-2),
+                ExecResultPayload::Entries(vec![("name".to_string(), "alice".to_string())]),
+                ExecResultPayload::Strings(vec![Some("one".to_string()), None]),
+                ExecResultPayload::Scan(ScanPayload {
+                    next_cursor: 22,
+                    keys: vec!["k1".to_string(), "k2".to_string()],
+                }),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            exec.decode_exec_results().unwrap(),
+            vec![
+                ExecResultPayload::Ok,
+                ExecResultPayload::Value("alpha".to_string()),
+                ExecResultPayload::Boolean(true),
+                ExecResultPayload::Count(7),
+                ExecResultPayload::Integer(-2),
+                ExecResultPayload::Entries(vec![("name".to_string(), "alice".to_string())]),
+                ExecResultPayload::Strings(vec![Some("one".to_string()), None]),
+                ExecResultPayload::Scan(ScanPayload {
+                    next_cursor: 22,
+                    keys: vec!["k1".to_string(), "k2".to_string()],
+                }),
+            ]
+        );
     }
 
     #[test]

@@ -389,9 +389,9 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::MaintenanceOff
             | Command::Discard => Ok("OK".to_string()),
             Command::Exec => Ok(response
-                .decode_strings()?
+                .decode_exec_results()?
                 .into_iter()
-                .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
+                .map(render_exec_result)
                 .collect::<Vec<_>>()
                 .join("\n")),
             Command::SetNx { .. }
@@ -443,6 +443,34 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             }
             Command::Help | Command::Exit => Err(ClientError::LocalCommandResponse),
         },
+    }
+}
+
+fn render_exec_result(result: transport::ExecResultPayload) -> String {
+    match result {
+        transport::ExecResultPayload::Ok => "OK".to_string(),
+        transport::ExecResultPayload::NotFound => "NOT_FOUND".to_string(),
+        transport::ExecResultPayload::Value(value) => value,
+        transport::ExecResultPayload::Boolean(value) => value.to_string(),
+        transport::ExecResultPayload::Count(value) => value.to_string(),
+        transport::ExecResultPayload::Integer(value) => value.to_string(),
+        transport::ExecResultPayload::Entries(entries) => entries
+            .into_iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        transport::ExecResultPayload::Strings(values) => values
+            .into_iter()
+            .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
+            .collect::<Vec<_>>()
+            .join(", "),
+        transport::ExecResultPayload::Scan(scan) => {
+            format!(
+                "cursor={}, keys=[{}]",
+                scan.next_cursor,
+                scan.keys.join(", ")
+            )
+        }
     }
 }
 
@@ -513,7 +541,7 @@ fn log_event(level: &str, component: &str, message: &str) {
 #[cfg(test)]
 mod tests {
     use command::{Command, Expiration, SetCondition, SetOptions};
-    use transport::{CodecOptions, Response, Status};
+    use transport::{CodecOptions, ExecResultPayload, Response, Status};
     use uuid::Uuid;
 
     use super::{ClientConfig, OutputMode, help_text, render_response, render_table};
@@ -537,8 +565,11 @@ mod tests {
         assert_eq!(
             render_response(
                 &Command::Exec,
-                &Response::strings(id(2), &[Some("OK".to_string()), Some("1".to_string())])
-                    .unwrap(),
+                &Response::exec_results(
+                    id(2),
+                    &[ExecResultPayload::Ok, ExecResultPayload::Count(1)],
+                )
+                .unwrap(),
                 OutputMode::Plain,
             )
             .unwrap(),

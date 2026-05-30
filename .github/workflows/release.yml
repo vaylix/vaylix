@@ -169,19 +169,69 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  publish-docker:
-    name: Publish Docker Image
-    runs-on: ubuntu-latest
-
+  publish-docker-platform:
+    name: Publish Docker Image (${{ matrix.platform }})
     needs:
       - release-binaries
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            platform_suffix: amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            platform_suffix: arm64
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.title=Vaylix
+            org.opencontainers.image.description=Vaylix database server
+
+      - name: Build and push platform image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}-${{ matrix.platform_suffix }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=docker-${{ matrix.platform_suffix }}
+          cache-to: type=gha,mode=max,scope=docker-${{ matrix.platform_suffix }}
+
+  publish-docker-manifest:
+    name: Publish Docker Manifest
+    runs-on: ubuntu-24.04
+    needs:
+      - release-binaries
+      - publish-docker-platform
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -199,39 +249,48 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE_NAME }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+      - name: Create multi-arch manifest
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Build and push multi-arch image
-        id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          platforms: |
-            linux/amd64,linux/arm64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          version_tag="${GITHUB_REF_NAME#v}"
+          amd64_ref="${IMAGE_NAME}:${GITHUB_REF_NAME}-amd64"
+          arm64_ref="${IMAGE_NAME}:${GITHUB_REF_NAME}-arm64"
+          final_refs=("${IMAGE_NAME}:${version_tag}")
+
+          if [[ "${GITHUB_REF_NAME}" != *-* ]]; then
+            final_refs+=("${IMAGE_NAME}:latest")
+          fi
+
+          for final_ref in "${final_refs[@]}"; do
+            docker buildx imagetools create \
+              --tag "${final_ref}" \
+              "${amd64_ref}" \
+              "${arm64_ref}"
+          done
+
+      - name: Inspect multi-arch manifest
+        id: inspect
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_tag="${GITHUB_REF_NAME#v}"
+          image_ref="${IMAGE_NAME}:${version_tag}"
+          digest="$(docker buildx imagetools inspect "${image_ref}" --format '{{json .Manifest}}' | jq -r '.digest')"
+          echo "image_ref=${image_ref}" >> "$GITHUB_OUTPUT"
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
       - name: Sign Docker image and publish SBOM attestation
         shell: bash
         run: |
           set -euo pipefail
 
-          image_ref="${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+          image_ref="${IMAGE_NAME}@${{ steps.inspect.outputs.digest }}"
           sbom="vaylix-docker-${GITHUB_REF_NAME}.sbom.spdx.json"
 
           cosign sign --yes "${image_ref}"
-          syft "${image_ref}" -o "spdx-json=${sbom}"
+          syft "${{ steps.inspect.outputs.image_ref }}" -o "spdx-json=${sbom}"
           cosign attest --yes --predicate "${sbom}" --type spdx "${image_ref}"
 
       - name: Upload Docker SBOM

@@ -387,7 +387,7 @@ mod tests {
 
     #[test]
     fn client_and_server_hello_round_trip() {
-        let client = ClientHello::new("vaylix-client", "0.2.0");
+        let client = ClientHello::new("vaylix-client", "0.3.0");
         let mut wire = Cursor::new(Vec::new());
         write_client_hello_to(&mut wire, &client).unwrap();
         assert_eq!(wire.get_ref()[5], 0);
@@ -409,7 +409,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_protocol_version() {
-        let mut hello = ClientHello::new("vaylix-client", "0.2.0");
+        let mut hello = ClientHello::new("vaylix-client", "0.3.0");
         hello.protocol_version = VERSION + 1;
         assert!(matches!(
             negotiate_server_options(&hello, CodecOptions::default()),
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn negotiates_compression_and_frame_limits() {
-        let mut hello = ClientHello::new("vaylix-client", "0.2.0");
+        let mut hello = ClientHello::new("vaylix-client", "0.3.0");
         hello.max_frame_len = 1024;
         let (server, options) = negotiate_server_options(&hello, CodecOptions::default()).unwrap();
         assert_eq!(server.compression, CompressionMode::Zstd);

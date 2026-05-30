@@ -219,7 +219,7 @@ async fn negotiate<S>(stream: &mut S)
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let hello = ClientHello::new("tcp-integration-test", "0.2.0");
+    let hello = ClientHello::new("tcp-integration-test", "0.3.0");
     write_client_hello_to_async(stream, &hello).await.unwrap();
     let response = read_server_hello_from_async(stream).await.unwrap();
     assert_eq!(response.status, Status::Ok);
@@ -383,7 +383,7 @@ async fn negotiates_compression_none_when_client_requests_it() {
         .await
         .unwrap()
         .unwrap();
-    let mut hello = ClientHello::new("tcp-integration-test", "0.2.0");
+    let mut hello = ClientHello::new("tcp-integration-test", "0.3.0");
     hello.desired_compression = CompressionMode::None;
     write_client_hello_to_async(&mut stream, &hello)
         .await

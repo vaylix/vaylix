@@ -33,4 +33,4 @@ pub use opcode::Opcode;
 pub use options::{CodecOptions, CompressionMode};
 pub use request::Request;
 pub use request::RequestMetadata;
-pub use response::{ErrorPayload, Response, ScanPayload, Status};
+pub use response::{ErrorPayload, ExecResultPayload, Response, ScanPayload, Status};
