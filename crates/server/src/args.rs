@@ -14,6 +14,20 @@ pub enum WalSyncMode {
     Sync,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ReplicationRoleMode {
+    Standalone,
+    Leader,
+    Follower,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum WriteAckModeArg {
+    Local,
+    Replica,
+    All,
+}
+
 /// Command-line arguments for the Vaylix server binary.
 #[derive(Parser, Debug)]
 #[command(name = "vaylix", about = "Vaylix database server")]
@@ -168,6 +182,80 @@ pub struct Args {
     /// Lockout duration in seconds after exceeding the auth failure limit.
     #[arg(long, env = "VAYLIX_AUTH_LOCKOUT_SECONDS", default_value_t = 900)]
     pub auth_lockout_seconds: u64,
+
+    /// Replication role for this node.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_ROLE",
+        value_enum,
+        default_value_t = ReplicationRoleMode::Standalone
+    )]
+    pub replication_role: ReplicationRoleMode,
+
+    /// Stable node identifier used by replication metadata and follower acknowledgements.
+    #[arg(long, env = "VAYLIX_NODE_ID")]
+    pub node_id: Option<String>,
+
+    /// Stable replication group identifier shared by leader and followers.
+    #[arg(long, env = "VAYLIX_REPLICATION_GROUP_ID", default_value = "default")]
+    pub replication_group_id: String,
+
+    /// Address advertised by a leader for replication diagnostics.
+    #[arg(long, env = "VAYLIX_REPLICATION_ADVERTISE_ADDR")]
+    pub replication_advertise_addr: Option<String>,
+
+    /// Upstream leader address for follower replication, in host:port form.
+    #[arg(long, env = "VAYLIX_REPLICATION_UPSTREAM")]
+    pub replication_upstream: Option<String>,
+
+    /// Upstream leader username used by followers when authenticating replication requests.
+    #[arg(long, env = "VAYLIX_REPLICATION_USER")]
+    pub replication_user: Option<String>,
+
+    /// Upstream leader password used by followers when authenticating replication requests.
+    #[arg(long, env = "VAYLIX_REPLICATION_PASSWORD")]
+    pub replication_password: Option<String>,
+
+    /// Client-visible write acknowledgement mode.
+    #[arg(
+        long,
+        env = "VAYLIX_WRITE_ACK_MODE",
+        value_enum,
+        default_value_t = WriteAckModeArg::Local
+    )]
+    pub write_ack_mode: WriteAckModeArg,
+
+    /// Maximum time in milliseconds to wait for follower acknowledgements.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_ACK_TIMEOUT_MS",
+        default_value_t = 5_000
+    )]
+    pub replication_ack_timeout_ms: u64,
+
+    /// Follower poll interval in milliseconds when syncing from a leader.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_POLL_INTERVAL_MS",
+        default_value_t = 250
+    )]
+    pub replication_poll_interval_ms: u64,
+
+    /// Maximum WAL entries fetched by a follower in one replication round trip.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_FETCH_BATCH_SIZE",
+        default_value_t = 256
+    )]
+    pub replication_fetch_batch_size: usize,
+
+    /// Follower lag threshold in seconds before health degrades to stale.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_STALE_AFTER_SECONDS",
+        default_value_t = 15
+    )]
+    pub replication_stale_after_seconds: u64,
 }
 
 #[derive(Subcommand, Debug)]

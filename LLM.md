@@ -84,7 +84,7 @@ Not yet true:
 - MVCC
 - distributed transactions
 - formal isolation levels
-- replication-aware commit coordination
+- automatic failover or quorum elections
 
 Design direction:
 
@@ -131,8 +131,8 @@ Current negotiated capabilities:
 - `pipelining`
 - `trace_context`
 
-Protocol `0.2.x` and `0.3.x` intentionally reject pre-v2 frames. `0.1.0` clients and servers are not wire-compatible with `0.2.0+`.
-Within protocol v2, `0.3.0` changes successful `EXEC` responses from a lossy string list to a structured typed result payload. `0.2.x` clients are therefore not transaction-wire-compatible with `0.3.0` servers.
+Protocol `0.2.x`, `0.3.x`, and `0.4.x` intentionally reject pre-v2 frames. `0.1.0` clients and servers are not wire-compatible with `0.2.0+`.
+Within protocol v2, `0.3.0` changes successful `EXEC` responses from a lossy string list to a structured typed result payload. `0.2.x` clients are therefore not transaction-wire-compatible with `0.3.0+` servers.
 
 ### Request IDs
 
@@ -444,9 +444,9 @@ Passwords and payload contents are not written to the audit log. Semantic event 
 
 Current state:
 
-- single node only
-- no replication
-- no sharding
+- manual leader/follower replication over the main transport
+- follower-side polling with snapshot bootstrap plus WAL catch-up
+- no automatic failover or sharding
 
 Architectural target:
 
@@ -577,14 +577,14 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.3.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.4.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 
 ## Current Gaps
 
 - full distributed ACID semantics are not implemented
-- no replication or sharding yet
+- no automatic failover, elections, quorum commits, or sharding yet
 - PITR is offline-first and there is no online WAL archive/PITR workflow yet
 - backup/restore remains logical JSON based; there is no separate streaming backup utility yet
 - no TLS certificate automation or rotation workflow yet

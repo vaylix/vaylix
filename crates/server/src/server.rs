@@ -17,7 +17,7 @@ use engine::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use transport::{
@@ -31,6 +31,10 @@ use crate::audit::{AuditEvent, AuditLogger};
 use crate::auth::{AuthConfig, Identity, Permission};
 use crate::error::{Result, ServerError};
 use crate::metrics::Metrics;
+use crate::replication::{
+    FollowerPhase, ReplicationAckRequest, ReplicationFetchRequest, ReplicationRole,
+    ReplicationRuntime, ReplicationStatusSnapshot,
+};
 
 const BACKUP_MANIFEST_VERSION: u32 = 1;
 const BACKUP_HASH_ALGORITHM: &str = "sha256";
@@ -71,6 +75,7 @@ pub struct ServerRuntimeConfig {
     pub auth_lockouts: Arc<Mutex<AuthLockoutState>>,
     pub insecure_auth_disabled: bool,
     pub insecure_default_credentials: bool,
+    pub replication: Arc<ReplicationRuntime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +114,22 @@ enum EngineRequest {
     },
     SweepExpired {
         respond_to: oneshot::Sender<Result<usize>>,
+    },
+    ReplicationSnapshot {
+        respond_to: oneshot::Sender<Result<engine::ReplicationSnapshot>>,
+    },
+    WalEntriesSince {
+        after_sequence: u64,
+        limit: usize,
+        respond_to: oneshot::Sender<Result<Vec<engine::WalEntry>>>,
+    },
+    ApplyReplicationSnapshot {
+        snapshot: engine::ReplicationSnapshot,
+        respond_to: oneshot::Sender<Result<u64>>,
+    },
+    ApplyReplicationEntries {
+        entries: Vec<engine::WalEntry>,
+        respond_to: oneshot::Sender<Result<u64>>,
     },
 }
 
@@ -156,6 +177,41 @@ impl EngineHandle {
                     }
                     EngineRequest::SweepExpired { respond_to } => {
                         let _ = respond_to.send(engine.sweep_expired().map_err(ServerError::from));
+                    }
+                    EngineRequest::ReplicationSnapshot { respond_to } => {
+                        let _ = respond_to.send(Ok(engine.replication_snapshot()));
+                    }
+                    EngineRequest::WalEntriesSince {
+                        after_sequence,
+                        limit,
+                        respond_to,
+                    } => {
+                        let _ = respond_to.send(
+                            engine
+                                .wal_entries_since(after_sequence, limit)
+                                .map_err(ServerError::from),
+                        );
+                    }
+                    EngineRequest::ApplyReplicationSnapshot {
+                        snapshot,
+                        respond_to,
+                    } => {
+                        let applied_sequence = snapshot.state.metadata.last_applied_sequence;
+                        let result = engine
+                            .apply_replication_snapshot(snapshot)
+                            .map(|()| applied_sequence)
+                            .map_err(ServerError::from);
+                        let _ = respond_to.send(result);
+                    }
+                    EngineRequest::ApplyReplicationEntries {
+                        entries,
+                        respond_to,
+                    } => {
+                        let _ = respond_to.send(
+                            engine
+                                .apply_replication_entries(&entries)
+                                .map_err(ServerError::from),
+                        );
                     }
                 }
             }
@@ -225,6 +281,59 @@ impl EngineHandle {
         self.sender
             .send(EngineRequest::ValidateBackup {
                 dump,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn replication_snapshot(&self) -> Result<engine::ReplicationSnapshot> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::ReplicationSnapshot { respond_to: send })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn wal_entries_since(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<engine::WalEntry>> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::WalEntriesSince {
+                after_sequence,
+                limit,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn apply_replication_snapshot(
+        &self,
+        snapshot: engine::ReplicationSnapshot,
+    ) -> Result<u64> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::ApplyReplicationSnapshot {
+                snapshot,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn apply_replication_entries(&self, entries: Vec<engine::WalEntry>) -> Result<u64> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::ApplyReplicationEntries {
+                entries,
                 respond_to: send,
             })
             .await
@@ -550,6 +659,13 @@ impl Server {
 
         spawn_tls_reloader(runtime.clone(), shutdown_rx.clone());
 
+        let initial_info = engine.info().await?;
+        runtime
+            .replication
+            .set_local_last_applied_sequence(parse_last_applied_sequence(&initial_info))
+            .await;
+        spawn_replication_follower_loop(engine.clone(), runtime.clone(), shutdown_rx.clone());
+
         tokio::pin!(shutdown_signal);
 
         loop {
@@ -745,6 +861,224 @@ fn spawn_tls_reloader(runtime: ServerRuntimeConfig, mut shutdown: watch::Receive
     });
 }
 
+fn spawn_replication_follower_loop(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    if runtime.replication.config().role != ReplicationRole::Follower {
+        return;
+    }
+
+    tokio::spawn(async move {
+        let mut ticker = interval(runtime.replication.config().poll_interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if runtime.replication.is_paused().await {
+                        runtime
+                            .replication
+                            .update_follower_phase(FollowerPhase::Paused, None, None)
+                            .await;
+                        continue;
+                    }
+
+                    let started = Instant::now();
+                    match run_replication_round(engine.clone(), runtime.clone()).await {
+                        Ok((lag_entries, caught_up)) => {
+                            let phase = if caught_up {
+                                FollowerPhase::Streaming
+                            } else {
+                                FollowerPhase::CatchingUp
+                            };
+                            runtime
+                                .replication
+                                .update_follower_phase(
+                                    phase,
+                                    Some(lag_entries),
+                                    Some(started.elapsed().as_millis() as u64),
+                                )
+                                .await;
+                        }
+                        Err(err) => {
+                            log_event(
+                                "WARN",
+                                "server.replication",
+                                &format!("[{}] {}: {err}", err.code(), err.name()),
+                            );
+                            runtime
+                                .replication
+                                .update_follower_phase(FollowerPhase::Stale, None, None)
+                                .await;
+                        }
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+async fn run_replication_round(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+) -> Result<(u64, bool)> {
+    let upstream = runtime
+        .replication
+        .config()
+        .upstream
+        .clone()
+        .ok_or_else(|| {
+            ServerError::InvalidArguments("follower replication upstream is required".to_string())
+        })?;
+    let mut stream = TcpStream::connect(&upstream)
+        .await
+        .map_err(ServerError::Accept)?;
+    let hello = transport::ClientHello::new("vaylix-replication", env!("CARGO_PKG_VERSION"));
+    transport::write_client_hello_to_async(&mut stream, &hello).await?;
+    let server_hello = transport::read_server_hello_from_async(&mut stream).await?;
+    let transport = transport::client_options_from_server_hello(&server_hello)?;
+    if let (Some(username), Some(password)) = (
+        runtime.replication.config().upstream_username.clone(),
+        runtime.replication.config().upstream_password.clone(),
+    ) {
+        let auth = Request::from_command(Uuid::now_v7(), Command::Auth { username, password })?;
+        transport::write_request_to_async_with_options(&mut stream, &auth, transport).await?;
+        let response =
+            transport::read_response_from_async_with_options(&mut stream, transport).await?;
+        if response.status != Status::Ok {
+            return Err(ServerError::AuthenticationFailed);
+        }
+    }
+
+    let status_request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationStatus,
+        Vec::new(),
+    );
+    transport::write_request_to_async_with_options(&mut stream, &status_request, transport).await?;
+    let status_response =
+        transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    if status_response.status != Status::Ok {
+        return Err(ServerError::UnsupportedRemoteCommand);
+    }
+    let leader_status: ReplicationStatusSnapshot = decode_json_payload(&status_response.payload)?;
+    runtime
+        .replication
+        .set_leader_node_id(Some(leader_status.node_id.clone()))
+        .await;
+
+    let local_sequence = parse_last_applied_sequence(&engine.info().await?);
+    let mut current_sequence = local_sequence;
+    if current_sequence == 0 {
+        runtime
+            .replication
+            .update_follower_phase(FollowerPhase::SnapshotSync, None, None)
+            .await;
+        let snapshot_request = Request::new(
+            Uuid::now_v7(),
+            transport::Opcode::ReplicationSnapshot,
+            Vec::new(),
+        );
+        transport::write_request_to_async_with_options(&mut stream, &snapshot_request, transport)
+            .await?;
+        let snapshot_response =
+            transport::read_response_from_async_with_options(&mut stream, transport).await?;
+        if snapshot_response.status != Status::Ok {
+            return Err(ServerError::UnsupportedRemoteCommand);
+        }
+        let snapshot: engine::ReplicationSnapshot =
+            decode_json_payload(&snapshot_response.payload)?;
+        current_sequence = engine.apply_replication_snapshot(snapshot).await?;
+        runtime
+            .replication
+            .set_local_last_applied_sequence(current_sequence)
+            .await;
+    }
+
+    let fetch_request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationFetch,
+        serde_json::to_vec(&ReplicationFetchRequest {
+            after_sequence: current_sequence,
+            limit: runtime.replication.config().fetch_batch_size,
+        })
+        .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &fetch_request, transport).await?;
+    let fetch_response =
+        transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    if fetch_response.status != Status::Ok {
+        return Err(ServerError::UnsupportedRemoteCommand);
+    }
+    let entries: Vec<engine::WalEntry> = decode_json_payload(&fetch_response.payload)?;
+    if !entries.is_empty() {
+        match engine.apply_replication_entries(entries).await {
+            Ok(applied_sequence) => {
+                current_sequence = applied_sequence;
+                runtime
+                    .replication
+                    .set_local_last_applied_sequence(current_sequence)
+                    .await;
+            }
+            Err(ServerError::Engine(engine::EngineError::InvalidStorageOperation(_))) => {
+                let snapshot_request = Request::new(
+                    Uuid::now_v7(),
+                    transport::Opcode::ReplicationSnapshot,
+                    Vec::new(),
+                );
+                transport::write_request_to_async_with_options(
+                    &mut stream,
+                    &snapshot_request,
+                    transport,
+                )
+                .await?;
+                let snapshot_response =
+                    transport::read_response_from_async_with_options(&mut stream, transport)
+                        .await?;
+                if snapshot_response.status != Status::Ok {
+                    return Err(ServerError::UnsupportedRemoteCommand);
+                }
+                let snapshot: engine::ReplicationSnapshot =
+                    decode_json_payload(&snapshot_response.payload)?;
+                current_sequence = engine.apply_replication_snapshot(snapshot).await?;
+                runtime
+                    .replication
+                    .set_local_last_applied_sequence(current_sequence)
+                    .await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    let ack_request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationAck,
+        serde_json::to_vec(&ReplicationAckRequest {
+            follower_node_id: runtime.replication.config().node_id.clone(),
+            applied_sequence: current_sequence,
+        })
+        .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &ack_request, transport).await?;
+    let ack_response =
+        transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    if ack_response.status != Status::Ok {
+        return Err(ServerError::UnsupportedRemoteCommand);
+    }
+
+    let lag_entries = leader_status
+        .commit_sequence
+        .saturating_sub(current_sequence);
+    Ok((lag_entries, lag_entries == 0))
+}
+
 async fn handle_client<S>(
     engine: EngineHandle,
     metrics: Arc<Metrics>,
@@ -880,6 +1214,24 @@ where
             ),
         );
 
+        if is_internal_replication_opcode(request.opcode) {
+            let request_id = request.request_id;
+            let response = match process_internal_replication_request(
+                engine.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                request,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(err) => error_response(request_id, err.code(), err.name(), &err.to_string()),
+            };
+            write_response_to_async_with_options(&mut stream, &response, transport).await?;
+            continue;
+        }
+
         let request_id = request.request_id;
         let command = match request.into_command() {
             Ok(command) => command,
@@ -993,6 +1345,16 @@ where
     }
 
     Ok(())
+}
+
+fn is_internal_replication_opcode(opcode: transport::Opcode) -> bool {
+    matches!(
+        opcode,
+        transport::Opcode::ReplicationStatus
+            | transport::Opcode::ReplicationSnapshot
+            | transport::Opcode::ReplicationFetch
+            | transport::Opcode::ReplicationAck
+    )
 }
 
 fn validate_request(request: &Request, guards: &ServerGuards) -> Result<()> {
@@ -1237,6 +1599,229 @@ fn sha256_hex(bytes: &[u8]) -> String {
     output
 }
 
+fn json_response<T: Serialize>(request_id: Uuid, value: &T) -> Result<Response> {
+    let payload =
+        serde_json::to_vec(value).map_err(|err| ServerError::InvalidArguments(err.to_string()))?;
+    Ok(Response::new(request_id, Status::Ok, payload))
+}
+
+fn decode_json_payload<T: for<'de> Deserialize<'de>>(payload: &[u8]) -> Result<T> {
+    serde_json::from_slice(payload).map_err(|err| ServerError::InvalidArguments(err.to_string()))
+}
+
+fn parse_last_applied_sequence(entries: &[(String, String)]) -> u64 {
+    entries
+        .iter()
+        .find_map(|(key, value)| {
+            (key == "last_applied_sequence").then(|| value.parse::<u64>().unwrap_or(0))
+        })
+        .unwrap_or(0)
+}
+
+fn replication_entries_from_snapshot(
+    snapshot: &ReplicationStatusSnapshot,
+) -> Vec<(String, String)> {
+    let mut entries = vec![
+        ("node_id".to_string(), snapshot.node_id.clone()),
+        ("group_id".to_string(), snapshot.group_id.clone()),
+        ("role".to_string(), snapshot.role.clone()),
+        (
+            "advertise_addr".to_string(),
+            snapshot
+                .advertise_addr
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "leader_node_id".to_string(),
+            snapshot
+                .leader_node_id
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "upstream".to_string(),
+            snapshot
+                .upstream
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "write_ack_mode".to_string(),
+            snapshot.write_ack_mode.clone(),
+        ),
+        ("paused".to_string(), snapshot.paused.to_string()),
+        ("health".to_string(), snapshot.health.clone()),
+        (
+            "reason".to_string(),
+            snapshot
+                .reason
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "local_last_applied_sequence".to_string(),
+            snapshot.local_last_applied_sequence.to_string(),
+        ),
+        (
+            "commit_sequence".to_string(),
+            snapshot.commit_sequence.to_string(),
+        ),
+        (
+            "retention_floor_sequence".to_string(),
+            snapshot
+                .retention_floor_sequence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "follower_phase".to_string(),
+            snapshot
+                .follower_phase
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "follower_lag_entries".to_string(),
+            snapshot
+                .follower_lag_entries
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "follower_lag_ms".to_string(),
+            snapshot
+                .follower_lag_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "known_followers".to_string(),
+            snapshot.known_followers.to_string(),
+        ),
+    ];
+    for follower in &snapshot.followers {
+        entries.push((
+            format!("follower.{}.applied_sequence", follower.node_id),
+            follower.applied_sequence.to_string(),
+        ));
+        entries.push((
+            format!("follower.{}.lag_entries", follower.node_id),
+            follower.lag_entries.to_string(),
+        ));
+        entries.push((
+            format!("follower.{}.lag_ms", follower.node_id),
+            follower.lag_ms.to_string(),
+        ));
+        entries.push((
+            format!("follower.{}.stale", follower.node_id),
+            follower.stale.to_string(),
+        ));
+    }
+    entries
+}
+
+fn is_write_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Set { .. }
+            | Command::SetNx { .. }
+            | Command::GetDel { .. }
+            | Command::GetEx {
+                expiration: Some(_),
+                ..
+            }
+            | Command::GetEx { persist: true, .. }
+            | Command::MSet { .. }
+            | Command::Delete { .. }
+            | Command::Incr { .. }
+            | Command::Decr { .. }
+            | Command::Expire { .. }
+            | Command::Persist { .. }
+            | Command::Rename { .. }
+            | Command::RenameNx { .. }
+            | Command::Clear
+            | Command::Save
+            | Command::Snapshot
+            | Command::Restore { .. }
+            | Command::RestoreFrom { .. }
+            | Command::AlterUserPassword { .. }
+            | Command::CreateUser { .. }
+            | Command::DropUser { .. }
+            | Command::CreateRole { .. }
+            | Command::DropRole { .. }
+            | Command::GrantRole { .. }
+            | Command::RevokeRole { .. }
+            | Command::GrantPermission { .. }
+            | Command::RevokePermission { .. }
+            | Command::MaintenanceOn
+            | Command::MaintenanceOff
+            | Command::Multi
+            | Command::Exec
+            | Command::Discard
+            | Command::PromoteFollower
+            | Command::PauseReplication
+            | Command::ResumeReplication
+    )
+}
+
+async fn enforce_leader_writeability(
+    runtime: &ServerRuntimeConfig,
+    command: &Command,
+) -> Result<()> {
+    if runtime.replication.role().await == ReplicationRole::Follower && is_write_command(command) {
+        return Err(ServerError::ReplicationReadOnly);
+    }
+    Ok(())
+}
+
+async fn process_internal_replication_request(
+    engine: EngineHandle,
+    _metrics: Arc<Metrics>,
+    runtime: &ServerRuntimeConfig,
+    session: &mut SessionState,
+    request: Request,
+) -> Result<Response> {
+    if runtime.auth_config.is_some() && !session.is_authenticated() {
+        return Err(ServerError::AuthenticationRequired);
+    }
+    if runtime.auth_config.is_some() {
+        let Some(identity) = &session.identity else {
+            return Err(ServerError::AuthenticationRequired);
+        };
+        if !identity.has(Permission::Admin) {
+            return Err(ServerError::PermissionDenied);
+        }
+    }
+
+    match request.opcode {
+        transport::Opcode::ReplicationStatus => {
+            let snapshot = runtime.replication.snapshot().await;
+            json_response(request.request_id, &snapshot)
+        }
+        transport::Opcode::ReplicationSnapshot => {
+            let snapshot = engine.replication_snapshot().await?;
+            json_response(request.request_id, &snapshot)
+        }
+        transport::Opcode::ReplicationFetch => {
+            let payload: ReplicationFetchRequest = decode_json_payload(&request.payload)?;
+            let entries = engine
+                .wal_entries_since(payload.after_sequence, payload.limit)
+                .await?;
+            json_response(request.request_id, &entries)
+        }
+        transport::Opcode::ReplicationAck => {
+            let payload: ReplicationAckRequest = decode_json_payload(&request.payload)?;
+            runtime
+                .replication
+                .register_follower_ack(payload.follower_node_id, payload.applied_sequence)
+                .await;
+            Ok(Response::ok(request.request_id))
+        }
+        _ => Err(ServerError::UnsupportedRemoteCommand),
+    }
+}
+
 async fn process_command(
     engine: EngineHandle,
     metrics: Arc<Metrics>,
@@ -1263,6 +1848,8 @@ async fn process_command(
     if runtime.maintenance.is_enabled() && !is_allowed_during_maintenance(&command) {
         return Err(ServerError::MaintenanceModeEnabled);
     }
+
+    enforce_leader_writeability(runtime, &command).await?;
 
     if session.in_transaction() {
         return handle_transaction_command(engine, metrics, runtime, session, request_id, command)
@@ -1321,9 +1908,78 @@ async fn process_command(
             Ok(Response::entries(request_id, &entries)?)
         }
         Command::MetricsProm => Ok(Response::value(request_id, &metrics.prometheus())?),
+        Command::Health => {
+            let snapshot = runtime.replication.snapshot().await;
+            let mut entries = vec![
+                ("status".to_string(), snapshot.health.clone()),
+                (
+                    "ready".to_string(),
+                    (snapshot.health == "ready").to_string(),
+                ),
+                (
+                    "reason".to_string(),
+                    snapshot.reason.unwrap_or_else(|| "none".to_string()),
+                ),
+                ("role".to_string(), snapshot.role),
+                (
+                    "maintenance_mode".to_string(),
+                    runtime.maintenance.is_enabled().to_string(),
+                ),
+            ];
+            if let Some(phase) = snapshot.follower_phase {
+                entries.push(("follower_phase".to_string(), phase));
+            }
+            Ok(Response::entries(request_id, &entries)?)
+        }
         Command::Info => {
             let entries = structured_info(engine, metrics, runtime).await?;
             Ok(Response::entries(request_id, &entries)?)
+        }
+        Command::ShowReplication => Ok(Response::entries(
+            request_id,
+            &replication_entries_from_snapshot(&runtime.replication.snapshot().await),
+        )?),
+        Command::PromoteFollower => {
+            runtime
+                .replication
+                .promote_follower(runtime.maintenance.is_enabled())
+                .await?;
+            record_runtime_event(
+                &runtime.audit_logger,
+                "replication_promote",
+                [
+                    ("result".to_string(), "ok".to_string()),
+                    (
+                        "node_id".to_string(),
+                        runtime.replication.config().node_id.clone(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            );
+            Ok(Response::ok(request_id))
+        }
+        Command::PauseReplication => {
+            runtime.replication.set_paused(true).await;
+            record_runtime_event(
+                &runtime.audit_logger,
+                "replication_pause",
+                [("paused".to_string(), "true".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+            Ok(Response::ok(request_id))
+        }
+        Command::ResumeReplication => {
+            runtime.replication.set_paused(false).await;
+            record_runtime_event(
+                &runtime.audit_logger,
+                "replication_pause",
+                [("paused".to_string(), "false".to_string())]
+                    .into_iter()
+                    .collect(),
+            );
+            Ok(Response::ok(request_id))
         }
         Command::BackupTo { path } => {
             let response = engine.execute(request_id, Command::Backup).await?;
@@ -1499,7 +2155,21 @@ async fn process_command(
                 ],
             )?)
         }
-        command => engine.execute(request_id, command).await,
+        command => {
+            let response = engine.execute(request_id, command.clone()).await?;
+            if is_write_command(&command) {
+                let last_applied_sequence = parse_last_applied_sequence(&engine.info().await?);
+                runtime
+                    .replication
+                    .set_local_last_applied_sequence(last_applied_sequence)
+                    .await;
+                runtime
+                    .replication
+                    .wait_for_write_ack(last_applied_sequence)
+                    .await?;
+            }
+            Ok(response)
+        }
     }
 }
 
@@ -1518,6 +2188,7 @@ async fn structured_info(
     } else {
         None
     };
+    let replication = runtime.replication.snapshot().await;
     let lookup = |key: &str| {
         engine_entries
             .iter()
@@ -1529,7 +2200,14 @@ async fn structured_info(
             "server.version".to_string(),
             env!("CARGO_PKG_VERSION").to_string(),
         ),
-        ("server.mode".to_string(), "single-node".to_string()),
+        (
+            "server.mode".to_string(),
+            if replication.role == "standalone" {
+                "single-node".to_string()
+            } else {
+                "primary-replica".to_string()
+            },
+        ),
         (
             "transport.protocol_magic".to_string(),
             String::from_utf8_lossy(&transport::MAGIC_BYTES).to_string(),
@@ -1769,6 +2447,54 @@ async fn structured_info(
                 .map(|duration| duration.as_millis().to_string())
                 .unwrap_or_else(|| "disabled".to_string()),
         ),
+        ("replication.role".to_string(), replication.role.clone()),
+        (
+            "replication.node_id".to_string(),
+            replication.node_id.clone(),
+        ),
+        (
+            "replication.group_id".to_string(),
+            replication.group_id.clone(),
+        ),
+        (
+            "replication.write_ack_mode".to_string(),
+            replication.write_ack_mode.clone(),
+        ),
+        (
+            "replication.leader_node_id".to_string(),
+            replication
+                .leader_node_id
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "replication.upstream".to_string(),
+            replication
+                .upstream
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "replication.paused".to_string(),
+            replication.paused.to_string(),
+        ),
+        ("replication.health".to_string(), replication.health.clone()),
+        (
+            "replication.reason".to_string(),
+            replication.reason.unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "replication.commit_sequence".to_string(),
+            replication.commit_sequence.to_string(),
+        ),
+        (
+            "replication.retention_floor_sequence".to_string(),
+            replication
+                .retention_floor_sequence
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        ("health.status".to_string(), replication.health.clone()),
     ];
     entries.extend(
         metrics
@@ -1861,6 +2587,9 @@ async fn handle_transaction_command(
     command: Command,
 ) -> Result<Response> {
     expire_transaction_if_needed(metrics.clone(), runtime, session)?;
+    if runtime.replication.role().await == ReplicationRole::Follower {
+        return Err(ServerError::ReplicationReadOnly);
+    }
     match command {
         Command::Multi => Err(ServerError::TransactionAlreadyActive),
         Command::Discard => {
@@ -1884,6 +2613,15 @@ async fn handle_transaction_command(
             for (_queued_command, result) in queued.iter().zip(results) {
                 encoded.push(map_transaction_result_payload(result));
             }
+            let last_applied_sequence = parse_last_applied_sequence(&engine.info().await?);
+            runtime
+                .replication
+                .set_local_last_applied_sequence(last_applied_sequence)
+                .await;
+            runtime
+                .replication
+                .wait_for_write_ack(last_applied_sequence)
+                .await?;
             metrics
                 .transactions_committed
                 .fetch_add(1, Ordering::Relaxed);
@@ -1961,6 +2699,8 @@ fn is_allowed_during_maintenance(command: &Command) -> bool {
             | Command::WhoAmI
             | Command::MaintenanceStatus
             | Command::MaintenanceOff
+            | Command::Health
+            | Command::ShowReplication
     )
 }
 
@@ -1994,6 +2734,7 @@ fn command_permission(command: &Command) -> Option<Permission> {
         | Command::Exec
         | Command::Discard
         | Command::MaintenanceStatus
+        | Command::Health
         | Command::WhoAmI => None,
         Command::Get { .. }
         | Command::Exists { .. }
@@ -2041,6 +2782,10 @@ fn command_permission(command: &Command) -> Option<Permission> {
         Command::ShowGrantsForRole { .. } => Some(Permission::RoleAdmin),
         Command::ShowUsers => Some(Permission::UserAdmin),
         Command::MaintenanceOn | Command::MaintenanceOff => Some(Permission::Admin),
+        Command::ShowReplication
+        | Command::PromoteFollower
+        | Command::PauseReplication
+        | Command::ResumeReplication => Some(Permission::Admin),
         Command::Help | Command::Exit => None,
     }
 }
@@ -2191,6 +2936,11 @@ where
         | Command::RestoreCheck { .. }
         | Command::RestoreCheckFrom { .. }
         | Command::AlterUserPassword { .. }
+        | Command::Health
+        | Command::ShowReplication
+        | Command::PromoteFollower
+        | Command::PauseReplication
+        | Command::ResumeReplication
         | Command::MaintenanceOn
         | Command::MaintenanceOff
         | Command::MaintenanceStatus => Err(ServerError::UnsupportedRemoteCommand),
@@ -2265,6 +3015,11 @@ fn validate_transaction_command(command: &Command) -> Result<()> {
         | Command::MaintenanceOn
         | Command::MaintenanceOff
         | Command::MaintenanceStatus
+        | Command::Health
+        | Command::ShowReplication
+        | Command::PromoteFollower
+        | Command::PauseReplication
+        | Command::ResumeReplication
         | Command::Auth { .. }
         | Command::Help
         | Command::Exit
@@ -2407,6 +3162,11 @@ fn opcode_name(command: &Command) -> &'static str {
         Command::MaintenanceOn => "MAINTENANCE_ON",
         Command::MaintenanceOff => "MAINTENANCE_OFF",
         Command::MaintenanceStatus => "MAINTENANCE_STATUS",
+        Command::Health => "HEALTH",
+        Command::ShowReplication => "SHOW_REPLICATION",
+        Command::PromoteFollower => "PROMOTE_FOLLOWER",
+        Command::PauseReplication => "PAUSE_REPLICATION",
+        Command::ResumeReplication => "RESUME_REPLICATION",
         Command::Help => "HELP",
         Command::Exit => "EXIT",
     }
@@ -2596,6 +3356,9 @@ mod tests {
     use crate::audit::AuditLogger;
     use crate::auth::{AuthConfig, Permission, PermissionGrant};
     use crate::metrics::Metrics;
+    use crate::replication::{
+        ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
+    };
     use crate::server::{EngineHandle, ServerRuntimeConfig};
     use command::{
         Command, Expiration as CommandExpiration, SetCondition as CommandSetCondition,
@@ -2676,6 +3439,20 @@ mod tests {
             auth_lockouts: Arc::new(tokio::sync::Mutex::new(AuthLockoutState::default())),
             insecure_auth_disabled: false,
             insecure_default_credentials: false,
+            replication: Arc::new(ReplicationRuntime::new(ReplicationConfig {
+                node_id: "test-node".to_string(),
+                group_id: "test-group".to_string(),
+                advertise_addr: None,
+                role: ReplicationRole::Standalone,
+                upstream: None,
+                upstream_username: None,
+                upstream_password: None,
+                write_ack_mode: WriteAckMode::Local,
+                ack_timeout: Duration::from_millis(100),
+                poll_interval: Duration::from_millis(100),
+                fetch_batch_size: 32,
+                stale_after: Duration::from_secs(5),
+            })),
         }
     }
 

@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-30
+
+### Added
+
+- Manual leader/follower replication with WAL-based catch-up, snapshot bootstrap, follower acknowledgements, and explicit `local` / `replica` / `all` write-ack modes.
+- Replication administration and diagnostics commands: `health`, `show replication`, `promote follower`, `pause replication`, and `resume replication`.
+- Replication-aware `INFO` sections covering role, node identity, upstream/leader state, retention floor, and health.
+- Follower-side background replication polling over the existing transport with authenticated internal replication requests.
+- Replication integration coverage that verifies leader/follower sync and replica-ack write gating.
+
+### Changed
+
+- Mutating commands and transactions are now rejected on follower nodes.
+- Transaction commits and standalone writes now publish local durable sequence progress into replication state and can block on configured follower acknowledgements.
+- WAL retention now has a floor-aware pruning primitive so future pruning decisions can preserve follower-required history.
+
 ## [0.3.0] - 2026-05-30
 
 ### Changed
@@ -84,8 +100,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Known Limitations
 
-- Single-node only; replication and sharding are not implemented.
-- No distributed ACID, MVCC, or cluster commit coordination.
-- No ACL/RBAC beyond one configured credential pair.
+- No automatic failover, elections, or quorum commits.
+- No MVCC, snapshot reads, or distributed transactions.
 - TLS is supported but disabled by default.
-- No online backup/restore tooling yet.
