@@ -274,6 +274,26 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "maintenance status",
     },
     CommandInfo {
+        name: "health",
+        usage: "health",
+    },
+    CommandInfo {
+        name: "show replication",
+        usage: "show replication",
+    },
+    CommandInfo {
+        name: "promote follower",
+        usage: "promote follower",
+    },
+    CommandInfo {
+        name: "pause replication",
+        usage: "pause replication",
+    },
+    CommandInfo {
+        name: "resume replication",
+        usage: "resume replication",
+    },
+    CommandInfo {
         name: "help",
         usage: "help",
     },
@@ -465,6 +485,11 @@ pub enum Command {
     MaintenanceOn,
     MaintenanceOff,
     MaintenanceStatus,
+    Health,
+    ShowReplication,
+    PromoteFollower,
+    PauseReplication,
+    ResumeReplication,
     Help,
     Exit,
     Snapshot,

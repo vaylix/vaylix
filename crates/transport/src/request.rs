@@ -241,6 +241,19 @@ impl Request {
             Command::MaintenanceStatus => {
                 Ok(Self::new(request_id, Opcode::MaintenanceStatus, Vec::new()))
             }
+            Command::Health => Ok(Self::new(request_id, Opcode::Health, Vec::new())),
+            Command::ShowReplication => {
+                Ok(Self::new(request_id, Opcode::ShowReplication, Vec::new()))
+            }
+            Command::PromoteFollower => {
+                Ok(Self::new(request_id, Opcode::PromoteFollower, Vec::new()))
+            }
+            Command::PauseReplication => {
+                Ok(Self::new(request_id, Opcode::PauseReplication, Vec::new()))
+            }
+            Command::ResumeReplication => {
+                Ok(Self::new(request_id, Opcode::ResumeReplication, Vec::new()))
+            }
             Command::Help => Err(TransportError::UnsupportedCommand("help")),
             Command::Exit => Err(TransportError::UnsupportedCommand("exit")),
         }
@@ -422,6 +435,23 @@ impl Request {
             Opcode::MaintenanceStatus => {
                 decode_empty(&self.payload).map(|()| Command::MaintenanceStatus)
             }
+            Opcode::Health => decode_empty(&self.payload).map(|()| Command::Health),
+            Opcode::ShowReplication => {
+                decode_empty(&self.payload).map(|()| Command::ShowReplication)
+            }
+            Opcode::PromoteFollower => {
+                decode_empty(&self.payload).map(|()| Command::PromoteFollower)
+            }
+            Opcode::PauseReplication => {
+                decode_empty(&self.payload).map(|()| Command::PauseReplication)
+            }
+            Opcode::ResumeReplication => {
+                decode_empty(&self.payload).map(|()| Command::ResumeReplication)
+            }
+            Opcode::ReplicationStatus
+            | Opcode::ReplicationSnapshot
+            | Opcode::ReplicationFetch
+            | Opcode::ReplicationAck => Err(TransportError::UnsupportedCommand("replication")),
         }
     }
 }
@@ -973,6 +1003,11 @@ mod tests {
             Command::MaintenanceOn,
             Command::MaintenanceOff,
             Command::MaintenanceStatus,
+            Command::Health,
+            Command::ShowReplication,
+            Command::PromoteFollower,
+            Command::PauseReplication,
+            Command::ResumeReplication,
         ];
 
         for command in commands {

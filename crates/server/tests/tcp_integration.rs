@@ -2,7 +2,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use command::{Command, Expiration, SetCondition, SetOptions};
 use engine::{Engine, EngineOptions, Paths, WalSyncPolicy, inspect_wal};
@@ -17,6 +17,7 @@ use rustls::{ClientConfig, RootCertStore};
 use server::Server;
 use server::audit::AuditLogger;
 use server::auth::AuthConfig;
+use server::replication::{ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode};
 use server::server::{ServerGuards, ServerRuntimeConfig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -229,6 +230,23 @@ fn runtime(snapshot_interval: Option<Duration>) -> ServerRuntimeConfig {
     runtime_with_tls(snapshot_interval, None)
 }
 
+fn standalone_replication(node_id: &str) -> Arc<ReplicationRuntime> {
+    Arc::new(ReplicationRuntime::new(ReplicationConfig {
+        node_id: node_id.to_string(),
+        group_id: "test-group".to_string(),
+        advertise_addr: None,
+        role: ReplicationRole::Standalone,
+        upstream: None,
+        upstream_username: None,
+        upstream_password: None,
+        write_ack_mode: WriteAckMode::Local,
+        ack_timeout: Duration::from_millis(100),
+        poll_interval: Duration::from_millis(100),
+        fetch_batch_size: 32,
+        stale_after: Duration::from_secs(5),
+    }))
+}
+
 fn runtime_with_tls(
     snapshot_interval: Option<Duration>,
     tls_config: Option<Arc<rustls::ServerConfig>>,
@@ -270,7 +288,17 @@ fn runtime_with_tls(
         )),
         insecure_auth_disabled: false,
         insecure_default_credentials: true,
+        replication: standalone_replication("test-node"),
     }
+}
+
+async fn issue_command<S>(stream: &mut S, request_id: u128, command: Command) -> transport::Response
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = Request::from_command(id(request_id), command).unwrap();
+    write_request_to_async(stream, &request).await.unwrap();
+    read_response_from_async(stream).await.unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1403,4 +1431,143 @@ async fn handles_concurrent_clients_against_serialized_engine() {
 
     server_task.abort();
     fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replicates_wal_to_follower_and_requires_replica_ack() {
+    let leader_root = temp_dir("leader-replication");
+    let follower_root = temp_dir("follower-replication");
+    let leader_engine = Engine::from_paths_with_options(
+        Paths::from_data_dir(&leader_root).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("leader-repl-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let follower_engine = Engine::from_paths_with_options(
+        Paths::from_data_dir(&follower_root).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("follower-repl-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut leader_runtime = runtime(None);
+    leader_runtime.replication = Arc::new(ReplicationRuntime::new(ReplicationConfig {
+        node_id: "leader-node".to_string(),
+        group_id: "test-group".to_string(),
+        advertise_addr: None,
+        role: ReplicationRole::Leader,
+        upstream: None,
+        upstream_username: None,
+        upstream_password: None,
+        write_ack_mode: WriteAckMode::Replica,
+        ack_timeout: Duration::from_secs(3),
+        poll_interval: Duration::from_millis(100),
+        fetch_batch_size: 32,
+        stale_after: Duration::from_secs(5),
+    }));
+    let leader = Server::with_engine(
+        "127.0.0.1".to_string(),
+        0,
+        16,
+        leader_engine,
+        leader_runtime,
+    )
+    .await
+    .unwrap();
+    let leader_addr = leader.local_addr().unwrap();
+    let leader_task = tokio::spawn(async move { leader.start().await });
+
+    let mut follower_runtime = runtime(None);
+    follower_runtime.replication = Arc::new(ReplicationRuntime::new(ReplicationConfig {
+        node_id: "follower-node".to_string(),
+        group_id: "test-group".to_string(),
+        advertise_addr: None,
+        role: ReplicationRole::Follower,
+        upstream: Some(leader_addr.to_string()),
+        upstream_username: Some("vaylix".to_string()),
+        upstream_password: Some("vaylix".to_string()),
+        write_ack_mode: WriteAckMode::Local,
+        ack_timeout: Duration::from_secs(1),
+        poll_interval: Duration::from_millis(100),
+        fetch_batch_size: 32,
+        stale_after: Duration::from_secs(5),
+    }));
+    let follower = Server::with_engine(
+        "127.0.0.1".to_string(),
+        0,
+        16,
+        follower_engine,
+        follower_runtime,
+    )
+    .await
+    .unwrap();
+    let follower_addr = follower.local_addr().unwrap();
+    let follower_task = tokio::spawn(async move { follower.start().await });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut stream = connect_tcp(leader_addr).await;
+        authenticate(&mut stream).await;
+        let response = issue_command(&mut stream, 40_000, Command::ShowReplication).await;
+        let entries = response.decode_entries().unwrap();
+        let known_followers = entries
+            .iter()
+            .find_map(|(key, value)| (key == "known_followers").then(|| value.clone()))
+            .unwrap();
+        if known_followers == "1" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follower never registered with leader"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut leader_stream = connect_tcp(leader_addr).await;
+    authenticate(&mut leader_stream).await;
+    let set = issue_command(
+        &mut leader_stream,
+        40_001,
+        Command::Set {
+            key: "repl:key".to_string(),
+            value: "value".to_string(),
+            options: SetOptions::default(),
+        },
+    )
+    .await;
+    assert_eq!(set.status, Status::Ok);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut follower_stream = connect_tcp(follower_addr).await;
+        authenticate(&mut follower_stream).await;
+        let response = issue_command(
+            &mut follower_stream,
+            40_002,
+            Command::Get {
+                key: "repl:key".to_string(),
+            },
+        )
+        .await;
+        if response.status == Status::Ok && response.decode_value().unwrap() == "value" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "follower never applied replicated write"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    follower_task.abort();
+    leader_task.abort();
+    fs::remove_dir_all(leader_root).ok();
+    fs::remove_dir_all(follower_root).ok();
 }

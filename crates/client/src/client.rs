@@ -437,9 +437,14 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::ShowGrantsForUser { .. }
             | Command::ShowGrantsForRole { .. }
             | Command::WhoAmI
-            | Command::MaintenanceStatus => {
+            | Command::MaintenanceStatus
+            | Command::Health
+            | Command::ShowReplication => {
                 let entries = response.decode_entries()?;
                 render_entries(&entries, output)
+            }
+            Command::PromoteFollower | Command::PauseReplication | Command::ResumeReplication => {
+                Ok("OK".to_string())
             }
             Command::Help | Command::Exit => Err(ClientError::LocalCommandResponse),
         },

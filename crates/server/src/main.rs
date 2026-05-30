@@ -1,5 +1,8 @@
 use clap::Parser;
-use server::{AdminCommand, Args, PitrAction, Server, StorageAction, WalSyncMode};
+use server::{
+    AdminCommand, Args, PitrAction, ReplicationRoleMode, Server, StorageAction, WalSyncMode,
+    WriteAckModeArg,
+};
 use transport::{CodecOptions, CompressionMode};
 
 #[tokio::main(flavor = "multi_thread")]
@@ -122,6 +125,41 @@ async fn try_main() -> server::Result<()> {
         )?),
         insecure_auth_disabled: args.disable_auth,
         insecure_default_credentials,
+        replication: std::sync::Arc::new(server::replication::ReplicationRuntime::new(
+            server::replication::ReplicationConfig {
+                node_id: args
+                    .node_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                group_id: args.replication_group_id.clone(),
+                advertise_addr: args.replication_advertise_addr.clone(),
+                role: match args.replication_role {
+                    ReplicationRoleMode::Standalone => {
+                        server::replication::ReplicationRole::Standalone
+                    }
+                    ReplicationRoleMode::Leader => server::replication::ReplicationRole::Leader,
+                    ReplicationRoleMode::Follower => server::replication::ReplicationRole::Follower,
+                },
+                upstream: args.replication_upstream.clone(),
+                upstream_username: args
+                    .replication_user
+                    .clone()
+                    .or_else(|| Some(args.user.clone())),
+                upstream_password: args
+                    .replication_password
+                    .clone()
+                    .or_else(|| Some(args.password.clone())),
+                write_ack_mode: match args.write_ack_mode {
+                    WriteAckModeArg::Local => server::replication::WriteAckMode::Local,
+                    WriteAckModeArg::Replica => server::replication::WriteAckMode::Replica,
+                    WriteAckModeArg::All => server::replication::WriteAckMode::All,
+                },
+                ack_timeout: std::time::Duration::from_millis(args.replication_ack_timeout_ms),
+                poll_interval: std::time::Duration::from_millis(args.replication_poll_interval_ms),
+                fetch_batch_size: args.replication_fetch_batch_size,
+                stale_after: std::time::Duration::from_secs(args.replication_stale_after_seconds),
+            },
+        )),
     };
     let server = Server::new(
         args.bind,

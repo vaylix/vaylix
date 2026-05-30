@@ -80,6 +80,14 @@ pub enum ServerError {
     MaintenanceModeEnabled,
     #[error("transaction expired after {seconds} seconds")]
     TransactionExpired { seconds: u64 },
+    #[error("replication write acknowledgement timed out for sequence {sequence} in mode {mode}")]
+    ReplicationAckTimeout { sequence: u64, mode: String },
+    #[error("replication write acknowledgement is unavailable")]
+    ReplicationAckUnavailable,
+    #[error("writes are rejected on follower nodes")]
+    ReplicationReadOnly,
+    #[error("replication promotion denied: {0}")]
+    ReplicationPromotionDenied(String),
 }
 
 impl ServerError {
@@ -121,6 +129,10 @@ impl ServerError {
             Self::PasswordPolicyViolation => "SRV-032",
             Self::MaintenanceModeEnabled => "SRV-033",
             Self::TransactionExpired { .. } => "SRV-034",
+            Self::ReplicationAckTimeout { .. } => "SRV-035",
+            Self::ReplicationAckUnavailable => "SRV-036",
+            Self::ReplicationReadOnly => "SRV-037",
+            Self::ReplicationPromotionDenied(_) => "SRV-038",
         }
     }
 
@@ -162,6 +174,10 @@ impl ServerError {
             Self::PasswordPolicyViolation => "Password Policy Violation",
             Self::MaintenanceModeEnabled => "Maintenance Mode Enabled",
             Self::TransactionExpired { .. } => "Transaction Expired",
+            Self::ReplicationAckTimeout { .. } => "Replication Acknowledgement Timeout",
+            Self::ReplicationAckUnavailable => "Replication Acknowledgement Unavailable",
+            Self::ReplicationReadOnly => "Follower Write Rejected",
+            Self::ReplicationPromotionDenied(_) => "Replication Promotion Denied",
         }
     }
 }

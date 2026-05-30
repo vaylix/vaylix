@@ -19,6 +19,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SCAN_COUNT: usize = 10;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicationSnapshot {
+    pub state: EngineState,
+    pub storage_format_version: u32,
+    pub exported_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageInspection {
     pub snapshot_present: bool,
@@ -136,6 +143,91 @@ impl Engine {
     pub fn verify_storage(paths: &Paths, options: EngineOptions) -> Result<StorageInspection> {
         let engine = Self::from_paths_with_options(paths.clone(), options)?;
         Ok(engine.storage_inspection())
+    }
+
+    pub fn replication_snapshot(&self) -> ReplicationSnapshot {
+        ReplicationSnapshot {
+            state: self.state.clone(),
+            storage_format_version: STORAGE_FORMAT_VERSION,
+            exported_at_ms: now_millis(),
+        }
+    }
+
+    pub fn wal_entries_since(&self, after_sequence: u64, limit: usize) -> Result<Vec<WalEntry>> {
+        let replay = replay(&self.paths.wal_dir, self.options.keyring.as_ref())?;
+        let mut entries = replay
+            .entries
+            .into_iter()
+            .filter(|entry| entry.sequence > after_sequence)
+            .collect::<Vec<_>>();
+        if limit > 0 && entries.len() > limit {
+            entries.truncate(limit);
+        }
+        Ok(entries)
+    }
+
+    pub fn apply_replication_snapshot(&mut self, snapshot: ReplicationSnapshot) -> Result<()> {
+        if snapshot.storage_format_version != STORAGE_FORMAT_VERSION {
+            return Err(crate::EngineError::UnsupportedStorageFormat {
+                resource: "replication snapshot",
+            });
+        }
+
+        self.state = snapshot.state;
+        let sequence = self.state.metadata.last_applied_sequence;
+        let persisted_at_ms = now_millis();
+        self.state.metadata.last_snapshot_at_ms = Some(persisted_at_ms);
+        self.state.metadata.updated_at_ms = persisted_at_ms;
+
+        let serialized = serialize(&self.state)?;
+        save(
+            &serialized,
+            &self.paths.snapshot_path,
+            &self.paths.snapshot_tmp_path,
+            self.options.keyring.as_ref(),
+        )?;
+        if self.paths.wal_dir.exists() {
+            fs::remove_dir_all(&self.paths.wal_dir)?;
+        }
+        create_active_segment(&self.paths.wal_dir, sequence.saturating_add(1))?;
+        save_manifest(
+            &Manifest {
+                storage_format_version: STORAGE_FORMAT_VERSION,
+                engine_version: self.state.metadata.version,
+                last_snapshot_sequence: sequence,
+                last_snapshot_at_ms: persisted_at_ms,
+                snapshot_size_bytes: serialized.len() as u64,
+                snapshot_checksum: hash(&serialized),
+                active_wal_start_sequence: sequence.saturating_add(1),
+                oldest_retained_sequence: sequence.saturating_add(1),
+            },
+            &self.paths.manifest_path,
+            &self.paths.manifest_tmp_path,
+        )?;
+        Ok(())
+    }
+
+    pub fn apply_replication_entries(&mut self, entries: &[WalEntry]) -> Result<u64> {
+        let mut last_applied = self.state.metadata.last_applied_sequence;
+        for entry in entries {
+            let expected = last_applied.saturating_add(1);
+            if entry.sequence != expected {
+                return Err(crate::EngineError::InvalidStorageOperation(format!(
+                    "replication WAL sequence gap: expected {expected}, got {}",
+                    entry.sequence
+                )));
+            }
+            append(
+                entry,
+                &self.paths.wal_dir,
+                self.options.wal_sync,
+                self.options.keyring.as_ref(),
+                self.options.wal_segment_size_bytes,
+            )?;
+            self.state.apply_entry(entry)?;
+            last_applied = entry.sequence;
+        }
+        Ok(last_applied)
     }
 
     pub fn migrate_storage(paths: &Paths, options: &EngineOptions) -> Result<StorageInspection> {
@@ -851,6 +943,11 @@ impl Engine {
             | Command::MaintenanceOn
             | Command::MaintenanceOff
             | Command::MaintenanceStatus
+            | Command::Health
+            | Command::ShowReplication
+            | Command::PromoteFollower
+            | Command::PauseReplication
+            | Command::ResumeReplication
             | Command::Multi
             | Command::Exec
             | Command::Discard

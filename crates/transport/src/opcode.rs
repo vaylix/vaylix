@@ -61,6 +61,15 @@ pub enum Opcode {
     MaintenanceOn = 0x37,
     MaintenanceOff = 0x38,
     MaintenanceStatus = 0x39,
+    Health = 0x3A,
+    ShowReplication = 0x3B,
+    PromoteFollower = 0x3C,
+    PauseReplication = 0x3D,
+    ResumeReplication = 0x3E,
+    ReplicationStatus = 0x3F,
+    ReplicationSnapshot = 0x40,
+    ReplicationFetch = 0x41,
+    ReplicationAck = 0x42,
 }
 
 impl From<Opcode> for u8 {
@@ -131,6 +140,15 @@ impl TryFrom<u8> for Opcode {
             0x37 => Ok(Self::MaintenanceOn),
             0x38 => Ok(Self::MaintenanceOff),
             0x39 => Ok(Self::MaintenanceStatus),
+            0x3A => Ok(Self::Health),
+            0x3B => Ok(Self::ShowReplication),
+            0x3C => Ok(Self::PromoteFollower),
+            0x3D => Ok(Self::PauseReplication),
+            0x3E => Ok(Self::ResumeReplication),
+            0x3F => Ok(Self::ReplicationStatus),
+            0x40 => Ok(Self::ReplicationSnapshot),
+            0x41 => Ok(Self::ReplicationFetch),
+            0x42 => Ok(Self::ReplicationAck),
             other => Err(TransportError::UnknownOpcode(other)),
         }
     }
@@ -201,6 +219,15 @@ mod tests {
             (0x37, Opcode::MaintenanceOn),
             (0x38, Opcode::MaintenanceOff),
             (0x39, Opcode::MaintenanceStatus),
+            (0x3A, Opcode::Health),
+            (0x3B, Opcode::ShowReplication),
+            (0x3C, Opcode::PromoteFollower),
+            (0x3D, Opcode::PauseReplication),
+            (0x3E, Opcode::ResumeReplication),
+            (0x3F, Opcode::ReplicationStatus),
+            (0x40, Opcode::ReplicationSnapshot),
+            (0x41, Opcode::ReplicationFetch),
+            (0x42, Opcode::ReplicationAck),
         ];
 
         for (byte, opcode) in mappings {
