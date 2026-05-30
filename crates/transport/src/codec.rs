@@ -686,6 +686,18 @@ mod tests {
             Response::entries(id(8), &[("name".to_string(), "alice".to_string())]).unwrap(),
             Response::strings(id(9), &[Some("alice".to_string()), None]).unwrap(),
             Response::scan(id(10), 3, &["one".to_string(), "two".to_string()]).unwrap(),
+            Response::exec_results(
+                id(11),
+                &[
+                    crate::response::ExecResultPayload::Ok,
+                    crate::response::ExecResultPayload::Value("alice".to_string()),
+                    crate::response::ExecResultPayload::Scan(crate::response::ScanPayload {
+                        next_cursor: 7,
+                        keys: vec!["one".to_string(), "two".to_string()],
+                    }),
+                ],
+            )
+            .unwrap(),
         ];
 
         for response in responses {
