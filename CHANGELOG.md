@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-06-01
+
+### Changed
+
+- Split server startup configuration, offline admin command handling, maintenance-mode state, and auth-lockout accounting into focused modules with direct unit coverage.
+- Split server runtime internals into responsibility modules for engine worker ownership, session state, validation, authorization, command execution, transaction handling, audit events, auth helpers, and replication quorum/timing/persistence helpers.
+- Split transport request/response/codec internals into directory modules while preserving all public re-exports and frame/request/response formats.
+- Split client internals into TLS setup, response rendering, help text, and CLI/URL configuration modules while preserving `vaylix-client` behavior.
+- Kept the `vaylix` binary behavior unchanged while reducing `main.rs` to argument parsing, admin dispatch, launch configuration, and server start orchestration.
+
+### Fixed
+
+- Fixed persisted Docker-volume auth stores so changing `VAYLIX_USER` / `VAYLIX_PASSWORD` retires the previous env-managed bootstrap admin instead of allowing old credentials to continue authenticating.
+- Added auth-store metadata migration so existing v0.5.0 auth stores are upgraded without losing custom users or RBAC roles, including legacy single-admin stores created from non-default startup credentials.
+
 ## [0.5.0] - 2026-05-31
 
 ### Added
