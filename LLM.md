@@ -8,7 +8,7 @@ Vaylix is a Rust database workspace centered on a transport-first architecture:
 
 `client -> transport -> TCP/TLS -> transport -> server -> engine`
 
-The current implementation is a single-node, string-to-string key/value database with:
+The current implementation is a string-to-string key/value database with:
 
 - a custom framed binary protocol v2 with startup capability negotiation
 - a shared transport crate used by both client and server
@@ -21,10 +21,11 @@ The current implementation is a single-node, string-to-string key/value database
 - default-on negotiated outbound frame-level zstd compression
 - deterministic command parsing and explicit error codes
 - protocol-level OTel-aligned metrics with Prometheus text export through `METRICS PROM`
+- Raft-style HA replication with automatic leader election and quorum-backed write acknowledgement
 
 The long-term target is broader:
 
-- scale from a single node to replicated and sharded deployments
+- scale from replicated single-region deployments to sharded deployments
 - keep the transport layer evolvable enough for replication traffic and cluster coordination
 - harden transactional behavior toward stronger ACID guarantees than the current session-queued model
 - add richer auditability and replication-oriented protocol sessions without breaking engine layering
@@ -62,6 +63,7 @@ The long-term target is broader:
   - backup/restore
   - backup-to-file/backup-verify/restore-from-file/restore-check
   - maintenance on/off/status
+  - health/show cluster/show replication/cluster join/cluster remove
   - create/drop user and role
   - alter user password
   - grant/revoke role and permission
@@ -83,14 +85,13 @@ Not yet true:
 
 - MVCC
 - distributed transactions
-- formal isolation levels
-- automatic failover or quorum elections
+- formal isolation levels beyond serialized leader execution
 
 Design direction:
 
 - keep transaction boundaries explicit in transport and server layers
-- move toward WAL-backed atomic commit groups and stronger isolation in engine internals
-- avoid protocol choices that assume single-node execution forever
+- keep transaction commits bound to deterministic WAL order and replicated commit position
+- avoid protocol choices that assume one process owns all future execution forever
 
 Agents should describe the current implementation honestly. Do not claim full ACID today.
 
@@ -225,7 +226,7 @@ Password policy and auth throttling:
   - `--auth-failure-limit`
   - `--auth-lockout-seconds`
 
-RBAC is implemented inside the existing server binary and transport protocol. There is no separate admin binary. On first startup, the configured `--user` / `--password` account is bootstrapped as an admin user. Once `<data-dir>/auth.bin` exists, users and roles are loaded from encrypted RBAC metadata instead of being recreated from CLI defaults.
+RBAC is implemented inside the existing server binary and transport protocol. There is no separate admin binary. On first startup, the configured `--user` / `--password` account is bootstrapped as an admin user. Once `<data-dir>/auth.bin` exists, users and roles are loaded from encrypted RBAC metadata. Non-default configured bootstrap credentials are reconciled into the persisted admin account on startup, and the default `vaylix / vaylix` bootstrap user is retired if it still accepts the default password.
 
 Current permissions:
 
@@ -444,9 +445,12 @@ Passwords and payload contents are not written to the audit log. Semantic event 
 
 Current state:
 
-- manual leader/follower replication over the main transport
-- follower-side polling with snapshot bootstrap plus WAL catch-up
-- no automatic failover or sharding
+- Raft-style HA replication over the main transport
+- follower/candidate/leader roles with persisted term, voted-for, and member metadata
+- pre-vote, majority election, heartbeats, append entries, snapshot install, and automatic leader failover
+- quorum-backed write acknowledgement by default through the `replica` / `majority` mode
+- follower-side catch-up through append entries, retained WAL history, and snapshot bootstrap fallback
+- no sharding
 
 Architectural target:
 
@@ -454,7 +458,7 @@ Architectural target:
 - request routing should remain decoupled from the engine so a shard-router or replica applier can be introduced later
 - storage and protocol identifiers should remain stable enough for cluster metadata and log replication
 
-Do not document distributed support as implemented today. It is a roadmap constraint, not a delivered feature.
+Do not document sharding, MVCC, distributed transactions, or linearizable follower reads as implemented today. They remain roadmap constraints, not delivered features.
 
 ## Compression
 
@@ -577,14 +581,15 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.4.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.5.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 
 ## Current Gaps
 
 - full distributed ACID semantics are not implemented
-- no automatic failover, elections, quorum commits, or sharding yet
+- no sharding yet
+- no MVCC or linearizable follower-read mode yet
 - PITR is offline-first and there is no online WAL archive/PITR workflow yet
 - backup/restore remains logical JSON based; there is no separate streaming backup utility yet
 - no TLS certificate automation or rotation workflow yet

@@ -65,6 +65,7 @@ impl Parser {
             "discard" => Self::parse_no_args(&tokens, Command::Discard, "discard"),
             "maintenance" => Self::parse_maintenance(&tokens),
             "health" => Self::parse_no_args(&tokens, Command::Health, "health"),
+            "cluster" => Self::parse_cluster(&tokens),
             "promote" => Self::parse_promote(&tokens),
             "pause" => Self::parse_replication_toggle(&tokens, true),
             "resume" => Self::parse_replication_toggle(&tokens, false),
@@ -512,6 +513,33 @@ impl Parser {
         }
     }
 
+    fn parse_cluster(tokens: &[Token]) -> Result<Command> {
+        if tokens.len() < 2 {
+            return Err(CommandError::InvalidArity {
+                usage: "cluster <join|remove> ...".to_string(),
+            });
+        }
+        match Self::token_text(&tokens[1]).to_ascii_lowercase().as_str() {
+            "join" => {
+                Self::expect_len(tokens, 4, "cluster join <node-id> <host:port>")?;
+                Ok(Command::ClusterJoin {
+                    node_id: Self::token_text(&tokens[2]).to_string(),
+                    address: Self::token_text(&tokens[3]).to_string(),
+                })
+            }
+            "remove" => {
+                Self::expect_len(tokens, 3, "cluster remove <node-id>")?;
+                Ok(Command::ClusterRemove {
+                    node_id: Self::token_text(&tokens[2]).to_string(),
+                })
+            }
+            other => Err(CommandError::InvalidOption {
+                command: "cluster",
+                option: other.to_string(),
+            }),
+        }
+    }
+
     fn parse_replication_toggle(tokens: &[Token], pause: bool) -> Result<Command> {
         let usage = if pause {
             "pause replication"
@@ -700,7 +728,7 @@ impl Parser {
     fn parse_show(tokens: &[Token]) -> Result<Command> {
         if tokens.len() != 2 && tokens.len() != 5 {
             return Err(CommandError::InvalidArity {
-                usage: "show users | show roles | show grants | show grants for user <username> | show grants for role <role> | show replication"
+                usage: "show users | show roles | show grants | show grants for user <username> | show grants for role <role> | show replication | show cluster"
                     .to_string(),
             });
         }
@@ -709,6 +737,7 @@ impl Parser {
             "roles" if tokens.len() == 2 => Ok(Command::ShowRoles),
             "grants" if tokens.len() == 2 => Ok(Command::ShowGrants),
             "replication" if tokens.len() == 2 => Ok(Command::ShowReplication),
+            "cluster" if tokens.len() == 2 => Ok(Command::ShowCluster),
             "grants"
                 if tokens.len() == 5
                     && Self::token_text(&tokens[2]).eq_ignore_ascii_case("for")

@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, Semaphore, mpsc, oneshot, watch};
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 use transport::{
     CodecOptions, ExecResultPayload, Request, Response, Status, TransportError,
@@ -32,8 +33,9 @@ use crate::auth::{AuthConfig, Identity, Permission};
 use crate::error::{Result, ServerError};
 use crate::metrics::Metrics;
 use crate::replication::{
-    FollowerPhase, ReplicationAckRequest, ReplicationFetchRequest, ReplicationRole,
-    ReplicationRuntime, ReplicationStatusSnapshot,
+    AppendEntriesRequest, AppendEntriesResponse, ClusterMember, FollowerPhase, HeartbeatRequest,
+    ReplicationAckRequest, ReplicationFetchRequest, ReplicationRole, ReplicationRuntime,
+    ReplicationStatusSnapshot, SnapshotInstallRequest, SnapshotInstallResponse, VoteRequest,
 };
 
 const BACKUP_MANIFEST_VERSION: u32 = 1;
@@ -76,6 +78,8 @@ pub struct ServerRuntimeConfig {
     pub insecure_auth_disabled: bool,
     pub insecure_default_credentials: bool,
     pub replication: Arc<ReplicationRuntime>,
+    pub replication_fanout_lock: Arc<Mutex<()>>,
+    pub replication_apply_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,13 +98,19 @@ struct BackupManifest {
 enum EngineRequest {
     Execute {
         request_id: Uuid,
+        consensus_term: u64,
         command: Command,
-        respond_to: oneshot::Sender<Result<Response>>,
+        respond_to: oneshot::Sender<Result<ExecuteResult>>,
     },
     ExecuteBatch {
         request_id: Uuid,
+        consensus_term: u64,
         commands: Vec<Command>,
         respond_to: oneshot::Sender<Result<Vec<TransactionResult>>>,
+    },
+    AppendNoop {
+        consensus_term: u64,
+        respond_to: oneshot::Sender<Result<LogAppendResult>>,
     },
     Info {
         respond_to: oneshot::Sender<Result<Vec<(String, String)>>>,
@@ -123,6 +133,14 @@ enum EngineRequest {
         limit: usize,
         respond_to: oneshot::Sender<Result<Vec<engine::WalEntry>>>,
     },
+    WalEntryChecksum {
+        sequence: u64,
+        respond_to: oneshot::Sender<Result<Option<u32>>>,
+    },
+    WalEntryTerm {
+        sequence: u64,
+        respond_to: oneshot::Sender<Result<Option<u64>>>,
+    },
     ApplyReplicationSnapshot {
         snapshot: engine::ReplicationSnapshot,
         respond_to: oneshot::Sender<Result<u64>>,
@@ -131,6 +149,24 @@ enum EngineRequest {
         entries: Vec<engine::WalEntry>,
         respond_to: oneshot::Sender<Result<u64>>,
     },
+    ReplaceReplicationSuffix {
+        prefix_sequence: u64,
+        entries: Vec<engine::WalEntry>,
+        respond_to: oneshot::Sender<Result<u64>>,
+    },
+}
+
+struct ExecuteResult {
+    response: Response,
+    last_applied_sequence: u64,
+    last_applied_term: Option<u64>,
+    last_applied_checksum: Option<u32>,
+}
+
+struct LogAppendResult {
+    last_applied_sequence: u64,
+    last_applied_term: Option<u64>,
+    last_applied_checksum: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -146,21 +182,73 @@ impl EngineHandle {
                 match request {
                     EngineRequest::Execute {
                         request_id,
+                        consensus_term,
                         command,
                         respond_to,
                     } => {
-                        let _ = respond_to.send(execute_command(&mut engine, request_id, command));
+                        engine.set_consensus_term(consensus_term);
+                        let result = execute_command(&mut engine, request_id, command).and_then(
+                            |response| {
+                                let last_applied_sequence = engine
+                                    .info()
+                                    .map_err(ServerError::from)
+                                    .map(|info| parse_last_applied_sequence(&info))?;
+                                let last_applied_term = engine
+                                    .wal_entry_term(last_applied_sequence)
+                                    .map_err(ServerError::from)?;
+                                let last_applied_checksum = engine
+                                    .wal_entry_checksum(last_applied_sequence)
+                                    .map_err(ServerError::from)?;
+                                Ok(ExecuteResult {
+                                    response,
+                                    last_applied_sequence,
+                                    last_applied_term,
+                                    last_applied_checksum,
+                                })
+                            },
+                        );
+                        let _ = respond_to.send(result);
                     }
                     EngineRequest::ExecuteBatch {
                         request_id: _request_id,
+                        consensus_term,
                         commands,
                         respond_to,
                     } => {
+                        engine.set_consensus_term(consensus_term);
                         let _ = respond_to.send(
                             engine
                                 .execute_transaction(&commands)
                                 .map_err(ServerError::from),
                         );
+                    }
+                    EngineRequest::AppendNoop {
+                        consensus_term,
+                        respond_to,
+                    } => {
+                        engine.set_consensus_term(consensus_term);
+                        let result =
+                            engine
+                                .append_noop()
+                                .map_err(ServerError::from)
+                                .and_then(|()| {
+                                    let last_applied_sequence = engine
+                                        .info()
+                                        .map_err(ServerError::from)
+                                        .map(|info| parse_last_applied_sequence(&info))?;
+                                    let last_applied_term = engine
+                                        .wal_entry_term(last_applied_sequence)
+                                        .map_err(ServerError::from)?;
+                                    let last_applied_checksum = engine
+                                        .wal_entry_checksum(last_applied_sequence)
+                                        .map_err(ServerError::from)?;
+                                    Ok(LogAppendResult {
+                                        last_applied_sequence,
+                                        last_applied_term,
+                                        last_applied_checksum,
+                                    })
+                                });
+                        let _ = respond_to.send(result);
                     }
                     EngineRequest::Info { respond_to } => {
                         let _ = respond_to.send(engine.info().map_err(ServerError::from));
@@ -192,6 +280,23 @@ impl EngineHandle {
                                 .map_err(ServerError::from),
                         );
                     }
+                    EngineRequest::WalEntryChecksum {
+                        sequence,
+                        respond_to,
+                    } => {
+                        let _ = respond_to.send(
+                            engine
+                                .wal_entry_checksum(sequence)
+                                .map_err(ServerError::from),
+                        );
+                    }
+                    EngineRequest::WalEntryTerm {
+                        sequence,
+                        respond_to,
+                    } => {
+                        let _ = respond_to
+                            .send(engine.wal_entry_term(sequence).map_err(ServerError::from));
+                    }
                     EngineRequest::ApplyReplicationSnapshot {
                         snapshot,
                         respond_to,
@@ -213,17 +318,34 @@ impl EngineHandle {
                                 .map_err(ServerError::from),
                         );
                     }
+                    EngineRequest::ReplaceReplicationSuffix {
+                        prefix_sequence,
+                        entries,
+                        respond_to,
+                    } => {
+                        let _ = respond_to.send(
+                            engine
+                                .replace_replication_suffix(prefix_sequence, &entries)
+                                .map_err(ServerError::from),
+                        );
+                    }
                 }
             }
         });
         Self { sender }
     }
 
-    async fn execute(&self, request_id: Uuid, command: Command) -> Result<Response> {
+    async fn execute(
+        &self,
+        request_id: Uuid,
+        consensus_term: u64,
+        command: Command,
+    ) -> Result<ExecuteResult> {
         let (send, recv) = oneshot::channel();
         self.sender
             .send(EngineRequest::Execute {
                 request_id,
+                consensus_term,
                 command,
                 respond_to: send,
             })
@@ -235,13 +357,27 @@ impl EngineHandle {
     async fn execute_batch(
         &self,
         request_id: Uuid,
+        consensus_term: u64,
         commands: Vec<Command>,
     ) -> Result<Vec<TransactionResult>> {
         let (send, recv) = oneshot::channel();
         self.sender
             .send(EngineRequest::ExecuteBatch {
                 request_id,
+                consensus_term,
                 commands,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn append_noop(&self, consensus_term: u64) -> Result<LogAppendResult> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::AppendNoop {
+                consensus_term,
                 respond_to: send,
             })
             .await
@@ -314,6 +450,30 @@ impl EngineHandle {
         recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
     }
 
+    async fn wal_entry_checksum(&self, sequence: u64) -> Result<Option<u32>> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::WalEntryChecksum {
+                sequence,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn wal_entry_term(&self, sequence: u64) -> Result<Option<u64>> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::WalEntryTerm {
+                sequence,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
     async fn apply_replication_snapshot(
         &self,
         snapshot: engine::ReplicationSnapshot,
@@ -333,6 +493,23 @@ impl EngineHandle {
         let (send, recv) = oneshot::channel();
         self.sender
             .send(EngineRequest::ApplyReplicationEntries {
+                entries,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    async fn replace_replication_suffix(
+        &self,
+        prefix_sequence: u64,
+        entries: Vec<engine::WalEntry>,
+    ) -> Result<u64> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::ReplaceReplicationSuffix {
+                prefix_sequence,
                 entries,
                 respond_to: send,
             })
@@ -381,6 +558,22 @@ pub struct Server {
     next_connection_id: AtomicU64,
     runtime: ServerRuntimeConfig,
     metrics: Arc<Metrics>,
+}
+
+struct AbortOnDrop {
+    handle: JoinHandle<()>,
+}
+
+impl AbortOnDrop {
+    fn new(handle: JoinHandle<()>) -> Self {
+        Self { handle }
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
 }
 
 struct SessionState {
@@ -565,6 +758,10 @@ impl Server {
 
         let listener = TcpListener::bind(&addr).await.map_err(ServerError::Bind)?;
         let local_addr = listener.local_addr().map_err(ServerError::Bind)?;
+        runtime
+            .replication
+            .set_advertise_addr(local_addr.to_string())
+            .await?;
         log_event(
             "INFO",
             "server.startup",
@@ -638,33 +835,48 @@ impl Server {
         } = self;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let mut background_tasks = Vec::new();
 
         if let Some(snapshot_interval) = runtime.snapshot_interval {
-            spawn_snapshotter(
+            background_tasks.push(AbortOnDrop::new(spawn_snapshotter(
                 engine.clone(),
                 Arc::clone(&metrics),
                 snapshot_interval,
                 shutdown_rx.clone(),
-            );
+            )));
         }
 
         if let Some(sweep_interval) = runtime.expiration_sweep_interval {
-            spawn_expiration_sweeper(
+            background_tasks.push(AbortOnDrop::new(spawn_expiration_sweeper(
                 engine.clone(),
                 Arc::clone(&metrics),
                 sweep_interval,
                 shutdown_rx.clone(),
-            );
+            )));
         }
 
-        spawn_tls_reloader(runtime.clone(), shutdown_rx.clone());
+        if let Some(handle) = spawn_tls_reloader(runtime.clone(), shutdown_rx.clone()) {
+            background_tasks.push(AbortOnDrop::new(handle));
+        }
 
         let initial_info = engine.info().await?;
+        let initial_sequence = parse_last_applied_sequence(&initial_info);
+        let initial_term = engine.wal_entry_term(initial_sequence).await?;
+        let initial_checksum = engine.wal_entry_checksum(initial_sequence).await?;
         runtime
             .replication
-            .set_local_last_applied_sequence(parse_last_applied_sequence(&initial_info))
+            .set_local_last_applied_state(initial_sequence, initial_term, initial_checksum)
             .await;
-        spawn_replication_follower_loop(engine.clone(), runtime.clone(), shutdown_rx.clone());
+        if let Some(handle) =
+            spawn_consensus_loop(engine.clone(), runtime.clone(), shutdown_rx.clone())
+        {
+            background_tasks.push(AbortOnDrop::new(handle));
+        }
+        if let Some(handle) =
+            spawn_replication_follower_loop(engine.clone(), runtime.clone(), shutdown_rx.clone())
+        {
+            background_tasks.push(AbortOnDrop::new(handle));
+        }
 
         tokio::pin!(shutdown_signal);
 
@@ -757,7 +969,7 @@ fn spawn_snapshotter(
     metrics: Arc<Metrics>,
     every: Duration,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(every);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -780,7 +992,7 @@ fn spawn_snapshotter(
                 }
             }
         }
-    });
+    })
 }
 
 fn spawn_expiration_sweeper(
@@ -788,7 +1000,7 @@ fn spawn_expiration_sweeper(
     metrics: Arc<Metrics>,
     every: Duration,
     mut shutdown: watch::Receiver<bool>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = interval(every);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -811,12 +1023,15 @@ fn spawn_expiration_sweeper(
                 }
             }
         }
-    });
+    })
 }
 
-fn spawn_tls_reloader(runtime: ServerRuntimeConfig, mut shutdown: watch::Receiver<bool>) {
+fn spawn_tls_reloader(
+    runtime: ServerRuntimeConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
     #[cfg(unix)]
-    tokio::spawn(async move {
+    return Some(tokio::spawn(async move {
         let Some(tls_state) = runtime.tls_state.clone() else {
             return;
         };
@@ -858,25 +1073,38 @@ fn spawn_tls_reloader(runtime: ServerRuntimeConfig, mut shutdown: watch::Receive
                 }
             }
         }
-    });
+    }));
+
+    #[cfg(not(unix))]
+    {
+        let _ = runtime;
+        let _ = shutdown;
+        None
+    }
 }
 
 fn spawn_replication_follower_loop(
     engine: EngineHandle,
     runtime: ServerRuntimeConfig,
     mut shutdown: watch::Receiver<bool>,
-) {
-    if runtime.replication.config().role != ReplicationRole::Follower {
-        return;
+) -> Option<JoinHandle<()>> {
+    if runtime.replication.config().role == ReplicationRole::Standalone {
+        return None;
     }
 
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let mut ticker = interval(runtime.replication.config().poll_interval);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    if !matches!(
+                        runtime.replication.role().await,
+                        ReplicationRole::Follower
+                    ) {
+                        continue;
+                    }
                     if runtime.replication.is_paused().await {
                         runtime
                             .replication
@@ -884,7 +1112,6 @@ fn spawn_replication_follower_loop(
                             .await;
                         continue;
                     }
-
                     let started = Instant::now();
                     match run_replication_round(engine.clone(), runtime.clone()).await {
                         Ok((lag_entries, caught_up)) => {
@@ -922,22 +1149,56 @@ fn spawn_replication_follower_loop(
                 }
             }
         }
-    });
+    }))
 }
 
 async fn run_replication_round(
     engine: EngineHandle,
     runtime: ServerRuntimeConfig,
 ) -> Result<(u64, bool)> {
-    let upstream = runtime
-        .replication
-        .config()
-        .upstream
-        .clone()
-        .ok_or_else(|| {
-            ServerError::InvalidArguments("follower replication upstream is required".to_string())
-        })?;
-    let mut stream = TcpStream::connect(&upstream)
+    let sources = replication_sources(&runtime).await;
+    if sources.is_empty() {
+        return Ok((0, false));
+    };
+
+    let mut last_error = None;
+    for upstream in sources {
+        match run_replication_round_from(engine.clone(), runtime.clone(), &upstream).await {
+            Ok(result) => return Ok(result),
+            Err(err) => last_error = Some(err),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        ServerError::InvalidArguments("replication source unavailable".to_string())
+    }))
+}
+
+async fn replication_sources(runtime: &ServerRuntimeConfig) -> Vec<String> {
+    let mut sources = Vec::new();
+    if let Some(leader_hint) = runtime.replication.leader_hint().await {
+        sources.push(leader_hint);
+    }
+    if let Some(upstream) = runtime.replication.config().upstream.clone() {
+        sources.push(upstream);
+    }
+    let local_node_id = runtime.replication.config().node_id.as_str();
+    for member in runtime.replication.current_members().await {
+        if member.node_id != local_node_id {
+            sources.push(member.advertise_addr);
+        }
+    }
+    sources.sort();
+    sources.dedup();
+    sources
+}
+
+async fn run_replication_round_from(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+    upstream: &str,
+) -> Result<(u64, bool)> {
+    let mut stream = TcpStream::connect(upstream)
         .await
         .map_err(ServerError::Accept)?;
     let hello = transport::ClientHello::new("vaylix-replication", env!("CARGO_PKG_VERSION"));
@@ -969,44 +1230,37 @@ async fn run_replication_round(
         return Err(ServerError::UnsupportedRemoteCommand);
     }
     let leader_status: ReplicationStatusSnapshot = decode_json_payload(&status_response.payload)?;
+    if leader_status.role != "leader" {
+        return Err(ServerError::InvalidArguments(format!(
+            "replication source {upstream} is not leader"
+        )));
+    }
     runtime
         .replication
-        .set_leader_node_id(Some(leader_status.node_id.clone()))
-        .await;
+        .observe_leader_status(
+            leader_status.node_id.clone(),
+            leader_status.advertise_addr.clone(),
+            leader_status.current_term,
+            leader_status.commit_sequence,
+            leader_status
+                .local_last_applied_sequence
+                .max(leader_status.commit_sequence),
+            leader_status.members.clone(),
+        )
+        .await?;
 
     let local_sequence = parse_last_applied_sequence(&engine.info().await?);
-    let mut current_sequence = local_sequence;
-    if current_sequence == 0 {
-        runtime
-            .replication
-            .update_follower_phase(FollowerPhase::SnapshotSync, None, None)
-            .await;
-        let snapshot_request = Request::new(
-            Uuid::now_v7(),
-            transport::Opcode::ReplicationSnapshot,
-            Vec::new(),
-        );
-        transport::write_request_to_async_with_options(&mut stream, &snapshot_request, transport)
-            .await?;
-        let snapshot_response =
-            transport::read_response_from_async_with_options(&mut stream, transport).await?;
-        if snapshot_response.status != Status::Ok {
-            return Err(ServerError::UnsupportedRemoteCommand);
-        }
-        let snapshot: engine::ReplicationSnapshot =
-            decode_json_payload(&snapshot_response.payload)?;
-        current_sequence = engine.apply_replication_snapshot(snapshot).await?;
-        runtime
-            .replication
-            .set_local_last_applied_sequence(current_sequence)
-            .await;
+    if local_sequence > leader_status.commit_sequence
+        || local_sequence > leader_status.local_last_applied_sequence
+    {
+        return Ok((0, false));
     }
 
     let fetch_request = Request::new(
         Uuid::now_v7(),
         transport::Opcode::ReplicationFetch,
         serde_json::to_vec(&ReplicationFetchRequest {
-            after_sequence: current_sequence,
+            after_sequence: local_sequence,
             limit: runtime.replication.config().fetch_batch_size,
         })
         .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
@@ -1018,44 +1272,49 @@ async fn run_replication_round(
         return Err(ServerError::UnsupportedRemoteCommand);
     }
     let entries: Vec<engine::WalEntry> = decode_json_payload(&fetch_response.payload)?;
-    if !entries.is_empty() {
-        match engine.apply_replication_entries(entries).await {
-            Ok(applied_sequence) => {
-                current_sequence = applied_sequence;
-                runtime
-                    .replication
-                    .set_local_last_applied_sequence(current_sequence)
-                    .await;
-            }
-            Err(ServerError::Engine(engine::EngineError::InvalidStorageOperation(_))) => {
-                let snapshot_request = Request::new(
-                    Uuid::now_v7(),
-                    transport::Opcode::ReplicationSnapshot,
-                    Vec::new(),
-                );
-                transport::write_request_to_async_with_options(
-                    &mut stream,
-                    &snapshot_request,
-                    transport,
-                )
-                .await?;
-                let snapshot_response =
-                    transport::read_response_from_async_with_options(&mut stream, transport)
-                        .await?;
-                if snapshot_response.status != Status::Ok {
-                    return Err(ServerError::UnsupportedRemoteCommand);
-                }
-                let snapshot: engine::ReplicationSnapshot =
-                    decode_json_payload(&snapshot_response.payload)?;
-                current_sequence = engine.apply_replication_snapshot(snapshot).await?;
-                runtime
-                    .replication
-                    .set_local_last_applied_sequence(current_sequence)
-                    .await;
-            }
-            Err(err) => return Err(err),
+    let current_sequence = {
+        let _apply_guard = runtime.replication_apply_lock.lock().await;
+        let mut current_sequence = parse_last_applied_sequence(&engine.info().await?);
+        if current_sequence > leader_status.commit_sequence
+            || current_sequence > leader_status.local_last_applied_sequence
+        {
+            return Ok((0, false));
         }
-    }
+        let entries = entries
+            .into_iter()
+            .filter(|entry| {
+                entry.sequence > current_sequence && entry.sequence <= leader_status.commit_sequence
+            })
+            .collect::<Vec<_>>();
+        if let Some(first) = entries.first()
+            && first.sequence != current_sequence.saturating_add(1)
+        {
+            return Err(ServerError::InvalidArguments(format!(
+                "replication fetch gap: expected {}, got {}",
+                current_sequence.saturating_add(1),
+                first.sequence
+            )));
+        }
+        if !entries.is_empty() {
+            match engine.apply_replication_entries(entries).await {
+                Ok(applied_sequence) => {
+                    current_sequence = applied_sequence;
+                    let current_term = engine.wal_entry_term(current_sequence).await?;
+                    let current_checksum = engine.wal_entry_checksum(current_sequence).await?;
+                    runtime
+                        .replication
+                        .set_local_last_applied_state(
+                            current_sequence,
+                            current_term,
+                            current_checksum,
+                        )
+                        .await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        current_sequence
+    };
 
     let ack_request = Request::new(
         Uuid::now_v7(),
@@ -1063,6 +1322,8 @@ async fn run_replication_round(
         serde_json::to_vec(&ReplicationAckRequest {
             follower_node_id: runtime.replication.config().node_id.clone(),
             applied_sequence: current_sequence,
+            term: leader_status.current_term,
+            leader_node_id: leader_status.node_id.clone(),
         })
         .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
     );
@@ -1077,6 +1338,881 @@ async fn run_replication_round(
         .commit_sequence
         .saturating_sub(current_sequence);
     Ok((lag_entries, lag_entries == 0))
+}
+
+fn spawn_consensus_loop(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+    mut shutdown: watch::Receiver<bool>,
+) -> Option<JoinHandle<()>> {
+    if runtime.replication.config().role == ReplicationRole::Standalone {
+        return None;
+    }
+
+    Some(tokio::spawn(async move {
+        let tick_every = runtime
+            .replication
+            .config()
+            .heartbeat_interval
+            .min(Duration::from_millis(100));
+        let mut ticker = interval(tick_every.max(Duration::from_millis(25)));
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    if runtime.replication.current_members().await.len() <= 1 {
+                        continue;
+                    }
+                    if runtime.replication.heartbeat_due().await
+                        && let Err(err) = send_cluster_liveness_heartbeats(engine.clone(), runtime.clone()).await
+                    {
+                        log_event(
+                            "WARN",
+                            "server.consensus",
+                            &format!("[{}] {}: {err}", err.code(), err.name()),
+                        );
+                    }
+                    if runtime.replication.heartbeat_due().await
+                        && let Err(err) = try_send_cluster_heartbeats(engine.clone(), runtime.clone()).await
+                    {
+                        log_event(
+                            "WARN",
+                            "server.consensus",
+                            &format!("[{}] {}: {err}", err.code(), err.name()),
+                        );
+                    }
+
+                    if runtime.replication.election_due().await
+                        && let Err(err) = run_election_round(engine.clone(), runtime.clone()).await
+                    {
+                        log_event(
+                            "WARN",
+                            "server.consensus",
+                            &format!("[{}] {}: {err}", err.code(), err.name()),
+                        );
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_ok() && *shutdown.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    }))
+}
+
+async fn run_election_round(engine: EngineHandle, runtime: ServerRuntimeConfig) -> Result<()> {
+    if !runtime.replication.election_due().await {
+        return Ok(());
+    }
+    let (probe_term, members, last_log_index, last_log_term) =
+        runtime.replication.election_probe().await;
+    let candidate_addr = runtime
+        .replication
+        .local_advertise_addr()
+        .await
+        .ok_or_else(|| {
+            ServerError::InvalidArguments("candidate advertise address is unavailable".to_string())
+        })?;
+    let local_node_id = runtime.replication.config().node_id.clone();
+    log_event(
+        "INFO",
+        "server.consensus",
+        &format!(
+            "prevote start node={} probe_term={} last_log_index={} last_log_term={:?}",
+            local_node_id, probe_term, last_log_index, last_log_term
+        ),
+    );
+    let mut voter_count = 0usize;
+    let mut prevotes_granted = 1usize;
+
+    for member in &members {
+        if member.voter {
+            voter_count += 1;
+        }
+        if !member.voter || member.node_id == local_node_id {
+            continue;
+        }
+        match send_vote_request(
+            runtime.clone(),
+            member,
+            VoteRequest {
+                term: probe_term,
+                candidate_node_id: local_node_id.clone(),
+                candidate_addr: candidate_addr.clone(),
+                last_log_index,
+                last_log_term,
+                prevote: true,
+            },
+        )
+        .await
+        {
+            Ok(response) => {
+                if response.vote_granted {
+                    prevotes_granted += 1;
+                }
+            }
+            Err(err) => {
+                log_event(
+                    "WARN",
+                    "server.consensus",
+                    &format!(
+                        "vote request to {} failed [{}] {}: {err}",
+                        member.node_id,
+                        err.code(),
+                        err.name()
+                    ),
+                );
+            }
+        }
+    }
+
+    if prevotes_granted < ((voter_count.max(1) / 2) + 1) {
+        log_event(
+            "INFO",
+            "server.consensus",
+            &format!(
+                "prevote lost node={} probe_term={} granted={}/{}",
+                local_node_id,
+                probe_term,
+                prevotes_granted,
+                voter_count.max(1)
+            ),
+        );
+        runtime.replication.defer_election().await;
+        return Ok(());
+    }
+
+    // Abort escalation if a valid leader heartbeat arrived during prevote.
+    if !runtime.replication.election_due().await {
+        log_event(
+            "INFO",
+            "server.consensus",
+            &format!(
+                "prevote stale node={} probe_term={} aborted_before_election=true",
+                local_node_id, probe_term
+            ),
+        );
+        return Ok(());
+    }
+
+    let (term, members, last_log_index, last_log_term) =
+        runtime.replication.begin_election().await?;
+    log_event(
+        "INFO",
+        "server.consensus",
+        &format!(
+            "election start node={} term={} last_log_index={} last_log_term={:?}",
+            local_node_id, term, last_log_index, last_log_term
+        ),
+    );
+    let mut votes_granted = 1usize;
+    let mut voter_count = 0usize;
+
+    for member in &members {
+        if member.voter {
+            voter_count += 1;
+        }
+        if !member.voter || member.node_id == local_node_id {
+            continue;
+        }
+        match send_vote_request(
+            runtime.clone(),
+            member,
+            VoteRequest {
+                term,
+                candidate_node_id: local_node_id.clone(),
+                candidate_addr: candidate_addr.clone(),
+                last_log_index,
+                last_log_term,
+                prevote: false,
+            },
+        )
+        .await
+        {
+            Ok(response) => {
+                if response.term > term {
+                    runtime
+                        .replication
+                        .observe_remote_term(response.term)
+                        .await?;
+                    return Ok(());
+                }
+                if response.vote_granted {
+                    votes_granted += 1;
+                }
+            }
+            Err(err) => {
+                log_event(
+                    "WARN",
+                    "server.consensus",
+                    &format!(
+                        "vote request to {} failed [{}] {}: {err}",
+                        member.node_id,
+                        err.code(),
+                        err.name()
+                    ),
+                );
+            }
+        }
+    }
+
+    let won = runtime
+        .replication
+        .finalize_election(term, votes_granted, voter_count.max(1))
+        .await?;
+    if won {
+        let _role_guard = runtime.replication_apply_lock.lock().await;
+        if !runtime.replication.is_leader_for_term(term).await {
+            return Ok(());
+        }
+        let noop = engine.append_noop(term).await?;
+        runtime
+            .replication
+            .set_local_last_applied_state(
+                noop.last_applied_sequence,
+                noop.last_applied_term,
+                noop.last_applied_checksum,
+            )
+            .await;
+        let catchup_deadline = Instant::now() + runtime.replication.config().ack_timeout;
+        loop {
+            send_cluster_heartbeats_role_guarded_with_timeout(engine.clone(), runtime.clone())
+                .await?;
+            if runtime.replication.role().await != ReplicationRole::Leader {
+                break;
+            }
+            if runtime.replication.commit_sequence().await >= noop.last_applied_sequence {
+                break;
+            }
+            if Instant::now() >= catchup_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        record_runtime_event(
+            &runtime.audit_logger,
+            "leader_elected",
+            [
+                ("term".to_string(), term.to_string()),
+                ("node_id".to_string(), local_node_id),
+                ("votes".to_string(), votes_granted.to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+    }
+    Ok(())
+}
+
+async fn send_cluster_heartbeats_role_guarded(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+) -> Result<()> {
+    let _fanout_guard = runtime.replication_fanout_lock.lock().await;
+    let peer_timeout = runtime.replication.config().ack_timeout;
+    send_cluster_appends_locked(engine, runtime.clone(), peer_timeout).await
+}
+
+async fn send_cluster_heartbeats_role_guarded_with_timeout(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+) -> Result<()> {
+    let background_window = runtime
+        .replication
+        .config()
+        .heartbeat_interval
+        .saturating_mul(5)
+        .max(Duration::from_millis(250))
+        .min(runtime.replication.config().ack_timeout);
+    let fanout_timeout = runtime
+        .replication
+        .config()
+        .ack_timeout
+        .saturating_add(background_window);
+    match timeout(
+        fanout_timeout,
+        send_cluster_heartbeats_role_guarded(engine, runtime),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ServerError::ReplicationAckUnavailable),
+    }
+}
+
+async fn try_send_cluster_heartbeats(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+) -> Result<()> {
+    let Ok(_role_guard) = runtime.replication_apply_lock.try_lock() else {
+        return Ok(());
+    };
+    let Ok(_fanout_guard) = runtime.replication_fanout_lock.try_lock() else {
+        return Ok(());
+    };
+    let peer_timeout = runtime
+        .replication
+        .config()
+        .heartbeat_interval
+        .saturating_mul(5)
+        .max(Duration::from_millis(250))
+        .min(runtime.replication.config().ack_timeout);
+    send_cluster_appends_locked(engine, runtime.clone(), peer_timeout).await
+}
+
+async fn send_cluster_appends_locked(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+    peer_timeout: Duration,
+) -> Result<()> {
+    if runtime.replication.role().await != ReplicationRole::Leader {
+        return Ok(());
+    }
+    let local_sequence = parse_last_applied_sequence(&engine.info().await?);
+    let local_term = engine.wal_entry_term(local_sequence).await?;
+    let local_checksum = engine.wal_entry_checksum(local_sequence).await?;
+    runtime
+        .replication
+        .set_local_last_applied_state(local_sequence, local_term, local_checksum)
+        .await;
+    let Some((
+        term,
+        leader_node_id,
+        leader_addr,
+        commit_sequence,
+        leader_frontier_sequence,
+        members,
+    )) = runtime.replication.leader_heartbeat_payload().await
+    else {
+        return Ok(());
+    };
+    runtime.replication.note_leader_activity().await;
+    let cluster_members = runtime.replication.current_members().await;
+    let mut peer_plans = Vec::new();
+    for member in members {
+        if !member.voter || member.node_id == leader_node_id {
+            continue;
+        }
+        let next_sequence = runtime
+            .replication
+            .follower_next_sequence(&member.node_id)
+            .await;
+        let prev_sequence = next_sequence.saturating_sub(1);
+        peer_plans.push((member, next_sequence, prev_sequence));
+    }
+    let min_prev_sequence = peer_plans
+        .iter()
+        .map(|(_, _, prev_sequence)| *prev_sequence)
+        .min()
+        .unwrap_or(local_sequence);
+    let fetch_batch_size = runtime.replication.config().fetch_batch_size;
+    let cache_after_sequence = min_prev_sequence.saturating_sub(1);
+    let cache_limit = local_sequence
+        .saturating_sub(cache_after_sequence)
+        .saturating_add(fetch_batch_size as u64)
+        .max(fetch_batch_size as u64)
+        .min(usize::MAX as u64) as usize;
+    let cached_entries = engine
+        .wal_entries_since(cache_after_sequence, cache_limit)
+        .await?;
+    let cached_by_sequence = cached_entries
+        .iter()
+        .map(|entry| (entry.sequence, entry.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut fanout = JoinSet::new();
+    for (member, _next_sequence, prev_sequence) in peer_plans {
+        let (prev_term, prev_entry_checksum, entries, snapshot) = if prev_sequence == 0 {
+            let entries = cached_entries
+                .iter()
+                .filter(|entry| entry.sequence > prev_sequence)
+                .take(fetch_batch_size)
+                .cloned()
+                .collect::<Vec<_>>();
+            (None, None, entries, None)
+        } else if let Some(prev_entry) = cached_by_sequence.get(&prev_sequence).cloned() {
+            let prev_term = Some(prev_entry.term);
+            let prev_entry_checksum = Some(prev_entry.checksum().map_err(ServerError::from)?);
+            let entries = cached_entries
+                .iter()
+                .filter(|entry| entry.sequence > prev_sequence)
+                .take(fetch_batch_size)
+                .cloned()
+                .collect::<Vec<_>>();
+            (prev_term, prev_entry_checksum, entries, None)
+        } else {
+            (
+                None,
+                None,
+                Vec::new(),
+                Some(engine.replication_snapshot().await?),
+            )
+        };
+        let runtime = runtime.clone();
+        let cluster_members = cluster_members.clone();
+        let leader_node_id = leader_node_id.clone();
+        let leader_addr = leader_addr.clone();
+        fanout.spawn(async move {
+            let response = if let Some(snapshot) = snapshot {
+                let response = timeout(
+                    peer_timeout,
+                    send_install_snapshot_request(
+                        runtime.clone(),
+                        SnapshotInstallCall {
+                            member: member.clone(),
+                            payload: SnapshotInstallRequest {
+                                term,
+                                leader_node_id: leader_node_id.clone(),
+                                leader_addr: leader_addr.clone(),
+                                commit_sequence,
+                                members: cluster_members.clone(),
+                                snapshot,
+                            },
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| ServerError::ReplicationAckUnavailable)??;
+                AppendEntriesResponse {
+                    term: response.term,
+                    accepted: response.accepted,
+                    match_sequence: response.applied_sequence,
+                }
+            } else {
+                timeout(
+                    peer_timeout,
+                    send_append_request(
+                        runtime.clone(),
+                        &member,
+                        AppendEntriesRequest {
+                            term,
+                            leader_node_id: leader_node_id.clone(),
+                            leader_addr: leader_addr.clone(),
+                            commit_sequence,
+                            leader_frontier_sequence,
+                            prev_sequence,
+                            prev_term,
+                            prev_entry_checksum,
+                            entries,
+                            members: cluster_members.clone(),
+                        },
+                    ),
+                )
+                .await
+                .map_err(|_| ServerError::ReplicationAckUnavailable)??
+            };
+            Ok::<_, ServerError>((member, response, leader_node_id, local_sequence))
+        });
+    }
+
+    while let Some(result) = fanout.join_next().await {
+        match result {
+            Ok(Ok((member, response, leader_node_id, local_sequence))) => {
+                if response.term > term {
+                    runtime
+                        .replication
+                        .observe_remote_term(response.term)
+                        .await?;
+                    return Ok(());
+                }
+                runtime
+                    .replication
+                    .record_append_result(
+                        member.node_id.clone(),
+                        response.accepted,
+                        response.match_sequence,
+                        term,
+                        &leader_node_id,
+                    )
+                    .await;
+                if !response.accepted {
+                    log_event(
+                        "WARN",
+                        "server.consensus",
+                        &format!(
+                            "append rejected by {} term={} match_sequence={} leader_term={} commit_sequence={}",
+                            member.node_id,
+                            response.term,
+                            response.match_sequence,
+                            term,
+                            commit_sequence
+                        ),
+                    );
+                }
+                if runtime.replication.config().write_ack_mode
+                    == crate::replication::WriteAckMode::Replica
+                    && runtime.replication.commit_sequence().await >= local_sequence
+                {
+                    fanout.abort_all();
+                    break;
+                }
+            }
+            Ok(Err(err)) => {
+                log_event(
+                    "WARN",
+                    "server.consensus",
+                    &format!(
+                        "heartbeat fanout failed [{}] {}: {err}",
+                        err.code(),
+                        err.name()
+                    ),
+                );
+            }
+            Err(err) => {
+                log_event(
+                    "WARN",
+                    "server.consensus",
+                    &format!("heartbeat fanout task failed: {err}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn send_cluster_liveness_heartbeats(
+    engine: EngineHandle,
+    runtime: ServerRuntimeConfig,
+) -> Result<()> {
+    if runtime.replication.role().await != ReplicationRole::Leader {
+        return Ok(());
+    }
+    let local_sequence = parse_last_applied_sequence(&engine.info().await?);
+    let local_term = engine.wal_entry_term(local_sequence).await?;
+    let local_checksum = engine.wal_entry_checksum(local_sequence).await?;
+    runtime
+        .replication
+        .set_local_last_applied_state(local_sequence, local_term, local_checksum)
+        .await;
+    let Some((
+        term,
+        leader_node_id,
+        leader_addr,
+        commit_sequence,
+        leader_frontier_sequence,
+        members,
+    )) = runtime.replication.leader_heartbeat_payload().await
+    else {
+        return Ok(());
+    };
+    runtime.replication.note_leader_activity().await;
+    let mut fanout = JoinSet::new();
+    for member in members {
+        if !member.voter || member.node_id == leader_node_id {
+            continue;
+        }
+        let runtime = runtime.clone();
+        let leader_node_id = leader_node_id.clone();
+        let leader_addr = leader_addr.clone();
+        let members = runtime.replication.current_members().await;
+        let peer_timeout = runtime
+            .replication
+            .config()
+            .heartbeat_interval
+            .saturating_mul(5)
+            .min(runtime.replication.config().ack_timeout);
+        fanout.spawn(async move {
+            let response = timeout(
+                peer_timeout,
+                send_heartbeat_request(
+                    runtime,
+                    &member,
+                    HeartbeatRequest {
+                        term,
+                        leader_node_id,
+                        leader_addr,
+                        commit_sequence,
+                        leader_frontier_sequence,
+                        members,
+                    },
+                ),
+            )
+            .await
+            .map_err(|_| ServerError::ReplicationAckUnavailable)??;
+            Ok::<_, ServerError>((member, response))
+        });
+    }
+
+    while let Some(result) = fanout.join_next().await {
+        match result {
+            Ok(Ok((member, response))) => {
+                if response.term > term {
+                    runtime
+                        .replication
+                        .observe_remote_term(response.term)
+                        .await?;
+                    return Ok(());
+                }
+                if !response.accepted {
+                    log_event(
+                        "WARN",
+                        "server.consensus",
+                        &format!(
+                            "heartbeat rejected by {} term={} leader_term={}",
+                            member.node_id, response.term, term
+                        ),
+                    );
+                }
+            }
+            Ok(Err(err)) => {
+                log_event(
+                    "WARN",
+                    "server.consensus",
+                    &format!(
+                        "heartbeat request failed [{}] {}: {err}",
+                        err.code(),
+                        err.name()
+                    ),
+                );
+            }
+            Err(err) => {
+                log_event(
+                    "WARN",
+                    "server.consensus",
+                    &format!("heartbeat task failed: {err}"),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn drive_write_commit(
+    engine: &EngineHandle,
+    runtime: &ServerRuntimeConfig,
+    sequence: u64,
+) -> Result<()> {
+    if runtime.replication.config().write_ack_mode == crate::replication::WriteAckMode::Local {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + runtime.replication.config().ack_timeout;
+    loop {
+        if runtime.replication.commit_sequence().await >= sequence {
+            return Ok(());
+        }
+        if runtime.replication.role().await != ReplicationRole::Leader {
+            return Err(ServerError::ReplicationAckUnavailable);
+        }
+        if Instant::now() >= deadline {
+            return runtime.replication.wait_for_write_ack(sequence).await;
+        }
+        if let Err(_err) =
+            send_cluster_heartbeats_role_guarded_with_timeout(engine.clone(), runtime.clone()).await
+        {
+            if runtime.replication.commit_sequence().await >= sequence {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return runtime.replication.wait_for_write_ack(sequence).await;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn rollback_uncommitted_tail(
+    engine: &EngineHandle,
+    runtime: &ServerRuntimeConfig,
+) -> Result<()> {
+    let commit_sequence = runtime.replication.commit_sequence().await;
+    let current_sequence = parse_last_applied_sequence(&engine.info().await?);
+    if current_sequence <= commit_sequence {
+        return Ok(());
+    }
+    let applied_sequence = engine
+        .replace_replication_suffix(commit_sequence, Vec::new())
+        .await?;
+    let applied_term = engine.wal_entry_term(applied_sequence).await?;
+    let applied_checksum = engine.wal_entry_checksum(applied_sequence).await?;
+    runtime
+        .replication
+        .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
+        .await;
+    Ok(())
+}
+
+async fn send_vote_request(
+    runtime: ServerRuntimeConfig,
+    member: &ClusterMember,
+    payload: VoteRequest,
+) -> Result<crate::replication::VoteResponse> {
+    let mut stream = connect_replication_peer(runtime.clone(), &member.advertise_addr).await?;
+    let transport = negotiate_replication_transport(&mut stream).await?;
+    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
+    let request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationVote,
+        serde_json::to_vec(&payload)
+            .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
+    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    ensure_replication_ok(&response)?;
+    decode_json_payload(&response.payload)
+}
+
+async fn send_append_request(
+    runtime: ServerRuntimeConfig,
+    member: &ClusterMember,
+    payload: AppendEntriesRequest,
+) -> Result<AppendEntriesResponse> {
+    let mut stream = connect_replication_peer(runtime.clone(), &member.advertise_addr).await?;
+    let transport = negotiate_replication_transport(&mut stream).await?;
+    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
+    let request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationAppend,
+        serde_json::to_vec(&payload)
+            .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
+    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    ensure_replication_ok(&response)?;
+    decode_json_payload(&response.payload)
+}
+
+async fn send_heartbeat_request(
+    runtime: ServerRuntimeConfig,
+    member: &ClusterMember,
+    payload: HeartbeatRequest,
+) -> Result<crate::replication::HeartbeatResponse> {
+    let mut stream = connect_replication_peer(runtime.clone(), &member.advertise_addr).await?;
+    let transport = negotiate_replication_transport(&mut stream).await?;
+    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
+    let request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationHeartbeat,
+        serde_json::to_vec(&payload)
+            .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
+    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    ensure_replication_ok(&response)?;
+    decode_json_payload(&response.payload)
+}
+
+fn spawn_replication_append_ack(
+    runtime: ServerRuntimeConfig,
+    leader_addr: String,
+    term: u64,
+    leader_node_id: String,
+    applied_sequence: u64,
+) {
+    tokio::spawn(async move {
+        if let Err(err) = send_replication_append_ack(
+            runtime,
+            leader_addr,
+            term,
+            leader_node_id,
+            applied_sequence,
+        )
+        .await
+        {
+            log_event(
+                "WARN",
+                "server.consensus",
+                &format!("append ack failed [{}] {}: {err}", err.code(), err.name()),
+            );
+        }
+    });
+}
+
+async fn send_replication_append_ack(
+    runtime: ServerRuntimeConfig,
+    leader_addr: String,
+    term: u64,
+    leader_node_id: String,
+    applied_sequence: u64,
+) -> Result<()> {
+    let mut stream = connect_replication_peer(runtime.clone(), &leader_addr).await?;
+    let transport = negotiate_replication_transport(&mut stream).await?;
+    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
+    let request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationAck,
+        serde_json::to_vec(&ReplicationAckRequest {
+            follower_node_id: runtime.replication.config().node_id.clone(),
+            applied_sequence,
+            term,
+            leader_node_id,
+        })
+        .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
+    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    ensure_replication_ok(&response)
+}
+
+struct SnapshotInstallCall {
+    member: ClusterMember,
+    payload: SnapshotInstallRequest,
+}
+
+async fn send_install_snapshot_request(
+    runtime: ServerRuntimeConfig,
+    call: SnapshotInstallCall,
+) -> Result<SnapshotInstallResponse> {
+    let mut stream = connect_replication_peer(runtime.clone(), &call.member.advertise_addr).await?;
+    let transport = negotiate_replication_transport(&mut stream).await?;
+    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
+    let request = Request::new(
+        Uuid::now_v7(),
+        transport::Opcode::ReplicationInstallSnapshot,
+        serde_json::to_vec(&call.payload)
+            .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
+    );
+    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
+    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
+    ensure_replication_ok(&response)?;
+    decode_json_payload(&response.payload)
+}
+
+fn ensure_replication_ok(response: &Response) -> Result<()> {
+    if response.status == Status::Ok {
+        return Ok(());
+    }
+
+    if let Ok(payload) = response.decode_error() {
+        return Err(ServerError::InvalidArguments(format!(
+            "replication peer returned {} {}: {}",
+            payload.code, payload.name, payload.message
+        )));
+    }
+
+    Err(ServerError::UnsupportedRemoteCommand)
+}
+
+async fn connect_replication_peer(_runtime: ServerRuntimeConfig, addr: &str) -> Result<TcpStream> {
+    TcpStream::connect(addr).await.map_err(ServerError::Accept)
+}
+
+async fn negotiate_replication_transport(stream: &mut TcpStream) -> Result<CodecOptions> {
+    let hello = transport::ClientHello::new("vaylix-replication", env!("CARGO_PKG_VERSION"));
+    transport::write_client_hello_to_async(stream, &hello).await?;
+    let server_hello = transport::read_server_hello_from_async(stream).await?;
+    transport::client_options_from_server_hello(&server_hello).map_err(ServerError::from)
+}
+
+async fn authenticate_replication_peer(
+    stream: &mut TcpStream,
+    transport: CodecOptions,
+    runtime: &ServerRuntimeConfig,
+) -> Result<()> {
+    if let (Some(username), Some(password)) = (
+        runtime.replication.config().upstream_username.clone(),
+        runtime.replication.config().upstream_password.clone(),
+    ) {
+        let auth = Request::from_command(Uuid::now_v7(), Command::Auth { username, password })?;
+        transport::write_request_to_async_with_options(stream, &auth, transport).await?;
+        let response = transport::read_response_from_async_with_options(stream, transport).await?;
+        if response.status != Status::Ok {
+            return Err(ServerError::AuthenticationFailed);
+        }
+    }
+    Ok(())
 }
 
 async fn handle_client<S>(
@@ -1354,6 +2490,10 @@ fn is_internal_replication_opcode(opcode: transport::Opcode) -> bool {
             | transport::Opcode::ReplicationSnapshot
             | transport::Opcode::ReplicationFetch
             | transport::Opcode::ReplicationAck
+            | transport::Opcode::ReplicationAppend
+            | transport::Opcode::ReplicationInstallSnapshot
+            | transport::Opcode::ReplicationVote
+            | transport::Opcode::ReplicationHeartbeat
     )
 }
 
@@ -1446,6 +2586,11 @@ fn validate_command(command: &Command, guards: &ServerGuards) -> Result<()> {
             validate_value(password, guards)?;
         }
         Command::DropUser { username } => validate_key(username, guards)?,
+        Command::ClusterJoin { node_id, address } => {
+            validate_key(node_id, guards)?;
+            validate_value(address, guards)?;
+        }
+        Command::ClusterRemove { node_id } => validate_key(node_id, guards)?,
         Command::CreateRole { role } | Command::DropRole { role } => validate_key(role, guards)?,
         Command::ShowGrantsForUser { username } => validate_key(username, guards)?,
         Command::ShowGrantsForRole { role } => validate_key(role, guards)?,
@@ -1640,6 +2785,13 @@ fn replication_entries_from_snapshot(
                 .unwrap_or_else(|| "none".to_string()),
         ),
         (
+            "leader_advertise_addr".to_string(),
+            snapshot
+                .leader_advertise_addr
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
             "upstream".to_string(),
             snapshot
                 .upstream
@@ -1650,6 +2802,18 @@ fn replication_entries_from_snapshot(
             "write_ack_mode".to_string(),
             snapshot.write_ack_mode.clone(),
         ),
+        (
+            "current_term".to_string(),
+            snapshot.current_term.to_string(),
+        ),
+        (
+            "voted_for".to_string(),
+            snapshot
+                .voted_for
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        ("quorum_size".to_string(), snapshot.quorum_size.to_string()),
         ("paused".to_string(), snapshot.paused.to_string()),
         ("health".to_string(), snapshot.health.clone()),
         (
@@ -1718,6 +2882,16 @@ fn replication_entries_from_snapshot(
             follower.stale.to_string(),
         ));
     }
+    for member in &snapshot.members {
+        entries.push((
+            format!("member.{}.advertise_addr", member.node_id),
+            member.advertise_addr.clone(),
+        ));
+        entries.push((
+            format!("member.{}.voter", member.node_id),
+            member.voter.to_string(),
+        ));
+    }
     entries
 }
 
@@ -1762,6 +2936,8 @@ fn is_write_command(command: &Command) -> bool {
             | Command::PromoteFollower
             | Command::PauseReplication
             | Command::ResumeReplication
+            | Command::ClusterJoin { .. }
+            | Command::ClusterRemove { .. }
     )
 }
 
@@ -1769,10 +2945,20 @@ async fn enforce_leader_writeability(
     runtime: &ServerRuntimeConfig,
     command: &Command,
 ) -> Result<()> {
-    if runtime.replication.role().await == ReplicationRole::Follower && is_write_command(command) {
+    if !is_write_command(command) {
+        return Ok(());
+    }
+    if !replication_role_accepts_writes(runtime.replication.role().await) {
         return Err(ServerError::ReplicationReadOnly);
     }
+    if !runtime.replication.write_window_available().await {
+        return Err(ServerError::ReplicationAckUnavailable);
+    }
     Ok(())
+}
+
+fn replication_role_accepts_writes(role: ReplicationRole) -> bool {
+    matches!(role, ReplicationRole::Standalone | ReplicationRole::Leader)
 }
 
 async fn process_internal_replication_request(
@@ -1814,9 +3000,241 @@ async fn process_internal_replication_request(
             let payload: ReplicationAckRequest = decode_json_payload(&request.payload)?;
             runtime
                 .replication
-                .register_follower_ack(payload.follower_node_id, payload.applied_sequence)
+                .register_follower_ack(
+                    payload.follower_node_id,
+                    payload.applied_sequence,
+                    payload.term,
+                    &payload.leader_node_id,
+                )
                 .await;
             Ok(Response::ok(request.request_id))
+        }
+        transport::Opcode::ReplicationAppend => {
+            let _apply_guard = runtime.replication_apply_lock.lock().await;
+            let payload: AppendEntriesRequest = decode_json_payload(&request.payload)?;
+            let current_term = runtime.replication.current_term().await;
+            if payload.term < current_term {
+                let response = AppendEntriesResponse {
+                    term: current_term,
+                    accepted: false,
+                    match_sequence: runtime.replication.local_last_applied_sequence().await,
+                };
+                return json_response(request.request_id, &response);
+            }
+
+            let heartbeat_response = runtime
+                .replication
+                .handle_heartbeat(HeartbeatRequest {
+                    term: payload.term,
+                    leader_node_id: payload.leader_node_id.clone(),
+                    leader_addr: payload.leader_addr.clone(),
+                    commit_sequence: payload.commit_sequence,
+                    leader_frontier_sequence: payload.leader_frontier_sequence,
+                    members: payload.members.clone(),
+                })
+                .await?;
+            if !heartbeat_response.accepted {
+                let response = AppendEntriesResponse {
+                    term: heartbeat_response.term,
+                    accepted: false,
+                    match_sequence: runtime.replication.local_last_applied_sequence().await,
+                };
+                return json_response(request.request_id, &response);
+            }
+
+            let current_sequence = parse_last_applied_sequence(&engine.info().await?);
+            let target_sequence = payload
+                .entries
+                .last()
+                .map(|entry| entry.sequence)
+                .unwrap_or(payload.commit_sequence)
+                .max(payload.commit_sequence);
+            runtime
+                .replication
+                .note_leader_frontier(target_sequence)
+                .await;
+            if current_sequence < target_sequence {
+                runtime
+                    .replication
+                    .update_follower_phase(FollowerPhase::CatchingUp, None, None)
+                    .await;
+            }
+            let local_prev_term = engine.wal_entry_term(payload.prev_sequence).await?;
+            let local_prev_checksum = engine.wal_entry_checksum(payload.prev_sequence).await?;
+            if local_prev_term != payload.prev_term
+                || local_prev_checksum != payload.prev_entry_checksum
+            {
+                let response = AppendEntriesResponse {
+                    term: heartbeat_response.term,
+                    accepted: false,
+                    match_sequence: payload.prev_sequence.saturating_sub(1),
+                };
+                return json_response(request.request_id, &response);
+            }
+
+            let applied_sequence = if payload.entries.is_empty() {
+                if current_sequence < payload.prev_sequence {
+                    let response = AppendEntriesResponse {
+                        term: heartbeat_response.term,
+                        accepted: false,
+                        match_sequence: current_sequence,
+                    };
+                    return json_response(request.request_id, &response);
+                }
+                if current_sequence > payload.prev_sequence {
+                    engine
+                        .replace_replication_suffix(payload.prev_sequence, Vec::new())
+                        .await?
+                } else {
+                    current_sequence
+                }
+            } else {
+                let mut overlap_match_sequence = payload.prev_sequence;
+                for entry in &payload.entries {
+                    if entry.sequence > current_sequence {
+                        break;
+                    }
+                    let local_term = engine.wal_entry_term(entry.sequence).await?;
+                    let local_checksum = engine.wal_entry_checksum(entry.sequence).await?;
+                    let entry_checksum = entry.checksum().map_err(ServerError::from)?;
+                    if local_term != Some(entry.term) || local_checksum != Some(entry_checksum) {
+                        let replacement = payload
+                            .entries
+                            .iter()
+                            .skip_while(|candidate| candidate.sequence < entry.sequence)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let applied_sequence = engine
+                            .replace_replication_suffix(
+                                entry.sequence.saturating_sub(1),
+                                replacement,
+                            )
+                            .await?;
+                        let applied_term = engine.wal_entry_term(applied_sequence).await?;
+                        let applied_checksum = engine.wal_entry_checksum(applied_sequence).await?;
+                        runtime
+                            .replication
+                            .set_local_last_applied_state(
+                                applied_sequence,
+                                applied_term,
+                                applied_checksum,
+                            )
+                            .await;
+                        if applied_sequence >= target_sequence {
+                            runtime
+                                .replication
+                                .update_follower_phase(FollowerPhase::Streaming, Some(0), Some(0))
+                                .await;
+                        }
+                        let response = AppendEntriesResponse {
+                            term: heartbeat_response.term,
+                            accepted: true,
+                            match_sequence: applied_sequence,
+                        };
+                        return json_response(request.request_id, &response);
+                    }
+                    overlap_match_sequence = entry.sequence;
+                }
+
+                let suffix_start = overlap_match_sequence.saturating_add(1);
+                let suffix = payload
+                    .entries
+                    .iter()
+                    .skip_while(|entry| entry.sequence < suffix_start)
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                if suffix.is_empty() {
+                    if current_sequence > overlap_match_sequence {
+                        engine
+                            .replace_replication_suffix(overlap_match_sequence, Vec::new())
+                            .await?
+                    } else {
+                        current_sequence.max(overlap_match_sequence)
+                    }
+                } else if current_sequence.saturating_add(1) != suffix[0].sequence {
+                    engine
+                        .replace_replication_suffix(overlap_match_sequence, suffix)
+                        .await?
+                } else {
+                    engine.apply_replication_entries(suffix).await?
+                }
+            };
+            let applied_term = engine.wal_entry_term(applied_sequence).await?;
+            let applied_checksum = engine.wal_entry_checksum(applied_sequence).await?;
+            runtime
+                .replication
+                .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
+                .await;
+            if applied_sequence >= target_sequence {
+                runtime
+                    .replication
+                    .update_follower_phase(FollowerPhase::Streaming, Some(0), Some(0))
+                    .await;
+            }
+            let response = AppendEntriesResponse {
+                term: heartbeat_response.term,
+                accepted: true,
+                match_sequence: applied_sequence,
+            };
+            spawn_replication_append_ack(
+                runtime.clone(),
+                payload.leader_addr.clone(),
+                payload.term,
+                payload.leader_node_id.clone(),
+                applied_sequence,
+            );
+            json_response(request.request_id, &response)
+        }
+        transport::Opcode::ReplicationInstallSnapshot => {
+            let _apply_guard = runtime.replication_apply_lock.lock().await;
+            let payload: SnapshotInstallRequest = decode_json_payload(&request.payload)?;
+            let current_term = runtime.replication.current_term().await;
+            if payload.term < current_term {
+                let response = SnapshotInstallResponse {
+                    term: current_term,
+                    accepted: false,
+                    applied_sequence: runtime.replication.local_last_applied_sequence().await,
+                };
+                return json_response(request.request_id, &response);
+            }
+
+            runtime
+                .replication
+                .handle_heartbeat(HeartbeatRequest {
+                    term: payload.term,
+                    leader_node_id: payload.leader_node_id,
+                    leader_addr: payload.leader_addr,
+                    commit_sequence: payload.commit_sequence,
+                    leader_frontier_sequence: payload.commit_sequence,
+                    members: payload.members,
+                })
+                .await?;
+            let applied_sequence = engine.apply_replication_snapshot(payload.snapshot).await?;
+            let applied_term = engine.wal_entry_term(applied_sequence).await?;
+            let applied_checksum = engine.wal_entry_checksum(applied_sequence).await?;
+            runtime
+                .replication
+                .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
+                .await;
+            let response = SnapshotInstallResponse {
+                term: runtime.replication.current_term().await,
+                accepted: true,
+                applied_sequence,
+            };
+            json_response(request.request_id, &response)
+        }
+        transport::Opcode::ReplicationVote => {
+            let _transition_guard = runtime.replication_apply_lock.lock().await;
+            let payload: VoteRequest = decode_json_payload(&request.payload)?;
+            let response = runtime.replication.handle_vote_request(payload).await?;
+            json_response(request.request_id, &response)
+        }
+        transport::Opcode::ReplicationHeartbeat => {
+            let _transition_guard = runtime.replication_apply_lock.lock().await;
+            let payload: HeartbeatRequest = decode_json_payload(&request.payload)?;
+            let response = runtime.replication.handle_heartbeat(payload).await?;
+            json_response(request.request_id, &response)
         }
         _ => Err(ServerError::UnsupportedRemoteCommand),
     }
@@ -1939,6 +3357,25 @@ async fn process_command(
             request_id,
             &replication_entries_from_snapshot(&runtime.replication.snapshot().await),
         )?),
+        Command::ShowCluster => Ok(Response::entries(
+            request_id,
+            &cluster_entries_from_snapshot(&runtime.replication.snapshot().await),
+        )?),
+        Command::ClusterJoin { node_id, address } => {
+            runtime
+                .replication
+                .add_member(ClusterMember {
+                    node_id,
+                    advertise_addr: address,
+                    voter: true,
+                })
+                .await?;
+            Ok(Response::ok(request_id))
+        }
+        Command::ClusterRemove { node_id } => {
+            runtime.replication.remove_member(&node_id).await?;
+            Ok(Response::ok(request_id))
+        }
         Command::PromoteFollower => {
             runtime
                 .replication
@@ -1982,8 +3419,8 @@ async fn process_command(
             Ok(Response::ok(request_id))
         }
         Command::BackupTo { path } => {
-            let response = engine.execute(request_id, Command::Backup).await?;
-            let dump = response.decode_value()?;
+            let response = engine.execute(request_id, 0, Command::Backup).await?;
+            let dump = response.response.decode_value()?;
             let path = resolve_backup_path(&runtime.backup_dir, &path, false)?;
             let manifest = build_backup_manifest(&dump)?;
             std::fs::write(&path, dump)?;
@@ -2008,7 +3445,10 @@ async fn process_command(
         Command::RestoreFrom { path } => {
             let path = resolve_backup_path(&runtime.backup_dir, &path, true)?;
             let dump = std::fs::read_to_string(path)?;
-            engine.execute(request_id, Command::Restore { dump }).await
+            Ok(engine
+                .execute(request_id, 0, Command::Restore { dump })
+                .await?
+                .response)
         }
         Command::RestoreCheck { dump } => Ok(Response::count(
             request_id,
@@ -2156,21 +3596,108 @@ async fn process_command(
             )?)
         }
         command => {
-            let response = engine.execute(request_id, command.clone()).await?;
+            if !is_write_command(&command) {
+                let consensus_term = runtime.replication.current_term().await;
+                return Ok(engine
+                    .execute(request_id, consensus_term, command)
+                    .await?
+                    .response);
+            }
+
+            let _write_guard = runtime.replication_apply_lock.lock().await;
+            enforce_leader_writeability(runtime, &command).await?;
+            let consensus_term = runtime.replication.current_term().await;
+            let execute_result = engine
+                .execute(request_id, consensus_term, command.clone())
+                .await?;
+            let response = execute_result.response;
+            if runtime.replication.role().await == ReplicationRole::Leader
+                && !runtime.replication.is_leader_for_term(consensus_term).await
+            {
+                return Err(ServerError::ReplicationAckUnavailable);
+            }
             if is_write_command(&command) {
-                let last_applied_sequence = parse_last_applied_sequence(&engine.info().await?);
+                let last_applied_sequence = execute_result.last_applied_sequence;
+                let last_applied_term = execute_result.last_applied_term;
+                let last_applied_checksum = execute_result.last_applied_checksum;
                 runtime
                     .replication
-                    .set_local_last_applied_sequence(last_applied_sequence)
+                    .set_local_last_applied_state(
+                        last_applied_sequence,
+                        last_applied_term,
+                        last_applied_checksum,
+                    )
                     .await;
-                runtime
-                    .replication
-                    .wait_for_write_ack(last_applied_sequence)
-                    .await?;
+                if runtime.replication.role().await == ReplicationRole::Leader
+                    && let Err(err) = send_cluster_heartbeats_role_guarded_with_timeout(
+                        engine.clone(),
+                        runtime.clone(),
+                    )
+                    .await
+                {
+                    let _ = err;
+                }
+                if let Err(err) = drive_write_commit(&engine, runtime, last_applied_sequence).await
+                {
+                    rollback_uncommitted_tail(&engine, runtime).await?;
+                    return Err(err);
+                }
             }
             Ok(response)
         }
     }
+}
+
+fn cluster_entries_from_snapshot(snapshot: &ReplicationStatusSnapshot) -> Vec<(String, String)> {
+    let mut entries = vec![
+        ("node_id".to_string(), snapshot.node_id.clone()),
+        ("group_id".to_string(), snapshot.group_id.clone()),
+        ("role".to_string(), snapshot.role.clone()),
+        (
+            "current_term".to_string(),
+            snapshot.current_term.to_string(),
+        ),
+        (
+            "leader_node_id".to_string(),
+            snapshot
+                .leader_node_id
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "leader_advertise_addr".to_string(),
+            snapshot
+                .leader_advertise_addr
+                .clone()
+                .unwrap_or_else(|| "none".to_string()),
+        ),
+        (
+            "commit_index".to_string(),
+            snapshot.commit_sequence.to_string(),
+        ),
+        (
+            "last_applied_index".to_string(),
+            snapshot.local_last_applied_sequence.to_string(),
+        ),
+        ("quorum_size".to_string(), snapshot.quorum_size.to_string()),
+        (
+            "member_count".to_string(),
+            snapshot.members.len().to_string(),
+        ),
+        ("sync_policy".to_string(), snapshot.write_ack_mode.clone()),
+        ("health".to_string(), snapshot.health.clone()),
+    ];
+    for member in &snapshot.members {
+        entries.push((
+            format!("member.{}.advertise_addr", member.node_id),
+            member.advertise_addr.clone(),
+        ));
+        entries.push((
+            format!("member.{}.voter", member.node_id),
+            member.voter.to_string(),
+        ));
+    }
+    entries
 }
 
 async fn structured_info(
@@ -2587,7 +4114,7 @@ async fn handle_transaction_command(
     command: Command,
 ) -> Result<Response> {
     expire_transaction_if_needed(metrics.clone(), runtime, session)?;
-    if runtime.replication.role().await == ReplicationRole::Follower {
+    if !replication_role_accepts_writes(runtime.replication.role().await) {
         return Err(ServerError::ReplicationReadOnly);
     }
     match command {
@@ -2600,6 +4127,8 @@ async fn handle_transaction_command(
             Ok(Response::ok(request_id))
         }
         Command::Exec => {
+            let _write_guard = runtime.replication_apply_lock.lock().await;
+            enforce_leader_writeability(runtime, &Command::Exec).await?;
             let mut queued = std::mem::take(&mut session.transaction_queue);
             session.transaction_started_at_ms = None;
             if matches!(queued.first(), Some(Command::Multi)) {
@@ -2608,20 +4137,38 @@ async fn handle_transaction_command(
             for command in &queued {
                 validate_transaction_command(command)?;
             }
-            let results = engine.execute_batch(request_id, queued.clone()).await?;
+            let consensus_term = runtime.replication.current_term().await;
+            let results = engine
+                .execute_batch(request_id, consensus_term, queued.clone())
+                .await?;
             let mut encoded = Vec::with_capacity(results.len());
             for (_queued_command, result) in queued.iter().zip(results) {
                 encoded.push(map_transaction_result_payload(result));
             }
             let last_applied_sequence = parse_last_applied_sequence(&engine.info().await?);
+            let last_applied_term = engine.wal_entry_term(last_applied_sequence).await?;
+            let last_applied_checksum = engine.wal_entry_checksum(last_applied_sequence).await?;
             runtime
                 .replication
-                .set_local_last_applied_sequence(last_applied_sequence)
+                .set_local_last_applied_state(
+                    last_applied_sequence,
+                    last_applied_term,
+                    last_applied_checksum,
+                )
                 .await;
-            runtime
-                .replication
-                .wait_for_write_ack(last_applied_sequence)
-                .await?;
+            if runtime.replication.role().await == ReplicationRole::Leader
+                && let Err(err) = send_cluster_heartbeats_role_guarded_with_timeout(
+                    engine.clone(),
+                    runtime.clone(),
+                )
+                .await
+            {
+                let _ = err;
+            }
+            if let Err(err) = drive_write_commit(&engine, runtime, last_applied_sequence).await {
+                rollback_uncommitted_tail(&engine, runtime).await?;
+                return Err(err);
+            }
             metrics
                 .transactions_committed
                 .fetch_add(1, Ordering::Relaxed);
@@ -2783,9 +4330,12 @@ fn command_permission(command: &Command) -> Option<Permission> {
         Command::ShowUsers => Some(Permission::UserAdmin),
         Command::MaintenanceOn | Command::MaintenanceOff => Some(Permission::Admin),
         Command::ShowReplication
+        | Command::ShowCluster
         | Command::PromoteFollower
         | Command::PauseReplication
-        | Command::ResumeReplication => Some(Permission::Admin),
+        | Command::ResumeReplication
+        | Command::ClusterJoin { .. }
+        | Command::ClusterRemove { .. } => Some(Permission::Admin),
         Command::Help | Command::Exit => None,
     }
 }
@@ -2937,6 +4487,9 @@ where
         | Command::RestoreCheckFrom { .. }
         | Command::AlterUserPassword { .. }
         | Command::Health
+        | Command::ShowCluster
+        | Command::ClusterJoin { .. }
+        | Command::ClusterRemove { .. }
         | Command::ShowReplication
         | Command::PromoteFollower
         | Command::PauseReplication
@@ -3016,6 +4569,7 @@ fn validate_transaction_command(command: &Command) -> Result<()> {
         | Command::MaintenanceOff
         | Command::MaintenanceStatus
         | Command::Health
+        | Command::ShowCluster
         | Command::ShowReplication
         | Command::PromoteFollower
         | Command::PauseReplication
@@ -3070,7 +4624,7 @@ fn map_set_options(options: CommandSetOptions) -> SetOptions {
     }
 }
 
-fn log_event(level: &str, component: &str, message: &str) {
+pub(crate) fn log_event(level: &str, component: &str, message: &str) {
     println!("[{level}] [{component}] {message}");
 }
 
@@ -3163,6 +4717,9 @@ fn opcode_name(command: &Command) -> &'static str {
         Command::MaintenanceOff => "MAINTENANCE_OFF",
         Command::MaintenanceStatus => "MAINTENANCE_STATUS",
         Command::Health => "HEALTH",
+        Command::ShowCluster => "SHOW_CLUSTER",
+        Command::ClusterJoin { .. } => "CLUSTER_JOIN",
+        Command::ClusterRemove { .. } => "CLUSTER_REMOVE",
         Command::ShowReplication => "SHOW_REPLICATION",
         Command::PromoteFollower => "PROMOTE_FOLLOWER",
         Command::PauseReplication => "PAUSE_REPLICATION",
@@ -3357,7 +4914,7 @@ mod tests {
     use crate::auth::{AuthConfig, Permission, PermissionGrant};
     use crate::metrics::Metrics;
     use crate::replication::{
-        ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
+        ClusterMember, ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
     };
     use crate::server::{EngineHandle, ServerRuntimeConfig};
     use command::{
@@ -3439,20 +4996,31 @@ mod tests {
             auth_lockouts: Arc::new(tokio::sync::Mutex::new(AuthLockoutState::default())),
             insecure_auth_disabled: false,
             insecure_default_credentials: false,
-            replication: Arc::new(ReplicationRuntime::new(ReplicationConfig {
-                node_id: "test-node".to_string(),
-                group_id: "test-group".to_string(),
-                advertise_addr: None,
-                role: ReplicationRole::Standalone,
-                upstream: None,
-                upstream_username: None,
-                upstream_password: None,
-                write_ack_mode: WriteAckMode::Local,
-                ack_timeout: Duration::from_millis(100),
-                poll_interval: Duration::from_millis(100),
-                fetch_batch_size: 32,
-                stale_after: Duration::from_secs(5),
-            })),
+            replication: Arc::new(
+                ReplicationRuntime::new(ReplicationConfig {
+                    node_id: "test-node".to_string(),
+                    group_id: "test-group".to_string(),
+                    advertise_addr: None,
+                    role: ReplicationRole::Standalone,
+                    upstream: None,
+                    upstream_username: None,
+                    upstream_password: None,
+                    write_ack_mode: WriteAckMode::Local,
+                    ack_timeout: Duration::from_millis(100),
+                    poll_interval: Duration::from_millis(100),
+                    fetch_batch_size: 32,
+                    stale_after: Duration::from_secs(5),
+                    heartbeat_interval: Duration::from_millis(100),
+                    election_timeout_min: Duration::from_millis(250),
+                    election_timeout_max: Duration::from_millis(500),
+                    state_path: audit_path.parent().unwrap().join("cluster-state.json"),
+                    state_tmp_path: audit_path.parent().unwrap().join("cluster-state.json.tmp"),
+                    initial_members: Vec::new(),
+                })
+                .unwrap(),
+            ),
+            replication_fanout_lock: Arc::new(tokio::sync::Mutex::new(())),
+            replication_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -3823,6 +5391,88 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(queued.decode_value().unwrap(), "QUEUED");
+    }
+
+    #[test]
+    fn rejects_transaction_exec_when_node_is_candidate() {
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let mut runtime = runtime();
+        runtime.replication = Arc::new(
+            ReplicationRuntime::new(ReplicationConfig {
+                node_id: "candidate-node".to_string(),
+                group_id: "candidate-group".to_string(),
+                advertise_addr: Some("127.0.0.1:9173".to_string()),
+                role: ReplicationRole::Candidate,
+                upstream: None,
+                upstream_username: None,
+                upstream_password: None,
+                write_ack_mode: WriteAckMode::Replica,
+                ack_timeout: Duration::from_millis(100),
+                poll_interval: Duration::from_millis(100),
+                fetch_batch_size: 32,
+                stale_after: Duration::from_secs(5),
+                heartbeat_interval: Duration::from_millis(100),
+                election_timeout_min: Duration::from_millis(250),
+                election_timeout_max: Duration::from_millis(500),
+                state_path: temp_dir("candidate-state").join("cluster-state.json"),
+                state_tmp_path: temp_dir("candidate-state").join("cluster-state.json.tmp"),
+                initial_members: vec![
+                    ClusterMember {
+                        node_id: "candidate-node".to_string(),
+                        advertise_addr: "127.0.0.1:9173".to_string(),
+                        voter: true,
+                    },
+                    ClusterMember {
+                        node_id: "peer-node".to_string(),
+                        advertise_addr: "127.0.0.1:9174".to_string(),
+                        voter: true,
+                    },
+                ],
+            })
+            .unwrap(),
+        );
+
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("candidate-exec")).unwrap(),
+            engine::EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("candidate-exec-key")),
+                ..engine::EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+        let mut session = SessionState::new(&guards());
+        session.identity = Some(crate::auth::Identity {
+            username: "dbuser".to_string(),
+            permissions: Permission::all(),
+            grants: Permission::all()
+                .into_iter()
+                .map(|permission| PermissionGrant {
+                    permission,
+                    pattern: "*".to_string(),
+                })
+                .collect(),
+        });
+        session.transaction_queue.push(Command::Multi);
+        session.transaction_queue.push(Command::Set {
+            key: "candidate:key".to_string(),
+            value: "candidate:value".to_string(),
+            options: CommandSetOptions::default(),
+        });
+
+        let err = runtime_handle
+            .block_on(handle_transaction_command(
+                handle,
+                metrics,
+                &runtime,
+                &mut session,
+                id(4),
+                Command::Exec,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, crate::ServerError::ReplicationReadOnly));
     }
 
     #[test]

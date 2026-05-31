@@ -278,6 +278,18 @@ pub const COMMANDS: &[CommandInfo] = &[
         usage: "health",
     },
     CommandInfo {
+        name: "show cluster",
+        usage: "show cluster",
+    },
+    CommandInfo {
+        name: "cluster join",
+        usage: "cluster join <node-id> <host:port>",
+    },
+    CommandInfo {
+        name: "cluster remove",
+        usage: "cluster remove <node-id>",
+    },
+    CommandInfo {
         name: "show replication",
         usage: "show replication",
     },
@@ -486,6 +498,14 @@ pub enum Command {
     MaintenanceOff,
     MaintenanceStatus,
     Health,
+    ShowCluster,
+    ClusterJoin {
+        node_id: String,
+        address: String,
+    },
+    ClusterRemove {
+        node_id: String,
+    },
     ShowReplication,
     PromoteFollower,
     PauseReplication,

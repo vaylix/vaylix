@@ -53,6 +53,8 @@ pub struct Engine {
     state: EngineState,
     paths: Paths,
     options: EngineOptions,
+    wal_entries: Vec<WalEntry>,
+    current_consensus_term: u64,
     recovery_duration_ms: u64,
     wal_entries_replayed_total: u64,
     last_snapshot_duration_ms: Option<u64>,
@@ -111,15 +113,18 @@ impl Engine {
         }
 
         let replay = replay(&paths.wal_dir, options.keyring.as_ref())?;
-        let wal_entries_replayed_total = replay.entries.len() as u64;
-        for entry in replay.entries {
-            state.apply_entry(&entry)?;
+        let wal_entries = replay.entries;
+        let wal_entries_replayed_total = wal_entries.len() as u64;
+        for entry in &wal_entries {
+            state.apply_entry(entry)?;
         }
 
         Ok(Self {
             state,
             paths,
             options,
+            wal_entries,
+            current_consensus_term: 0,
             recovery_duration_ms: now_millis().saturating_sub(recovery_started_at_ms),
             wal_entries_replayed_total,
             last_snapshot_duration_ms: None,
@@ -154,11 +159,49 @@ impl Engine {
     }
 
     pub fn wal_entries_since(&self, after_sequence: u64, limit: usize) -> Result<Vec<WalEntry>> {
-        let replay = replay(&self.paths.wal_dir, self.options.keyring.as_ref())?;
-        let mut entries = replay
-            .entries
-            .into_iter()
-            .filter(|entry| entry.sequence > after_sequence)
+        self.wal_entries_since_capped(after_sequence, limit, None)
+    }
+
+    pub fn wal_entry_checksum(&self, sequence: u64) -> Result<Option<u32>> {
+        if sequence == 0 {
+            return Ok(None);
+        }
+        self.wal_entries
+            .iter()
+            .find(|entry| entry.sequence == sequence)
+            .map(|entry| entry.checksum())
+            .transpose()
+    }
+
+    pub fn wal_entry_term(&self, sequence: u64) -> Result<Option<u64>> {
+        if sequence == 0 {
+            return Ok(None);
+        }
+        Ok(self
+            .wal_entries
+            .iter()
+            .find(|entry| entry.sequence == sequence)
+            .map(|entry| entry.term))
+    }
+
+    pub fn set_consensus_term(&mut self, term: u64) {
+        self.current_consensus_term = term;
+    }
+
+    pub fn wal_entries_since_capped(
+        &self,
+        after_sequence: u64,
+        limit: usize,
+        max_sequence: Option<u64>,
+    ) -> Result<Vec<WalEntry>> {
+        let mut entries = self
+            .wal_entries
+            .iter()
+            .filter(|entry| {
+                entry.sequence > after_sequence
+                    && max_sequence.is_none_or(|max| entry.sequence <= max)
+            })
+            .cloned()
             .collect::<Vec<_>>();
         if limit > 0 && entries.len() > limit {
             entries.truncate(limit);
@@ -190,6 +233,7 @@ impl Engine {
             fs::remove_dir_all(&self.paths.wal_dir)?;
         }
         create_active_segment(&self.paths.wal_dir, sequence.saturating_add(1))?;
+        self.wal_entries.clear();
         save_manifest(
             &Manifest {
                 storage_format_version: STORAGE_FORMAT_VERSION,
@@ -225,9 +269,83 @@ impl Engine {
                 self.options.wal_segment_size_bytes,
             )?;
             self.state.apply_entry(entry)?;
+            self.wal_entries.push(entry.clone());
             last_applied = entry.sequence;
         }
         Ok(last_applied)
+    }
+
+    pub fn replace_replication_suffix(
+        &mut self,
+        prefix_sequence: u64,
+        entries: &[WalEntry],
+    ) -> Result<u64> {
+        let snapshot_state = match load(&self.paths.snapshot_path, self.options.keyring.as_ref())? {
+            Some(bytes) => deserialize(&bytes)?,
+            None => EngineState::new(),
+        };
+        let baseline_sequence = snapshot_state.metadata.last_applied_sequence;
+        if prefix_sequence < baseline_sequence {
+            return Err(crate::EngineError::InvalidStorageOperation(format!(
+                "replication prefix {prefix_sequence} is older than snapshot baseline {baseline_sequence}"
+            )));
+        }
+
+        let mut retained = self
+            .wal_entries
+            .iter()
+            .filter(|entry| entry.sequence <= prefix_sequence)
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if let Some(last_retained) = retained.last()
+            && last_retained.sequence != prefix_sequence
+        {
+            return Err(crate::EngineError::InvalidStorageOperation(format!(
+                "replication prefix gap: expected retained sequence {prefix_sequence}, got {}",
+                last_retained.sequence
+            )));
+        }
+        if retained.is_empty() && prefix_sequence != baseline_sequence {
+            return Err(crate::EngineError::InvalidStorageOperation(format!(
+                "replication prefix gap: expected baseline {baseline_sequence}, got {prefix_sequence}"
+            )));
+        }
+
+        for (idx, entry) in entries.iter().enumerate() {
+            let expected = prefix_sequence.saturating_add(idx as u64).saturating_add(1);
+            if entry.sequence != expected {
+                return Err(crate::EngineError::InvalidStorageOperation(format!(
+                    "replication replacement gap: expected {expected}, got {}",
+                    entry.sequence
+                )));
+            }
+        }
+        retained.extend(entries.iter().cloned());
+
+        let mut rebuilt_state = snapshot_state;
+        for entry in &retained {
+            rebuilt_state.apply_entry(entry)?;
+        }
+
+        if self.paths.wal_dir.exists() {
+            fs::remove_dir_all(&self.paths.wal_dir)?;
+        }
+        if retained.is_empty() {
+            create_active_segment(&self.paths.wal_dir, baseline_sequence.saturating_add(1))?;
+        } else {
+            crate::store::write_entries(
+                &retained,
+                &self.paths.wal_dir,
+                self.options.wal_sync,
+                self.options.keyring.as_ref(),
+                self.options.wal_segment_size_bytes,
+            )?;
+        }
+
+        self.state = rebuilt_state;
+        self.wal_entries = retained;
+        Ok(self.state.metadata.last_applied_sequence)
     }
 
     pub fn migrate_storage(paths: &Paths, options: &EngineOptions) -> Result<StorageInspection> {
@@ -424,12 +542,18 @@ impl Engine {
             self.options.wal_segment_size_bytes,
         )?;
         self.state.apply_entry(&entry)?;
+        self.wal_entries.push(entry);
         Ok(())
+    }
+
+    pub fn append_noop(&mut self) -> Result<()> {
+        self.append_and_apply(Vec::new())
     }
 
     fn next_entry(&self, operations: Vec<WalOperation>) -> WalEntry {
         WalEntry::new(
             self.state.metadata.last_applied_sequence + 1,
+            self.current_consensus_term,
             now_millis(),
             operations,
         )
@@ -592,6 +716,7 @@ impl Engine {
             self.options.wal_segment_size_bytes,
         )?;
         self.state.apply_entry(&entry)?;
+        self.wal_entries.push(entry);
 
         Ok(results)
     }
@@ -944,6 +1069,9 @@ impl Engine {
             | Command::MaintenanceOff
             | Command::MaintenanceStatus
             | Command::Health
+            | Command::ShowCluster
+            | Command::ClusterJoin { .. }
+            | Command::ClusterRemove { .. }
             | Command::ShowReplication
             | Command::PromoteFollower
             | Command::PauseReplication
@@ -1373,6 +1501,7 @@ impl StorageEngine for Engine {
         )?;
 
         self.state = durable_state;
+        self.wal_entries = replay(&self.paths.wal_dir, self.options.keyring.as_ref())?.entries;
         self.last_snapshot_duration_ms = Some(now_millis().saturating_sub(snapshot_started_at));
 
         Ok(())
@@ -1699,6 +1828,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn wal_entries_since_capped_hides_uncommitted_tail() {
+        let (mut engine, root) = engine();
+
+        engine.set("a".to_string(), "1".to_string()).unwrap();
+        engine.set("b".to_string(), "2".to_string()).unwrap();
+        engine.set("c".to_string(), "3".to_string()).unwrap();
+
+        let committed = engine.wal_entries_since_capped(0, 32, Some(2)).unwrap();
+        assert_eq!(
+            committed
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        let full = engine.wal_entries_since(0, 32).unwrap();
+        assert_eq!(
+            full.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
 
         fs::remove_dir_all(root).ok();
     }

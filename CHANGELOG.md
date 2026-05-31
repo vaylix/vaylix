@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-31
+
+### Added
+
+- Raft-style cluster runtime with follower/candidate/leader roles, current term, voted-for state, leader hints, election timeouts, heartbeats, pre-vote, and automatic leader failover.
+- Cluster-internal transport opcodes for vote requests, heartbeats, append entries, and snapshot installation over the existing framed protocol.
+- Quorum-backed write acknowledgement semantics: `replica` / `majority` now commits after a voting majority, `all` waits for every voter, and `local` remains explicitly weaker.
+- Three-node HA integration coverage for leader election, failover, old-leader rejoin, follower catch-up, and split-brain write rejection.
+- Cluster administration and diagnostics surfaces: `show cluster`, `cluster join`, `cluster remove`, quorum fields in replication status, and role-aware `health`.
+- Snapshot-install fallback for followers that are behind retained WAL history.
+
+### Changed
+
+- Default server write acknowledgement mode is now quorum-backed `replica` / `majority` instead of local-only acknowledgement.
+- Leader write fanout now uses bounded foreground append attempts and commit-index based completion so successful writes are tied to replicated durable position.
+- Replication append fanout now batches WAL lookups from an in-memory WAL cache instead of replaying WAL from disk per follower.
+- Election and term handling now preserve monotonic commit index across step-down while clearing stale follower progress.
+- Followers and candidates reject mutating commands; followers may still serve explicitly stale local reads.
+
+### Fixed
+
+- Fixed persisted Docker-volume auth stores continuing to accept the default bootstrap password after `VAYLIX_PASSWORD` was changed.
+- Fixed HA write-path self-deadlocks caused by nested replication apply-lock acquisition during synchronous write commit.
+- Fixed follower polling so legacy configured followers continue discovering leader progress after initial registration.
+- Fixed stale replication unit tests that expected non-Raft vote switching and commit-index regression.
+
 ## [0.4.0] - 2026-05-30
 
 ### Added

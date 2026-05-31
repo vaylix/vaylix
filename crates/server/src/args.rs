@@ -24,6 +24,7 @@ pub enum ReplicationRoleMode {
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum WriteAckModeArg {
     Local,
+    #[value(alias = "majority")]
     Replica,
     All,
 }
@@ -221,7 +222,7 @@ pub struct Args {
         long,
         env = "VAYLIX_WRITE_ACK_MODE",
         value_enum,
-        default_value_t = WriteAckModeArg::Local
+        default_value_t = WriteAckModeArg::Replica
     )]
     pub write_ack_mode: WriteAckModeArg,
 
@@ -256,6 +257,34 @@ pub struct Args {
         default_value_t = 15
     )]
     pub replication_stale_after_seconds: u64,
+
+    /// Heartbeat interval in milliseconds for leader-to-peer cluster traffic.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_HEARTBEAT_INTERVAL_MS",
+        default_value_t = 300
+    )]
+    pub replication_heartbeat_interval_ms: u64,
+
+    /// Minimum election timeout in milliseconds.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_ELECTION_TIMEOUT_MIN_MS",
+        default_value_t = 1_500
+    )]
+    pub replication_election_timeout_min_ms: u64,
+
+    /// Maximum election timeout in milliseconds.
+    #[arg(
+        long,
+        env = "VAYLIX_REPLICATION_ELECTION_TIMEOUT_MAX_MS",
+        default_value_t = 3_000
+    )]
+    pub replication_election_timeout_max_ms: u64,
+
+    /// Static cluster peers in `node_id@host:port` form. Repeated or comma-delimited.
+    #[arg(long, env = "VAYLIX_CLUSTER_PEERS", value_delimiter = ',')]
+    pub cluster_peers: Vec<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -308,7 +337,7 @@ pub enum PitrAction {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminCommand, Args, PitrAction, StorageAction};
+    use super::{AdminCommand, Args, PitrAction, StorageAction, WriteAckModeArg};
     use clap::Parser;
 
     #[test]
@@ -360,5 +389,14 @@ mod tests {
             Some(AdminCommand::Pitr(command))
                 if matches!(command.action, PitrAction::Restore { to_sequence: Some(42), .. })
         ));
+    }
+
+    #[test]
+    fn write_ack_defaults_to_majority_and_accepts_alias() {
+        let parsed = Args::try_parse_from(["vaylix"]).unwrap();
+        assert_eq!(parsed.write_ack_mode, WriteAckModeArg::Replica);
+
+        let parsed = Args::try_parse_from(["vaylix", "--write-ack-mode", "majority"]).unwrap();
+        assert_eq!(parsed.write_ack_mode, WriteAckModeArg::Replica);
     }
 }

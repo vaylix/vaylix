@@ -242,6 +242,17 @@ impl Request {
                 Ok(Self::new(request_id, Opcode::MaintenanceStatus, Vec::new()))
             }
             Command::Health => Ok(Self::new(request_id, Opcode::Health, Vec::new())),
+            Command::ShowCluster => Ok(Self::new(request_id, Opcode::ShowCluster, Vec::new())),
+            Command::ClusterJoin { node_id, address } => Ok(Self::new(
+                request_id,
+                Opcode::ClusterJoin,
+                encode_key_value(&node_id, &address)?,
+            )),
+            Command::ClusterRemove { node_id } => Ok(Self::new(
+                request_id,
+                Opcode::ClusterRemove,
+                encode_key(&node_id)?,
+            )),
             Command::ShowReplication => {
                 Ok(Self::new(request_id, Opcode::ShowReplication, Vec::new()))
             }
@@ -436,6 +447,14 @@ impl Request {
                 decode_empty(&self.payload).map(|()| Command::MaintenanceStatus)
             }
             Opcode::Health => decode_empty(&self.payload).map(|()| Command::Health),
+            Opcode::ShowCluster => decode_empty(&self.payload).map(|()| Command::ShowCluster),
+            Opcode::ClusterJoin => {
+                let (node_id, address) = decode_key_value(&self.payload)?;
+                Ok(Command::ClusterJoin { node_id, address })
+            }
+            Opcode::ClusterRemove => Ok(Command::ClusterRemove {
+                node_id: decode_single_key(&self.payload)?,
+            }),
             Opcode::ShowReplication => {
                 decode_empty(&self.payload).map(|()| Command::ShowReplication)
             }
@@ -451,7 +470,13 @@ impl Request {
             Opcode::ReplicationStatus
             | Opcode::ReplicationSnapshot
             | Opcode::ReplicationFetch
-            | Opcode::ReplicationAck => Err(TransportError::UnsupportedCommand("replication")),
+            | Opcode::ReplicationAck
+            | Opcode::ReplicationVote
+            | Opcode::ReplicationHeartbeat
+            | Opcode::ReplicationAppend
+            | Opcode::ReplicationInstallSnapshot => {
+                Err(TransportError::UnsupportedCommand("replication"))
+            }
         }
     }
 }
