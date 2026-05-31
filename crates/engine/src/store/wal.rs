@@ -33,6 +33,9 @@ pub enum WalOperation {
 pub struct WalEntry {
     /// Monotonic sequence number assigned by the engine.
     pub sequence: u64,
+    /// Consensus term associated with the entry when it was created.
+    #[serde(default)]
+    pub term: u64,
     /// Entry creation time in unix milliseconds.
     pub created_at_ms: u64,
     /// Mutations applied atomically as one logical unit.
@@ -41,12 +44,25 @@ pub struct WalEntry {
 
 impl WalEntry {
     /// Builds a new WAL entry.
-    pub fn new(sequence: u64, created_at_ms: u64, operations: Vec<WalOperation>) -> Self {
+    pub fn new(
+        sequence: u64,
+        term: u64,
+        created_at_ms: u64,
+        operations: Vec<WalOperation>,
+    ) -> Self {
         Self {
             sequence,
+            term,
             created_at_ms,
             operations,
         }
+    }
+
+    /// Returns a stable checksum for replication identity checks.
+    pub fn checksum(&self) -> Result<u32> {
+        let encoded =
+            binary::encode(self).map_err(|err| EngineError::WalSerialize(err.to_string()))?;
+        Ok(hash(&encoded))
     }
 }
 
@@ -597,6 +613,7 @@ mod tests {
     fn sample_entry(sequence: u64) -> WalEntry {
         WalEntry::new(
             sequence,
+            0,
             100 + sequence,
             vec![WalOperation::Set {
                 key: format!("name:{sequence}"),

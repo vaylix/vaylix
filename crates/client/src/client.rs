@@ -439,13 +439,16 @@ fn render_response(command: &Command, response: &Response, output: OutputMode) -
             | Command::WhoAmI
             | Command::MaintenanceStatus
             | Command::Health
+            | Command::ShowCluster
             | Command::ShowReplication => {
                 let entries = response.decode_entries()?;
                 render_entries(&entries, output)
             }
-            Command::PromoteFollower | Command::PauseReplication | Command::ResumeReplication => {
-                Ok("OK".to_string())
-            }
+            Command::ClusterJoin { .. }
+            | Command::ClusterRemove { .. }
+            | Command::PromoteFollower
+            | Command::PauseReplication
+            | Command::ResumeReplication => Ok("OK".to_string()),
             Command::Help | Command::Exit => Err(ClientError::LocalCommandResponse),
         },
     }

@@ -203,7 +203,13 @@ impl AuthConfig {
             temp_path,
             keyring,
         };
-        let stored = load_store(&persist)?.unwrap_or(bootstrap_store(username, password)?);
+        let stored = match load_store(&persist)? {
+            Some(mut stored) => {
+                reconcile_configured_bootstrap_admin(&mut stored, &username, &password)?;
+                stored
+            }
+            None => bootstrap_store(username, password)?,
+        };
         let store = AuthStore {
             stored,
             persist: Some(persist),
@@ -577,21 +583,6 @@ impl AuthStore {
 }
 
 fn bootstrap_store(username: String, password: String) -> Result<StoredAuth> {
-    let mut roles = BTreeMap::new();
-    roles.insert(
-        ADMIN_ROLE.to_string(),
-        RoleRecord {
-            permissions: Permission::all(),
-            grants: Permission::all()
-                .into_iter()
-                .map(|permission| PermissionGrant {
-                    permission,
-                    pattern: "*".to_string(),
-                })
-                .collect(),
-        },
-    );
-
     let mut user_roles = BTreeSet::new();
     user_roles.insert(ADMIN_ROLE.to_string());
     let mut users = BTreeMap::new();
@@ -607,8 +598,97 @@ fn bootstrap_store(username: String, password: String) -> Result<StoredAuth> {
     Ok(StoredAuth {
         version: AUTH_FORMAT_VERSION,
         users,
-        roles,
+        roles: admin_roles(),
     })
+}
+
+fn reconcile_configured_bootstrap_admin(
+    stored: &mut StoredAuth,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    if username == DEFAULT_USERNAME && password == DEFAULT_PASSWORD {
+        return Ok(());
+    }
+
+    ensure_admin_role(stored);
+    let mut roles = BTreeSet::new();
+    roles.insert(ADMIN_ROLE.to_string());
+    let record = UserRecord {
+        password_hash: hash_password(password)?,
+        roles,
+        disabled: false,
+    };
+
+    stored
+        .users
+        .entry(username.to_string())
+        .and_modify(|user| {
+            user.password_hash = record.password_hash.clone();
+            user.roles.insert(ADMIN_ROLE.to_string());
+            user.disabled = false;
+        })
+        .or_insert(record);
+
+    retire_default_bootstrap_user(stored, username)?;
+    Ok(())
+}
+
+fn retire_default_bootstrap_user(stored: &mut StoredAuth, configured_username: &str) -> Result<()> {
+    if configured_username == DEFAULT_USERNAME {
+        return Ok(());
+    }
+
+    let Some(default_user) = stored.users.get(DEFAULT_USERNAME) else {
+        return Ok(());
+    };
+    if password_matches(default_user, DEFAULT_PASSWORD)? {
+        stored.users.remove(DEFAULT_USERNAME);
+    }
+    Ok(())
+}
+
+fn admin_roles() -> BTreeMap<String, RoleRecord> {
+    let mut roles = BTreeMap::new();
+    roles.insert(ADMIN_ROLE.to_string(), admin_role_record());
+    roles
+}
+
+fn ensure_admin_role(stored: &mut StoredAuth) {
+    let role = stored
+        .roles
+        .entry(ADMIN_ROLE.to_string())
+        .or_insert_with(admin_role_record);
+    role.permissions.extend(Permission::all());
+    role.grants.extend(
+        Permission::all()
+            .into_iter()
+            .map(|permission| PermissionGrant {
+                permission,
+                pattern: "*".to_string(),
+            }),
+    );
+}
+
+fn admin_role_record() -> RoleRecord {
+    RoleRecord {
+        permissions: Permission::all(),
+        grants: Permission::all()
+            .into_iter()
+            .map(|permission| PermissionGrant {
+                permission,
+                pattern: "*".to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn password_matches(user: &UserRecord, password: &str) -> Result<bool> {
+    let parsed_hash = PasswordHash::new(&user.password_hash)
+        .map_err(|_| ServerError::AuthenticationConfiguration)?;
+    Ok(Argon2::default()
+        .verify_password(password.as_bytes(), &parsed_hash)
+        .is_ok())
 }
 
 fn hash_password(password: &str) -> Result<String> {
@@ -848,6 +928,75 @@ mod tests {
         assert!(
             reloaded
                 .verify("alice", "rotated12345")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(temp).ok();
+    }
+
+    #[tokio::test]
+    async fn reconciles_non_default_bootstrap_password_into_persisted_store() {
+        let path = temp_path("bootstrap-password");
+        let temp = temp_path("bootstrap-password-tmp");
+        let auth = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "vaylix".to_string(),
+            "vaylix".to_string(),
+        )
+        .unwrap();
+        assert!(auth.verify("vaylix", "vaylix").await.unwrap().is_some());
+
+        let reloaded = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "vaylix".to_string(),
+            "7965PPO4".to_string(),
+        )
+        .unwrap();
+        assert!(reloaded.verify("vaylix", "vaylix").await.unwrap().is_none());
+        assert!(
+            reloaded
+                .verify("vaylix", "7965PPO4")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(temp).ok();
+    }
+
+    #[tokio::test]
+    async fn retires_default_bootstrap_user_when_configured_admin_changes() {
+        let path = temp_path("bootstrap-user");
+        let temp = temp_path("bootstrap-user-tmp");
+        AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "vaylix".to_string(),
+            "vaylix".to_string(),
+        )
+        .unwrap();
+
+        let reloaded = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "admin".to_string(),
+            "7965PPO4".to_string(),
+        )
+        .unwrap();
+        assert!(reloaded.verify("vaylix", "vaylix").await.unwrap().is_none());
+        assert!(
+            reloaded
+                .verify("admin", "7965PPO4")
                 .await
                 .unwrap()
                 .is_some()

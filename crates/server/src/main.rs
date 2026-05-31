@@ -42,6 +42,11 @@ async fn try_main() -> server::Result<()> {
         )?)
     };
     let engine_options = engine_options(&args, Some(keyring));
+    let node_id = args
+        .node_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
+    let cluster_members = parse_cluster_peers(&args.cluster_peers)?;
     let tls_state = if args.ssl {
         let cert = args
             .tls_cert
@@ -127,10 +132,7 @@ async fn try_main() -> server::Result<()> {
         insecure_default_credentials,
         replication: std::sync::Arc::new(server::replication::ReplicationRuntime::new(
             server::replication::ReplicationConfig {
-                node_id: args
-                    .node_id
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::now_v7().to_string()),
+                node_id: node_id.clone(),
                 group_id: args.replication_group_id.clone(),
                 advertise_addr: args.replication_advertise_addr.clone(),
                 role: match args.replication_role {
@@ -158,8 +160,22 @@ async fn try_main() -> server::Result<()> {
                 poll_interval: std::time::Duration::from_millis(args.replication_poll_interval_ms),
                 fetch_batch_size: args.replication_fetch_batch_size,
                 stale_after: std::time::Duration::from_secs(args.replication_stale_after_seconds),
+                heartbeat_interval: std::time::Duration::from_millis(
+                    args.replication_heartbeat_interval_ms,
+                ),
+                election_timeout_min: std::time::Duration::from_millis(
+                    args.replication_election_timeout_min_ms,
+                ),
+                election_timeout_max: std::time::Duration::from_millis(
+                    args.replication_election_timeout_max_ms,
+                ),
+                state_path: paths.cluster_state_path.clone(),
+                state_tmp_path: paths.cluster_state_tmp_path.clone(),
+                initial_members: cluster_members,
             },
-        )),
+        )?),
+        replication_fanout_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        replication_apply_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     };
     let server = Server::new(
         args.bind,
@@ -173,6 +189,31 @@ async fn try_main() -> server::Result<()> {
     server.start().await?;
 
     Ok(())
+}
+
+fn parse_cluster_peers(
+    peers: &[String],
+) -> server::Result<Vec<server::replication::ClusterMember>> {
+    peers
+        .iter()
+        .map(|peer| {
+            let Some((node_id, advertise_addr)) = peer.split_once('@') else {
+                return Err(server::ServerError::InvalidArguments(
+                    "cluster peers must use node_id@host:port form".to_string(),
+                ));
+            };
+            if node_id.is_empty() || advertise_addr.is_empty() {
+                return Err(server::ServerError::InvalidArguments(
+                    "cluster peer entries must include both node_id and host:port".to_string(),
+                ));
+            }
+            Ok(server::replication::ClusterMember {
+                node_id: node_id.to_string(),
+                advertise_addr: advertise_addr.to_string(),
+                voter: true,
+            })
+        })
+        .collect()
 }
 
 fn engine_options(args: &Args, keyring: Option<engine::StorageKeyring>) -> engine::EngineOptions {

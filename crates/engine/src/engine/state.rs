@@ -237,7 +237,7 @@ mod tests {
     use crate::store::{WalEntry, WalOperation};
 
     fn entry(sequence: u64, operation: WalOperation) -> WalEntry {
-        WalEntry::new(sequence, 1_000, vec![operation])
+        WalEntry::new(sequence, 0, 1_000, vec![operation])
     }
 
     #[test]

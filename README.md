@@ -6,7 +6,7 @@ Vaylix is a Rust key/value database built around a strict transport boundary:
 client -> transport -> TCP/TLS -> transport -> server -> engine
 ```
 
-The current server stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, hash-chained audit logging, and manual leader/follower replication with explicit write-ack modes.
+The current server stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, hash-chained audit logging, and Raft-style HA replication with automatic leader election and quorum-backed writes.
 
 Detailed architecture context lives in [LLM.md](LLM.md).
 
@@ -16,7 +16,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.4.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.5.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -82,6 +82,45 @@ Useful runtime environment variables for containers:
 - `VAYLIX_REPLICATION_POLL_INTERVAL_MS`
 - `VAYLIX_REPLICATION_FETCH_BATCH_SIZE`
 - `VAYLIX_REPLICATION_STALE_AFTER_SECONDS`
+- `VAYLIX_REPLICATION_HEARTBEAT_INTERVAL_MS`
+- `VAYLIX_REPLICATION_ELECTION_TIMEOUT_MIN_MS`
+- `VAYLIX_REPLICATION_ELECTION_TIMEOUT_MAX_MS`
+- `VAYLIX_CLUSTER_PEERS`
+
+## High Availability
+
+Vaylix 0.5.0 supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
+
+Recommended production shape:
+
+- Run three voting nodes with stable `--node-id` values.
+- Set `--replication-advertise-addr <host:port>` on each node.
+- Set identical `--cluster-peers node-1@host1:9173,node-2@host2:9173,node-3@host3:9173` on each node.
+- Seed at least one node with `--replication-role leader`; cluster startup still elects the active leader through the consensus path.
+- Keep the default `--write-ack-mode replica`, or use `--write-ack-mode majority`; both map to quorum commit. `--write-ack-mode local` is explicitly weaker and is not HA-safe.
+
+Example node:
+
+```bash
+vaylix \
+  --bind 0.0.0.0 \
+  --port 9173 \
+  --data-dir /var/lib/vaylix \
+  --node-id node-1 \
+  --replication-role leader \
+  --replication-advertise-addr node-1.internal:9173 \
+  --cluster-peers node-1@node-1.internal:9173,node-2@node-2.internal:9173,node-3@node-3.internal:9173 \
+  --write-ack-mode majority
+```
+
+Operational commands:
+
+- `health` returns machine-readable readiness state, role, and reason.
+- `show cluster` returns term, leader, quorum, sync policy, and member state.
+- `show replication` returns replication progress, follower lag, and commit position.
+- `cluster join <node-id> <host:port>` and `cluster remove <node-id>` update membership from the leader.
+
+Followers may serve local stale reads; clients that require linearizable read-after-write behavior should route reads to the current leader reported by `show cluster` / `show replication`.
 
 ## Run from Binaries
 
@@ -153,6 +192,7 @@ cargo audit
 
 - Authentication and RBAC are enabled by default. `--disable-auth` is for trusted local testing only.
 - Development credentials default to `vaylix / vaylix`; production deployments should override them.
+- When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the admin account on startup. If the default bootstrap user still accepts `vaylix / vaylix`, it is retired.
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
 - TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.
@@ -161,4 +201,5 @@ cargo audit
 - WAL is segmented under `<data-dir>/wal`, snapshots no longer discard all retained WAL history, and PITR restore is currently an offline operation that writes a new target data directory.
 - `maintenance on` switches the node into persisted read-only admin mode until `maintenance off`.
 - Audit JSONL records are SHA-256 hash chained and verified on startup. This is tamper-evident logging, not non-repudiation without external anchoring.
-- Vaylix is not distributed yet. Replication, sharding, MVCC, and distributed ACID semantics remain roadmap items.
+- HA writes should use the default quorum acknowledgement mode. `local` acknowledgement is for explicitly weaker development or disaster-recovery workflows.
+- Vaylix does not implement sharding, MVCC, distributed ACID transactions, or linearizable follower reads.

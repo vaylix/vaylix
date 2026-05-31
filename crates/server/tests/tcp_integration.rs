@@ -2,6 +2,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::{Arc as StdArc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use command::{Command, Expiration, SetCondition, SetOptions};
@@ -17,10 +18,13 @@ use rustls::{ClientConfig, RootCertStore};
 use server::Server;
 use server::audit::AuditLogger;
 use server::auth::AuthConfig;
-use server::replication::{ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode};
+use server::replication::{
+    ClusterMember, ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
+};
 use server::server::{ServerGuards, ServerRuntimeConfig};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -37,6 +41,14 @@ fn temp_dir(name: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("vaylix-server-test-{name}-{unique}"))
+}
+
+async fn acquire_ha_test_lock() -> OwnedMutexGuard<()> {
+    static LOCK: OnceLock<StdArc<TokioMutex<()>>> = OnceLock::new();
+    LOCK.get_or_init(|| StdArc::new(TokioMutex::new(())))
+        .clone()
+        .lock_owned()
+        .await
 }
 
 fn id(value: u128) -> Uuid {
@@ -230,21 +242,86 @@ fn runtime(snapshot_interval: Option<Duration>) -> ServerRuntimeConfig {
     runtime_with_tls(snapshot_interval, None)
 }
 
+fn runtime_without_auth(snapshot_interval: Option<Duration>) -> ServerRuntimeConfig {
+    let mut runtime = runtime(snapshot_interval);
+    runtime.auth_config = None;
+    runtime
+}
+
 fn standalone_replication(node_id: &str) -> Arc<ReplicationRuntime> {
-    Arc::new(ReplicationRuntime::new(ReplicationConfig {
-        node_id: node_id.to_string(),
-        group_id: "test-group".to_string(),
-        advertise_addr: None,
-        role: ReplicationRole::Standalone,
-        upstream: None,
-        upstream_username: None,
-        upstream_password: None,
-        write_ack_mode: WriteAckMode::Local,
-        ack_timeout: Duration::from_millis(100),
-        poll_interval: Duration::from_millis(100),
-        fetch_batch_size: 32,
-        stale_after: Duration::from_secs(5),
-    }))
+    let state_dir = temp_dir(&format!("cluster-state-{node_id}"));
+    Arc::new(
+        ReplicationRuntime::new(ReplicationConfig {
+            node_id: node_id.to_string(),
+            group_id: "test-group".to_string(),
+            advertise_addr: None,
+            role: ReplicationRole::Standalone,
+            upstream: None,
+            upstream_username: None,
+            upstream_password: None,
+            write_ack_mode: WriteAckMode::Local,
+            ack_timeout: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(100),
+            fetch_batch_size: 32,
+            stale_after: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_millis(100),
+            election_timeout_min: Duration::from_millis(250),
+            election_timeout_max: Duration::from_millis(500),
+            state_path: state_dir.join("cluster-state.json"),
+            state_tmp_path: state_dir.join("cluster-state.json.tmp"),
+            initial_members: Vec::new(),
+        })
+        .unwrap(),
+    )
+}
+
+fn reserve_local_addr() -> SocketAddr {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    addr
+}
+
+fn clustered_replication(
+    node_id: &str,
+    role: ReplicationRole,
+    advertise_addr: SocketAddr,
+    members: &[ClusterMember],
+) -> Arc<ReplicationRuntime> {
+    let state_dir = temp_dir(&format!("cluster-state-{node_id}"));
+    clustered_replication_with_state_dir(node_id, role, advertise_addr, members, &state_dir)
+}
+
+fn clustered_replication_with_state_dir(
+    node_id: &str,
+    role: ReplicationRole,
+    advertise_addr: SocketAddr,
+    members: &[ClusterMember],
+    state_dir: &Path,
+) -> Arc<ReplicationRuntime> {
+    Arc::new(
+        ReplicationRuntime::new(ReplicationConfig {
+            node_id: node_id.to_string(),
+            group_id: "ha-test-group".to_string(),
+            advertise_addr: Some(advertise_addr.to_string()),
+            role,
+            upstream: None,
+            upstream_username: Some("vaylix".to_string()),
+            upstream_password: Some("vaylix".to_string()),
+            write_ack_mode: WriteAckMode::Replica,
+            ack_timeout: Duration::from_secs(3),
+            poll_interval: Duration::from_millis(100),
+            fetch_batch_size: 32,
+            stale_after: Duration::from_secs(3),
+            heartbeat_interval: Duration::from_millis(100),
+            election_timeout_min: Duration::from_millis(900),
+            election_timeout_max: Duration::from_millis(1_500),
+            state_path: state_dir.join("cluster-state.json"),
+            state_tmp_path: state_dir.join("cluster-state.json.tmp"),
+            initial_members: members.to_vec(),
+        })
+        .unwrap(),
+    )
 }
 
 fn runtime_with_tls(
@@ -289,6 +366,8 @@ fn runtime_with_tls(
         insecure_auth_disabled: false,
         insecure_default_credentials: true,
         replication: standalone_replication("test-node"),
+        replication_fanout_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        replication_apply_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     }
 }
 
@@ -298,7 +377,149 @@ where
 {
     let request = Request::from_command(id(request_id), command).unwrap();
     write_request_to_async(stream, &request).await.unwrap();
-    read_response_from_async(stream).await.unwrap()
+    timeout(Duration::from_secs(20), read_response_from_async(stream))
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+async fn wait_for_writable_leader(
+    addrs: &[SocketAddr],
+    excluded: Option<usize>,
+    deadline: Instant,
+    request_id_base: u128,
+    probe_key: &str,
+) -> usize {
+    let mut last_probe_results = vec![String::from("unprobed"); addrs.len()];
+    let mut previous_candidate: Option<(usize, u64)> = None;
+    loop {
+        let mut leader_candidates = Vec::new();
+        for (idx, addr) in addrs.iter().enumerate() {
+            if excluded == Some(idx) {
+                last_probe_results[idx] = "excluded".to_string();
+                continue;
+            }
+            let mut stream = connect_tcp(*addr).await;
+            authenticate(&mut stream).await;
+            let cluster = issue_command(
+                &mut stream,
+                request_id_base + idx as u128,
+                Command::ShowCluster,
+            )
+            .await;
+            if cluster.status == Status::Ok {
+                let entries = cluster.decode_entries().unwrap_or_default();
+                let lookup = |key: &str| {
+                    entries
+                        .iter()
+                        .find_map(|(entry_key, value)| (entry_key == key).then(|| value.clone()))
+                        .unwrap_or_else(|| "unknown".to_string())
+                };
+                let role = lookup("role");
+                let leader = lookup("leader_node_id");
+                let term = lookup("current_term");
+                let parsed_term = term.parse::<u64>().unwrap_or(0);
+                let commit = lookup("commit_index");
+                let applied = lookup("last_applied_index");
+                let health = lookup("health");
+                last_probe_results[idx] = format!(
+                    "cluster_status=Ok role={role} term={term} leader={leader} commit={commit} applied={applied} health={health}"
+                );
+                if role == "leader" {
+                    leader_candidates.push((idx, *addr, parsed_term));
+                }
+            } else {
+                last_probe_results[idx] = format!("cluster_status={:?}", cluster.status);
+            }
+        }
+
+        leader_candidates.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        if let Some((idx, addr, term)) = leader_candidates.into_iter().next() {
+            if previous_candidate != Some((idx, term)) {
+                previous_candidate = Some((idx, term));
+                sleep(Duration::from_millis(150)).await;
+                continue;
+            }
+            let mut stream = connect_tcp(addr).await;
+            authenticate(&mut stream).await;
+            let response = issue_command(
+                &mut stream,
+                request_id_base + 1_000 + idx as u128,
+                Command::Set {
+                    key: probe_key.to_string(),
+                    value: format!("leader-{idx}"),
+                    options: SetOptions::default(),
+                },
+            )
+            .await;
+            let response_error = response
+                .decode_error()
+                .ok()
+                .map(|payload| format!("{}:{}", payload.code, payload.name));
+            last_probe_results[idx] = format!(
+                "{} probe_set={:?}{}",
+                last_probe_results[idx],
+                response.status,
+                response_error
+                    .as_ref()
+                    .map(|value| format!(" error={value}"))
+                    .unwrap_or_default()
+            );
+            if response.status == Status::Ok {
+                return idx;
+            }
+            previous_candidate = None;
+        }
+
+        if Instant::now() >= deadline {
+            let mut cluster_views = Vec::new();
+            for (idx, addr) in addrs.iter().enumerate() {
+                if excluded == Some(idx) {
+                    continue;
+                }
+                let mut stream = connect_tcp(*addr).await;
+                authenticate(&mut stream).await;
+                let cluster = issue_command(
+                    &mut stream,
+                    request_id_base + 10_000 + idx as u128,
+                    Command::ShowCluster,
+                )
+                .await;
+                let summary = if cluster.status == Status::Ok {
+                    let entries = cluster.decode_entries().unwrap_or_default();
+                    let lookup = |key: &str| {
+                        entries
+                            .iter()
+                            .find_map(|(entry_key, value)| {
+                                (entry_key == key).then(|| value.clone())
+                            })
+                            .unwrap_or_else(|| "unknown".to_string())
+                    };
+                    format!(
+                        "idx={idx} probe={} role={} term={} leader={} commit={} applied={} health={}",
+                        last_probe_results[idx],
+                        lookup("role"),
+                        lookup("current_term"),
+                        lookup("leader_node_id"),
+                        lookup("commit_index"),
+                        lookup("last_applied_index"),
+                        lookup("health"),
+                    )
+                } else {
+                    format!(
+                        "idx={idx} probe={} show_cluster_status={:?}",
+                        last_probe_results[idx], cluster.status
+                    )
+                };
+                cluster_views.push(summary);
+            }
+            panic!(
+                "no writable leader became available before timeout: {}",
+                cluster_views.join(" | ")
+            );
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1456,21 +1677,31 @@ async fn replicates_wal_to_follower_and_requires_replica_ack() {
     )
     .unwrap();
 
-    let mut leader_runtime = runtime(None);
-    leader_runtime.replication = Arc::new(ReplicationRuntime::new(ReplicationConfig {
-        node_id: "leader-node".to_string(),
-        group_id: "test-group".to_string(),
-        advertise_addr: None,
-        role: ReplicationRole::Leader,
-        upstream: None,
-        upstream_username: None,
-        upstream_password: None,
-        write_ack_mode: WriteAckMode::Replica,
-        ack_timeout: Duration::from_secs(3),
-        poll_interval: Duration::from_millis(100),
-        fetch_batch_size: 32,
-        stale_after: Duration::from_secs(5),
-    }));
+    let mut leader_runtime = runtime_without_auth(None);
+    let leader_cluster_dir = temp_dir("leader-cluster-state");
+    leader_runtime.replication = Arc::new(
+        ReplicationRuntime::new(ReplicationConfig {
+            node_id: "leader-node".to_string(),
+            group_id: "test-group".to_string(),
+            advertise_addr: None,
+            role: ReplicationRole::Leader,
+            upstream: None,
+            upstream_username: None,
+            upstream_password: None,
+            write_ack_mode: WriteAckMode::Replica,
+            ack_timeout: Duration::from_secs(3),
+            poll_interval: Duration::from_millis(100),
+            fetch_batch_size: 32,
+            stale_after: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_millis(100),
+            election_timeout_min: Duration::from_millis(250),
+            election_timeout_max: Duration::from_millis(500),
+            state_path: leader_cluster_dir.join("cluster-state.json"),
+            state_tmp_path: leader_cluster_dir.join("cluster-state.json.tmp"),
+            initial_members: Vec::new(),
+        })
+        .unwrap(),
+    );
     let leader = Server::with_engine(
         "127.0.0.1".to_string(),
         0,
@@ -1483,21 +1714,31 @@ async fn replicates_wal_to_follower_and_requires_replica_ack() {
     let leader_addr = leader.local_addr().unwrap();
     let leader_task = tokio::spawn(async move { leader.start().await });
 
-    let mut follower_runtime = runtime(None);
-    follower_runtime.replication = Arc::new(ReplicationRuntime::new(ReplicationConfig {
-        node_id: "follower-node".to_string(),
-        group_id: "test-group".to_string(),
-        advertise_addr: None,
-        role: ReplicationRole::Follower,
-        upstream: Some(leader_addr.to_string()),
-        upstream_username: Some("vaylix".to_string()),
-        upstream_password: Some("vaylix".to_string()),
-        write_ack_mode: WriteAckMode::Local,
-        ack_timeout: Duration::from_secs(1),
-        poll_interval: Duration::from_millis(100),
-        fetch_batch_size: 32,
-        stale_after: Duration::from_secs(5),
-    }));
+    let mut follower_runtime = runtime_without_auth(None);
+    let follower_cluster_dir = temp_dir("follower-cluster-state");
+    follower_runtime.replication = Arc::new(
+        ReplicationRuntime::new(ReplicationConfig {
+            node_id: "follower-node".to_string(),
+            group_id: "test-group".to_string(),
+            advertise_addr: None,
+            role: ReplicationRole::Follower,
+            upstream: Some(leader_addr.to_string()),
+            upstream_username: Some("vaylix".to_string()),
+            upstream_password: Some("vaylix".to_string()),
+            write_ack_mode: WriteAckMode::Local,
+            ack_timeout: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(100),
+            fetch_batch_size: 32,
+            stale_after: Duration::from_secs(5),
+            heartbeat_interval: Duration::from_millis(100),
+            election_timeout_min: Duration::from_millis(250),
+            election_timeout_max: Duration::from_millis(500),
+            state_path: follower_cluster_dir.join("cluster-state.json"),
+            state_tmp_path: follower_cluster_dir.join("cluster-state.json.tmp"),
+            initial_members: Vec::new(),
+        })
+        .unwrap(),
+    );
     let follower = Server::with_engine(
         "127.0.0.1".to_string(),
         0,
@@ -1542,7 +1783,12 @@ async fn replicates_wal_to_follower_and_requires_replica_ack() {
         },
     )
     .await;
-    assert_eq!(set.status, Status::Ok);
+    assert_eq!(
+        set.status,
+        Status::Ok,
+        "initial leader write failed: {:?}",
+        String::from_utf8_lossy(&set.payload)
+    );
 
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -1570,4 +1816,575 @@ async fn replicates_wal_to_follower_and_requires_replica_ack() {
     leader_task.abort();
     fs::remove_dir_all(leader_root).ok();
     fs::remove_dir_all(follower_root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn elects_leader_fails_over_and_keeps_replicating() {
+    let _ha_test_lock = acquire_ha_test_lock().await;
+    let node1_addr = reserve_local_addr();
+    let node2_addr = reserve_local_addr();
+    let node3_addr = reserve_local_addr();
+    let members = vec![
+        ClusterMember {
+            node_id: "node-1".to_string(),
+            advertise_addr: node1_addr.to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "node-2".to_string(),
+            advertise_addr: node2_addr.to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "node-3".to_string(),
+            advertise_addr: node3_addr.to_string(),
+            voter: true,
+        },
+    ];
+
+    let root1 = temp_dir("ha-node-1");
+    let root2 = temp_dir("ha-node-2");
+    let root3 = temp_dir("ha-node-3");
+
+    let engine1 = Engine::from_paths_with_options(
+        Paths::from_data_dir(&root1).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("ha-node-1-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let engine2 = Engine::from_paths_with_options(
+        Paths::from_data_dir(&root2).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("ha-node-2-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let engine3 = Engine::from_paths_with_options(
+        Paths::from_data_dir(&root3).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("ha-node-3-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut runtime1 = runtime_without_auth(None);
+    runtime1.replication =
+        clustered_replication("node-1", ReplicationRole::Leader, node1_addr, &members);
+    let mut runtime2 = runtime_without_auth(None);
+    runtime2.replication =
+        clustered_replication("node-2", ReplicationRole::Follower, node2_addr, &members);
+    let mut runtime3 = runtime_without_auth(None);
+    runtime3.replication =
+        clustered_replication("node-3", ReplicationRole::Follower, node3_addr, &members);
+
+    let server1 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node1_addr.port(),
+        16,
+        engine1,
+        runtime1,
+    )
+    .await
+    .unwrap();
+    let server2 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node2_addr.port(),
+        16,
+        engine2,
+        runtime2,
+    )
+    .await
+    .unwrap();
+    let server3 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node3_addr.port(),
+        16,
+        engine3,
+        runtime3,
+    )
+    .await
+    .unwrap();
+
+    let task1 = tokio::spawn(async move { server1.start().await });
+    let task2 = tokio::spawn(async move { server2.start().await });
+    let task3 = tokio::spawn(async move { server3.start().await });
+    let tasks = [task1, task2, task3];
+    let addrs = [node1_addr, node2_addr, node3_addr];
+
+    let initial_leader = wait_for_writable_leader(
+        &addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        49_900,
+        "ha:key:probe",
+    )
+    .await;
+
+    let mut leader_stream = connect_tcp(addrs[initial_leader]).await;
+    authenticate(&mut leader_stream).await;
+    let set = issue_command(
+        &mut leader_stream,
+        50_001,
+        Command::Set {
+            key: "ha:key:1".to_string(),
+            value: "value-1".to_string(),
+            options: SetOptions::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        set.status,
+        Status::Ok,
+        "initial HA leader write failed: {:?}",
+        String::from_utf8_lossy(&set.payload)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut replicated = 0usize;
+        for (idx, addr) in addrs.iter().enumerate() {
+            if idx == initial_leader {
+                continue;
+            }
+            let mut stream = connect_tcp(*addr).await;
+            authenticate(&mut stream).await;
+            let response = issue_command(
+                &mut stream,
+                50_002 + idx as u128,
+                Command::Get {
+                    key: "ha:key:1".to_string(),
+                },
+            )
+            .await;
+            if response.status == Status::Ok && response.decode_value().unwrap() == "value-1" {
+                replicated += 1;
+            }
+        }
+        if replicated == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial leader write did not replicate to both followers"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    tasks[initial_leader].abort();
+
+    let survivor_indices = [0usize, 1, 2]
+        .into_iter()
+        .filter(|idx| *idx != initial_leader)
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let new_leader = loop {
+        let mut elected = None;
+        for idx in &survivor_indices {
+            let mut stream = connect_tcp(addrs[*idx]).await;
+            authenticate(&mut stream).await;
+            let response = issue_command(
+                &mut stream,
+                50_100 + *idx as u128,
+                Command::Set {
+                    key: "ha:key:2".to_string(),
+                    value: "value-2".to_string(),
+                    options: SetOptions::default(),
+                },
+            )
+            .await;
+            if response.status == Status::Ok {
+                elected = Some(*idx);
+                break;
+            }
+        }
+        if let Some(idx) = elected {
+            break idx;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no surviving node accepted writes after leader failure"
+        );
+        sleep(Duration::from_millis(200)).await;
+    };
+
+    let follower_idx = [0usize, 1, 2]
+        .into_iter()
+        .find(|idx| *idx != initial_leader && *idx != new_leader)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let mut follower_stream = connect_tcp(addrs[follower_idx]).await;
+        authenticate(&mut follower_stream).await;
+        let response = issue_command(
+            &mut follower_stream,
+            50_101,
+            Command::Get {
+                key: "ha:key:2".to_string(),
+            },
+        )
+        .await;
+        if response.status == Status::Ok && response.decode_value().unwrap() == "value-2" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "post-failover leader write did not replicate to surviving follower"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    for (idx, task) in tasks.into_iter().enumerate() {
+        if idx != initial_leader {
+            task.abort();
+        }
+    }
+    fs::remove_dir_all(root1).ok();
+    fs::remove_dir_all(root2).ok();
+    fs::remove_dir_all(root3).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_leader_rejoins_as_follower_and_catches_up() {
+    let _ha_test_lock = acquire_ha_test_lock().await;
+    let node1_addr = reserve_local_addr();
+    let node2_addr = reserve_local_addr();
+    let node3_addr = reserve_local_addr();
+    let members = vec![
+        ClusterMember {
+            node_id: "node-1".to_string(),
+            advertise_addr: node1_addr.to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "node-2".to_string(),
+            advertise_addr: node2_addr.to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "node-3".to_string(),
+            advertise_addr: node3_addr.to_string(),
+            voter: true,
+        },
+    ];
+
+    let root1 = temp_dir("ha-rejoin-node-1");
+    let root2 = temp_dir("ha-rejoin-node-2");
+    let root3 = temp_dir("ha-rejoin-node-3");
+    let state1 = temp_dir("ha-rejoin-state-1");
+    let state2 = temp_dir("ha-rejoin-state-2");
+    let state3 = temp_dir("ha-rejoin-state-3");
+    let roots = [root1.clone(), root2.clone(), root3.clone()];
+    let state_dirs = [state1.clone(), state2.clone(), state3.clone()];
+    let node_ids = ["node-1", "node-2", "node-3"];
+
+    let engine1 = Engine::from_paths_with_options(
+        Paths::from_data_dir(&root1).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("ha-rejoin-node-1-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let engine2 = Engine::from_paths_with_options(
+        Paths::from_data_dir(&root2).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("ha-rejoin-node-2-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+    let engine3 = Engine::from_paths_with_options(
+        Paths::from_data_dir(&root3).unwrap(),
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("ha-rejoin-node-3-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut runtime1 = runtime_without_auth(None);
+    runtime1.replication = clustered_replication_with_state_dir(
+        "node-1",
+        ReplicationRole::Leader,
+        node1_addr,
+        &members,
+        &state1,
+    );
+    let mut runtime2 = runtime_without_auth(None);
+    runtime2.replication = clustered_replication_with_state_dir(
+        "node-2",
+        ReplicationRole::Follower,
+        node2_addr,
+        &members,
+        &state2,
+    );
+    let mut runtime3 = runtime_without_auth(None);
+    runtime3.replication = clustered_replication_with_state_dir(
+        "node-3",
+        ReplicationRole::Follower,
+        node3_addr,
+        &members,
+        &state3,
+    );
+
+    let server1 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node1_addr.port(),
+        16,
+        engine1,
+        runtime1,
+    )
+    .await
+    .unwrap();
+    let server2 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node2_addr.port(),
+        16,
+        engine2,
+        runtime2,
+    )
+    .await
+    .unwrap();
+    let server3 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node3_addr.port(),
+        16,
+        engine3,
+        runtime3,
+    )
+    .await
+    .unwrap();
+
+    let mut tasks = vec![
+        tokio::spawn(async move { server1.start().await }),
+        tokio::spawn(async move { server2.start().await }),
+        tokio::spawn(async move { server3.start().await }),
+    ];
+    let addrs = [node1_addr, node2_addr, node3_addr];
+
+    let _initial_probe_leader = wait_for_writable_leader(
+        &addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        60_000,
+        "ha:rejoin:probe",
+    )
+    .await;
+
+    let mut initial_leader = wait_for_writable_leader(
+        &addrs,
+        None,
+        Instant::now() + Duration::from_secs(5),
+        61_000,
+        "ha:rejoin:stable-probe",
+    )
+    .await;
+
+    loop {
+        let mut leader_stream = connect_tcp(addrs[initial_leader]).await;
+        authenticate(&mut leader_stream).await;
+        let set = issue_command(
+            &mut leader_stream,
+            60_010,
+            Command::Set {
+                key: "ha:rejoin:key:1".to_string(),
+                value: "value-1".to_string(),
+                options: SetOptions::default(),
+            },
+        )
+        .await;
+        if set.status == Status::Ok {
+            break;
+        }
+        initial_leader = wait_for_writable_leader(
+            &addrs,
+            None,
+            Instant::now() + Duration::from_secs(5),
+            62_000,
+            "ha:rejoin:retry-probe",
+        )
+        .await;
+    }
+
+    tasks[initial_leader].abort();
+    let _ = (&mut tasks[initial_leader]).await;
+    sleep(Duration::from_millis(300)).await;
+
+    let new_leader = wait_for_writable_leader(
+        &addrs,
+        Some(initial_leader),
+        Instant::now() + Duration::from_secs(12),
+        60_100,
+        "ha:rejoin:key:2",
+    )
+    .await;
+
+    let restarted_server = {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let restarted_engine = Engine::from_paths_with_options(
+                Paths::from_data_dir(&roots[initial_leader]).unwrap(),
+                EngineOptions {
+                    wal_sync: WalSyncPolicy::Flush,
+                    keyring: Some(test_keyring(&format!(
+                        "ha-rejoin-{}-key",
+                        node_ids[initial_leader]
+                    ))),
+                    ..EngineOptions::default()
+                },
+            )
+            .unwrap();
+            let mut restarted_runtime = runtime_without_auth(None);
+            restarted_runtime.replication = clustered_replication_with_state_dir(
+                node_ids[initial_leader],
+                ReplicationRole::Leader,
+                addrs[initial_leader],
+                &members,
+                &state_dirs[initial_leader],
+            );
+            match Server::with_engine(
+                "127.0.0.1".to_string(),
+                addrs[initial_leader].port(),
+                16,
+                restarted_engine,
+                restarted_runtime,
+            )
+            .await
+            {
+                Ok(server) => break server,
+                Err(server::ServerError::Bind(_)) if Instant::now() < deadline => {
+                    sleep(Duration::from_millis(150)).await;
+                }
+                Err(err) => panic!("failed to restart old leader: {err}"),
+            }
+        }
+    };
+    let restarted_task = tokio::spawn(async move { restarted_server.start().await });
+
+    let mut restarted_stream = connect_tcp(addrs[initial_leader]).await;
+    authenticate(&mut restarted_stream).await;
+    let restarted_write = issue_command(
+        &mut restarted_stream,
+        60_200,
+        Command::Set {
+            key: "ha:rejoin:key:stale".to_string(),
+            value: "bad".to_string(),
+            options: SetOptions::default(),
+        },
+    )
+    .await;
+    assert_eq!(restarted_write.status, Status::Error);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stream = connect_tcp(addrs[initial_leader]).await;
+        authenticate(&mut stream).await;
+        let response = issue_command(
+            &mut stream,
+            60_201,
+            Command::Get {
+                key: "ha:rejoin:key:2".to_string(),
+            },
+        )
+        .await;
+        if response.status == Status::Ok
+            && response.decode_value().unwrap() == format!("leader-{new_leader}")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restarted old leader never caught up to the surviving leader"
+        );
+        sleep(Duration::from_millis(150)).await;
+    }
+
+    let final_leader = wait_for_writable_leader(
+        &addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        60_300,
+        "ha:rejoin:key:3",
+    )
+    .await;
+    let follower_idx = [0usize, 1, 2]
+        .into_iter()
+        .find(|idx| *idx != final_leader && *idx != initial_leader)
+        .unwrap_or(initial_leader);
+    let final_write_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut survivor_stream = connect_tcp(addrs[final_leader]).await;
+        authenticate(&mut survivor_stream).await;
+        let set = issue_command(
+            &mut survivor_stream,
+            60_300,
+            Command::Set {
+                key: "ha:rejoin:key:3".to_string(),
+                value: "value-3".to_string(),
+                options: SetOptions::default(),
+            },
+        )
+        .await;
+        if set.status == Status::Ok {
+            break;
+        }
+        assert!(
+            Instant::now() < final_write_deadline,
+            "post-rejoin leader never accepted the follow-up write"
+        );
+        sleep(Duration::from_millis(150)).await;
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stream = connect_tcp(addrs[follower_idx]).await;
+        authenticate(&mut stream).await;
+        let follower_response = issue_command(
+            &mut stream,
+            60_301,
+            Command::Get {
+                key: "ha:rejoin:key:3".to_string(),
+            },
+        )
+        .await;
+
+        let mut restarted = connect_tcp(node1_addr).await;
+        authenticate(&mut restarted).await;
+        let restarted_response = issue_command(
+            &mut restarted,
+            60_302,
+            Command::Get {
+                key: "ha:rejoin:key:3".to_string(),
+            },
+        )
+        .await;
+
+        if follower_response.status == Status::Ok
+            && restarted_response.status == Status::Ok
+            && follower_response.decode_value().unwrap() == "value-3"
+            && restarted_response.decode_value().unwrap() == "value-3"
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cluster did not converge after old leader rejoin"
+        );
+        sleep(Duration::from_millis(150)).await;
+    }
+
+    restarted_task.abort();
+    for task in tasks {
+        task.abort();
+    }
 }

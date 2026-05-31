@@ -32,6 +32,10 @@ pub struct Paths {
     pub auth_tmp_path: PathBuf,
     /// Maintenance mode sentinel file.
     pub maintenance_path: PathBuf,
+    /// Cluster consensus metadata path.
+    pub cluster_state_path: PathBuf,
+    /// Temporary cluster consensus metadata path used for atomic updates.
+    pub cluster_state_tmp_path: PathBuf,
 }
 
 impl Paths {
@@ -60,6 +64,8 @@ impl Paths {
             auth_path: data_dir.join("auth.bin"),
             auth_tmp_path: data_dir.join("auth.bin.tmp"),
             maintenance_path: data_dir.join("maintenance.mode"),
+            cluster_state_path: data_dir.join("cluster-state.json"),
+            cluster_state_tmp_path: data_dir.join("cluster-state.json.tmp"),
             data_dir,
         })
     }
@@ -91,5 +97,11 @@ mod tests {
         assert!(paths.auth_path.ends_with("auth.bin"));
         assert!(paths.auth_tmp_path.ends_with("auth.bin.tmp"));
         assert!(paths.maintenance_path.ends_with("maintenance.mode"));
+        assert!(paths.cluster_state_path.ends_with("cluster-state.json"));
+        assert!(
+            paths
+                .cluster_state_tmp_path
+                .ends_with("cluster-state.json.tmp")
+        );
     }
 }
