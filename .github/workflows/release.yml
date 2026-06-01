@@ -87,6 +87,22 @@ jobs:
             artifact_prefix: vaylix-client
             artifact_suffix: windows-x86_64
 
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            package: server
+            binary: vaylix.exe
+            artifact_prefix: vaylix-server
+            artifact_suffix: windows-aarch64
+
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            archive: zip
+            package: client
+            binary: vaylix-client.exe
+            artifact_prefix: vaylix-client
+            artifact_suffix: windows-aarch64
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

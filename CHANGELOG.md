@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Switched the runtime container image to a non-root distroless Debian 12 base while preserving `/var/lib/vaylix` ownership for out-of-the-box volume writes.
+- Switched the runtime container image to a Debian 12 slim base with a root bootstrap entrypoint that repairs `/var/lib/vaylix` ownership and then drops to the fixed unprivileged runtime UID/GID.
 - Added a Docker `HEALTHCHECK` that uses the `vaylix healthcheck` subcommand against the local framed protocol instead of requiring a second client binary or shell tooling.
 
 ### Fixed
@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Fixed container readiness probes against auth-enabled servers by allowing `vaylix healthcheck --kind readiness` to authenticate with `VAYLIX_HEALTHCHECK_USER` / `VAYLIX_HEALTHCHECK_PASSWORD`, explicit CLI credentials, or the configured `VAYLIX_USER` / `VAYLIX_PASSWORD`.
 - Fixed Docker startup probe races by adding a healthcheck start period before failed probes count against the container.
 - Cleaned healthcheck error rendering so `SRV-039` reports the concrete failure once.
+- Fixed Linux bind-mounted data directories failing at startup with `ENG-002` / `Permission denied` by repairing ownership before launching the server process.
+
 
 ## [0.5.1] - 2026-06-01
 
