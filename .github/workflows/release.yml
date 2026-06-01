@@ -115,12 +115,6 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install Syft
-        uses: anchore/sbom-action/download-syft@v0
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3
-
       - name: Install cross for Linux cross-compilation
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
@@ -162,33 +156,72 @@ jobs:
             -Path dist/* `
             -DestinationPath "${{ matrix.artifact_prefix }}-${env:GITHUB_REF_NAME}-${{ matrix.artifact_suffix }}.zip"
 
-      - name: Generate SBOM and sign release archive
+      - name: Upload unsigned binary archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.artifact_suffix }}-${{ matrix.package }}
+          path: |
+            *.tar.gz
+            *.zip
+
+  sign-release-binaries:
+    name: Sign And Publish Release Archives
+    runs-on: ubuntu-24.04
+    needs:
+      - release-binaries
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download unsigned archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          pattern: binary-*
+          merge-multiple: true
+
+      - name: Install Syft
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Generate SBOMs and sign release archives
         shell: bash
         run: |
           set -euo pipefail
 
-          archive="${{ matrix.artifact_prefix }}-${GITHUB_REF_NAME}-${{ matrix.artifact_suffix }}.${{ matrix.archive }}"
-          sbom="${archive}.sbom.spdx.json"
+          shopt -s nullglob
+          archives=(release-artifacts/*.tar.gz release-artifacts/*.zip)
 
-          syft "dir:dist" -o "spdx-json=${sbom}"
-          cosign sign-blob --yes --bundle "${archive}.sigstore.json" "${archive}"
-          cosign sign-blob --yes --bundle "${sbom}.sigstore.json" "${sbom}"
+          if [[ ${#archives[@]} -eq 0 ]]; then
+            echo "no release archives downloaded" >&2
+            exit 1
+          fi
 
-      - name: Upload release artifacts
+          for archive in "${archives[@]}"; do
+            sbom="${archive}.sbom.spdx.json"
+            syft "file:${archive}" -o "spdx-json=${sbom}"
+            cosign sign-blob --yes --bundle "${archive}.sigstore.json" "${archive}"
+            cosign sign-blob --yes --bundle "${sbom}.sigstore.json" "${sbom}"
+          done
+
+      - name: Upload signed release artifacts
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            *.tar.gz
-            *.zip
-            *.sbom.spdx.json
-            *.sigstore.json
+            release-artifacts/*.tar.gz
+            release-artifacts/*.zip
+            release-artifacts/*.sbom.spdx.json
+            release-artifacts/*.sigstore.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   publish-docker-platform:
     name: Publish Docker Image (${{ matrix.platform }})
     needs:
-      - release-binaries
+      - sign-release-binaries
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -242,7 +275,7 @@ jobs:
     name: Publish Docker Manifest
     runs-on: ubuntu-24.04
     needs:
-      - release-binaries
+      - sign-release-binaries
       - publish-docker-platform
 
     steps:
