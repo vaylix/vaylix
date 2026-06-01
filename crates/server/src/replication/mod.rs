@@ -1,7 +1,5 @@
-use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,6 +7,14 @@ use tokio::sync::Mutex;
 
 use crate::error::{Result, ServerError};
 use crate::server::log_event;
+
+mod persistence;
+mod quorum;
+mod timing;
+
+use persistence::{load_persisted_state, persist_state};
+use quorum::{quorum_size, quorum_size_from_members, recompute_commit_sequence, voter_count};
+use timing::{leader_lease_duration, random_election_timeout, recently_heard_from_known_leader};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1272,127 +1278,10 @@ fn default_true() -> bool {
     true
 }
 
-fn leader_lease_duration(config: &ReplicationConfig) -> Duration {
-    config
-        .stale_after
-        .max(config.election_timeout_max.saturating_mul(4))
-}
-
-fn recently_heard_from_known_leader(config: &ReplicationConfig, state: &ReplicationState) -> bool {
-    state.leader_node_id.is_some()
-        && Instant::now().duration_since(state.last_heartbeat_at) < leader_lease_duration(config)
-}
-
-fn recompute_commit_sequence(config: &ReplicationConfig, state: &mut ReplicationState) {
-    let candidate = match config.write_ack_mode {
-        WriteAckMode::Local => state.local_last_applied_sequence,
-        WriteAckMode::Replica => {
-            let quorum = quorum_size_from_members(&state.members);
-            nth_highest_voter_match(config, state, quorum)
-        }
-        WriteAckMode::All => min_voter_match(config, state),
-    };
-
-    state.commit_sequence = state
-        .commit_sequence
-        .max(candidate.min(state.local_last_applied_sequence));
-}
-
-fn voter_match_sequences(config: &ReplicationConfig, state: &ReplicationState) -> Vec<u64> {
-    state
-        .members
-        .values()
-        .filter(|member| member.voter)
-        .map(|member| {
-            if member.node_id == config.node_id {
-                state.local_last_applied_sequence
-            } else {
-                state
-                    .followers
-                    .get(&member.node_id)
-                    .map(|progress| progress.match_index)
-                    .unwrap_or(0)
-            }
-        })
-        .collect()
-}
-
-fn nth_highest_voter_match(
-    config: &ReplicationConfig,
-    state: &ReplicationState,
-    quorum: usize,
-) -> u64 {
-    let mut matches = voter_match_sequences(config, state);
-    if matches.is_empty() {
-        return 0;
-    }
-    matches.sort_unstable();
-    let index = matches.len().saturating_sub(quorum);
-    matches[index]
-}
-
-fn min_voter_match(config: &ReplicationConfig, state: &ReplicationState) -> u64 {
-    voter_match_sequences(config, state)
-        .into_iter()
-        .min()
-        .unwrap_or(0)
-}
-
-fn voter_count(members: &BTreeMap<String, ClusterMember>) -> usize {
-    members
-        .values()
-        .filter(|member| member.voter)
-        .count()
-        .max(1)
-}
-
-fn quorum_size(member_count: usize) -> usize {
-    (member_count / 2) + 1
-}
-
-fn quorum_size_from_members(members: &BTreeMap<String, ClusterMember>) -> usize {
-    quorum_size(voter_count(members))
-}
-
-fn random_election_timeout(config: &ReplicationConfig) -> Duration {
-    if config.election_timeout_max <= config.election_timeout_min {
-        return config.election_timeout_min;
-    }
-    let min = config.election_timeout_min.as_millis() as u64;
-    let max = config.election_timeout_max.as_millis() as u64;
-    let jitter = rand::rng().random_range(min..=max);
-    Duration::from_millis(jitter)
-}
-
-fn load_persisted_state(path: &PathBuf) -> Result<Option<PersistedReplicationState>> {
-    match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|err| ServerError::InvalidArguments(err.to_string())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(ServerError::Io(err)),
-    }
-}
-
-fn persist_state(config: &ReplicationConfig, state: &ReplicationState) -> Result<()> {
-    let persisted = PersistedReplicationState {
-        current_term: state.current_term,
-        voted_for: state.voted_for.clone(),
-        members: state.members.values().cloned().collect(),
-    };
-    let bytes = serde_json::to_vec_pretty(&persisted)
-        .map_err(|err| ServerError::InvalidArguments(err.to_string()))?;
-    if let Some(parent) = config.state_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&config.state_tmp_path, bytes)?;
-    fs::rename(&config.state_tmp_path, &config.state_path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_state_path(label: &str) -> (PathBuf, PathBuf) {

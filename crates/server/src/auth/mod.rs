@@ -4,22 +4,25 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use argon2::Argon2;
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use engine::StorageKeyring;
-use rand::random;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::error::{Result, ServerError};
 
+mod password;
+mod pattern;
+
+use password::{hash_password, password_matches, validate_password_policy};
+use pattern::{pattern_covers, wildcard_matches};
+
 pub const DEFAULT_USERNAME: &str = "vaylix";
 pub const DEFAULT_PASSWORD: &str = "vaylix";
 
 const AUTH_RESOURCE: &str = "auth metadata";
-const AUTH_FORMAT_VERSION: u32 = 1;
+const AUTH_FORMAT_VERSION: u32 = 2;
+const MIN_SUPPORTED_AUTH_FORMAT_VERSION: u32 = 1;
 const ADMIN_ROLE: &str = "admin";
-const MIN_PASSWORD_LEN: usize = 12;
 
 /// Coarse command permissions granted to roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -154,10 +157,17 @@ struct RoleRecord {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct BootstrapAdminRecord {
+    username: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct StoredAuth {
     version: u32,
     users: BTreeMap<String, UserRecord>,
     roles: BTreeMap<String, RoleRecord>,
+    #[serde(default)]
+    bootstrap_admin: Option<BootstrapAdminRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -305,12 +315,7 @@ impl AuthStore {
         if user.disabled {
             return Ok(None);
         }
-        let parsed_hash = PasswordHash::new(&user.password_hash)
-            .map_err(|_| ServerError::AuthenticationConfiguration)?;
-        if Argon2::default()
-            .verify_password(password.as_bytes(), &parsed_hash)
-            .is_err()
-        {
+        if !password_matches(user, password)? {
             return Ok(None);
         }
 
@@ -586,6 +591,7 @@ fn bootstrap_store(username: String, password: String) -> Result<StoredAuth> {
     let mut user_roles = BTreeSet::new();
     user_roles.insert(ADMIN_ROLE.to_string());
     let mut users = BTreeMap::new();
+    let bootstrap_username = username.clone();
     users.insert(
         username,
         UserRecord {
@@ -599,6 +605,9 @@ fn bootstrap_store(username: String, password: String) -> Result<StoredAuth> {
         version: AUTH_FORMAT_VERSION,
         users,
         roles: admin_roles(),
+        bootstrap_admin: Some(BootstrapAdminRecord {
+            username: bootstrap_username,
+        }),
     })
 }
 
@@ -608,8 +617,15 @@ fn reconcile_configured_bootstrap_admin(
     password: &str,
 ) -> Result<()> {
     if username == DEFAULT_USERNAME && password == DEFAULT_PASSWORD {
+        stored.version = AUTH_FORMAT_VERSION;
         return Ok(());
     }
+
+    let previous_bootstrap_username = stored
+        .bootstrap_admin
+        .as_ref()
+        .map(|record| record.username.clone());
+    let legacy_single_admin_username = legacy_single_admin_username(stored);
 
     ensure_admin_role(stored);
     let mut roles = BTreeSet::new();
@@ -630,11 +646,50 @@ fn reconcile_configured_bootstrap_admin(
         })
         .or_insert(record);
 
-    retire_default_bootstrap_user(stored, username)?;
+    retire_previous_bootstrap_admin(stored, previous_bootstrap_username.as_deref(), username)?;
+    if previous_bootstrap_username.is_none() {
+        retire_previous_bootstrap_admin(stored, legacy_single_admin_username.as_deref(), username)?;
+    }
+    retire_legacy_default_bootstrap_user(stored, username)?;
+    stored.bootstrap_admin = Some(BootstrapAdminRecord {
+        username: username.to_string(),
+    });
+    stored.version = AUTH_FORMAT_VERSION;
     Ok(())
 }
 
-fn retire_default_bootstrap_user(stored: &mut StoredAuth, configured_username: &str) -> Result<()> {
+fn legacy_single_admin_username(stored: &StoredAuth) -> Option<String> {
+    if stored.bootstrap_admin.is_some() {
+        return None;
+    }
+    let mut admins = stored
+        .users
+        .iter()
+        .filter(|(_, user)| !user.disabled && user.roles.contains(ADMIN_ROLE))
+        .map(|(username, _)| username.clone());
+    let username = admins.next()?;
+    admins.next().is_none().then_some(username)
+}
+
+fn retire_previous_bootstrap_admin(
+    stored: &mut StoredAuth,
+    previous_username: Option<&str>,
+    configured_username: &str,
+) -> Result<()> {
+    let Some(previous_username) = previous_username else {
+        return Ok(());
+    };
+    if previous_username == configured_username {
+        return Ok(());
+    }
+    remove_admin_user_if_present(stored, previous_username);
+    Ok(())
+}
+
+fn retire_legacy_default_bootstrap_user(
+    stored: &mut StoredAuth,
+    configured_username: &str,
+) -> Result<()> {
     if configured_username == DEFAULT_USERNAME {
         return Ok(());
     }
@@ -642,10 +697,20 @@ fn retire_default_bootstrap_user(stored: &mut StoredAuth, configured_username: &
     let Some(default_user) = stored.users.get(DEFAULT_USERNAME) else {
         return Ok(());
     };
-    if password_matches(default_user, DEFAULT_PASSWORD)? {
-        stored.users.remove(DEFAULT_USERNAME);
+    if default_user.roles.contains(ADMIN_ROLE) || password_matches(default_user, DEFAULT_PASSWORD)?
+    {
+        remove_admin_user_if_present(stored, DEFAULT_USERNAME);
     }
     Ok(())
+}
+
+fn remove_admin_user_if_present(stored: &mut StoredAuth, username: &str) {
+    let Some(user) = stored.users.get(username) else {
+        return;
+    };
+    if user.roles.contains(ADMIN_ROLE) {
+        stored.users.remove(username);
+    }
 }
 
 fn admin_roles() -> BTreeMap<String, RoleRecord> {
@@ -683,42 +748,14 @@ fn admin_role_record() -> RoleRecord {
     }
 }
 
-fn password_matches(user: &UserRecord, password: &str) -> Result<bool> {
-    let parsed_hash = PasswordHash::new(&user.password_hash)
-        .map_err(|_| ServerError::AuthenticationConfiguration)?;
-    Ok(Argon2::default()
-        .verify_password(password.as_bytes(), &parsed_hash)
-        .is_ok())
-}
-
-fn hash_password(password: &str) -> Result<String> {
-    let salt = SaltString::encode_b64(&random::<[u8; 16]>())
-        .map_err(|_| ServerError::AuthenticationConfiguration)?;
-    Ok(Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|_| ServerError::AuthenticationConfiguration)?
-        .to_string())
-}
-
-fn validate_password_policy(password: &str) -> Result<()> {
-    if password.len() < MIN_PASSWORD_LEN {
-        return Err(ServerError::PasswordPolicyViolation);
-    }
-    let has_letter = password.chars().any(|char| char.is_ascii_alphabetic());
-    let has_digit = password.chars().any(|char| char.is_ascii_digit());
-    if !has_letter || !has_digit {
-        return Err(ServerError::PasswordPolicyViolation);
-    }
-    Ok(())
-}
-
 fn load_store(persist: &PersistConfig) -> Result<Option<StoredAuth>> {
     match fs::read(&persist.path) {
         Ok(bytes) => {
             let decrypted = engine::storage_decrypt(&persist.keyring, AUTH_RESOURCE, &bytes)?;
             let stored: StoredAuth = serde_json::from_slice(&decrypted)
                 .map_err(|err| ServerError::AuthStoreDecode(err.to_string()))?;
-            if stored.version != AUTH_FORMAT_VERSION {
+            if !(MIN_SUPPORTED_AUTH_FORMAT_VERSION..=AUTH_FORMAT_VERSION).contains(&stored.version)
+            {
                 return Err(ServerError::AuthStoreDecode(format!(
                     "unsupported auth store version {}",
                     stored.version
@@ -760,32 +797,12 @@ fn role_grants(record: &RoleRecord) -> Vec<String> {
     grants
 }
 
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-    let Some(star_index) = pattern.find('*') else {
-        return pattern == value;
-    };
-    let (prefix, suffix_with_star) = pattern.split_at(star_index);
-    let suffix = &suffix_with_star[1..];
-    value.starts_with(prefix) && value.ends_with(suffix)
-}
-
-fn pattern_covers(grant_pattern: &str, requested_pattern: &str) -> bool {
-    grant_pattern == "*"
-        || grant_pattern == requested_pattern
-        || requested_pattern != "*"
-            && grant_pattern.ends_with('*')
-            && requested_pattern.starts_with(grant_pattern.trim_end_matches('*'))
-}
-
 #[allow(dead_code)]
 fn _assert_paths(_: &Path) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthConfig, Permission};
+    use super::{AuthConfig, Permission, PersistConfig, load_store, save_store};
     use engine::{StorageKey, StorageKeyring};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -997,6 +1014,146 @@ mod tests {
         assert!(
             reloaded
                 .verify("admin", "7965PPO4")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(temp).ok();
+    }
+
+    #[tokio::test]
+    async fn retires_previous_env_managed_admin_when_configured_user_changes() {
+        let path = temp_path("bootstrap-user-rotation");
+        let temp = temp_path("bootstrap-user-rotation-tmp");
+        let first = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "vaylix".to_string(),
+            "firstpass1234".to_string(),
+        )
+        .unwrap();
+        assert!(
+            first
+                .verify("vaylix", "firstpass1234")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let second = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "admin".to_string(),
+            "secondpass1234".to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            second
+                .verify("vaylix", "firstpass1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            second
+                .verify("admin", "secondpass1234")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(temp).ok();
+    }
+
+    #[tokio::test]
+    async fn rotates_tracked_env_admin_password_on_restart() {
+        let path = temp_path("bootstrap-password-rotation");
+        let temp = temp_path("bootstrap-password-rotation-tmp");
+        AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "admin".to_string(),
+            "firstpass1234".to_string(),
+        )
+        .unwrap();
+
+        let reloaded = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "admin".to_string(),
+            "secondpass1234".to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            reloaded
+                .verify("admin", "firstpass1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .verify("admin", "secondpass1234")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        fs::remove_file(path).ok();
+        fs::remove_file(temp).ok();
+    }
+
+    #[tokio::test]
+    async fn retires_legacy_single_admin_when_configured_user_changes() {
+        let path = temp_path("legacy-bootstrap-user-rotation");
+        let temp = temp_path("legacy-bootstrap-user-rotation-tmp");
+        AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "firstadmin".to_string(),
+            "firstpass1234".to_string(),
+        )
+        .unwrap();
+
+        let persist = PersistConfig {
+            path: path.clone(),
+            temp_path: temp.clone(),
+            keyring: keyring(),
+        };
+        let mut stored = load_store(&persist).unwrap().unwrap();
+        stored.version = 1;
+        stored.bootstrap_admin = None;
+        save_store(&stored, &persist).unwrap();
+
+        let reloaded = AuthConfig::load_or_bootstrap(
+            path.clone(),
+            temp.clone(),
+            keyring(),
+            "secondadmin".to_string(),
+            "secondpass1234".to_string(),
+        )
+        .unwrap();
+
+        assert!(
+            reloaded
+                .verify("firstadmin", "firstpass1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .verify("secondadmin", "secondpass1234")
                 .await
                 .unwrap()
                 .is_some()

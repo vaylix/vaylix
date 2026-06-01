@@ -16,7 +16,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.5.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.5.1`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -89,7 +89,7 @@ Useful runtime environment variables for containers:
 
 ## High Availability
 
-Vaylix 0.5.0 supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
+Vaylix 0.5.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
 
 Recommended production shape:
 
@@ -192,7 +192,7 @@ cargo audit
 
 - Authentication and RBAC are enabled by default. `--disable-auth` is for trusted local testing only.
 - Development credentials default to `vaylix / vaylix`; production deployments should override them.
-- When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the admin account on startup. If the default bootstrap user still accepts `vaylix / vaylix`, it is retired.
+- When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the env-managed bootstrap admin on startup. Changing those startup credentials rotates that admin and retires the previous env-managed admin.
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
 - TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.

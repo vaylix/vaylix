@@ -325,7 +325,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "client"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "clap",
  "command",
@@ -366,7 +366,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "command"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "thiserror",
 ]
@@ -537,7 +537,7 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "engine"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1419,7 +1419,7 @@ dependencies = [
 
 [[package]]
 name = "server"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "argon2",
  "clap",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "bytes",
  "command",
