@@ -2,12 +2,16 @@
 resolver = "2"
 
 members = [
+    "crates/bench",
     "crates/command",
     "crates/engine",
     "crates/server",
     "crates/client",
     "crates/transport",
 ]
+
+[profile.bench]
+debug = true
 
 [profile.release]
 opt-level = 3

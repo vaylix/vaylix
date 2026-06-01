@@ -1,0 +1,4 @@
+[alias]
+bench-engine = "bench -p engine"
+bench-transport = "bench -p transport"
+bench-load = "run -p bench --"

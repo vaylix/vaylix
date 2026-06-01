@@ -505,7 +505,7 @@ async fn run_replication_round_from(
         )
         .await?;
 
-    let local_sequence = parse_last_applied_sequence(&engine.info().await?);
+    let local_sequence = engine.last_applied_state().await?.last_applied_sequence;
     if local_sequence > leader_status.commit_sequence
         || local_sequence > leader_status.local_last_applied_sequence
     {
@@ -530,7 +530,7 @@ async fn run_replication_round_from(
     let entries: Vec<engine::WalEntry> = decode_json_payload(&fetch_response.payload)?;
     let current_sequence = {
         let _apply_guard = runtime.replication_apply_lock.lock().await;
-        let mut current_sequence = parse_last_applied_sequence(&engine.info().await?);
+        let mut current_sequence = engine.last_applied_state().await?.last_applied_sequence;
         if current_sequence > leader_status.commit_sequence
             || current_sequence > leader_status.local_last_applied_sequence
         {
@@ -927,12 +927,15 @@ async fn send_cluster_appends_locked(
     if runtime.replication.role().await != ReplicationRole::Leader {
         return Ok(());
     }
-    let local_sequence = parse_last_applied_sequence(&engine.info().await?);
-    let local_term = engine.wal_entry_term(local_sequence).await?;
-    let local_checksum = engine.wal_entry_checksum(local_sequence).await?;
+    let local_state = engine.last_applied_state().await?;
+    let local_sequence = local_state.last_applied_sequence;
     runtime
         .replication
-        .set_local_last_applied_state(local_sequence, local_term, local_checksum)
+        .set_local_last_applied_state(
+            local_sequence,
+            local_state.last_applied_term,
+            local_state.last_applied_checksum,
+        )
         .await;
     let Some((
         term,
@@ -1135,12 +1138,15 @@ async fn send_cluster_liveness_heartbeats(
     if runtime.replication.role().await != ReplicationRole::Leader {
         return Ok(());
     }
-    let local_sequence = parse_last_applied_sequence(&engine.info().await?);
-    let local_term = engine.wal_entry_term(local_sequence).await?;
-    let local_checksum = engine.wal_entry_checksum(local_sequence).await?;
+    let local_state = engine.last_applied_state().await?;
+    let local_sequence = local_state.last_applied_sequence;
     runtime
         .replication
-        .set_local_last_applied_state(local_sequence, local_term, local_checksum)
+        .set_local_last_applied_state(
+            local_sequence,
+            local_state.last_applied_term,
+            local_state.last_applied_checksum,
+        )
         .await;
     let Some((
         term,
@@ -1274,7 +1280,7 @@ async fn rollback_uncommitted_tail(
     runtime: &ServerRuntimeConfig,
 ) -> Result<()> {
     let commit_sequence = runtime.replication.commit_sequence().await;
-    let current_sequence = parse_last_applied_sequence(&engine.info().await?);
+    let current_sequence = engine.last_applied_state().await?.last_applied_sequence;
     if current_sequence <= commit_sequence {
         return Ok(());
     }
@@ -1348,58 +1354,6 @@ async fn send_heartbeat_request(
     let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
     ensure_replication_ok(&response)?;
     decode_json_payload(&response.payload)
-}
-
-fn spawn_replication_append_ack(
-    runtime: ServerRuntimeConfig,
-    leader_addr: String,
-    term: u64,
-    leader_node_id: String,
-    applied_sequence: u64,
-) {
-    tokio::spawn(async move {
-        if let Err(err) = send_replication_append_ack(
-            runtime,
-            leader_addr,
-            term,
-            leader_node_id,
-            applied_sequence,
-        )
-        .await
-        {
-            log_event(
-                "WARN",
-                "server.consensus",
-                &format!("append ack failed [{}] {}: {err}", err.code(), err.name()),
-            );
-        }
-    });
-}
-
-async fn send_replication_append_ack(
-    runtime: ServerRuntimeConfig,
-    leader_addr: String,
-    term: u64,
-    leader_node_id: String,
-    applied_sequence: u64,
-) -> Result<()> {
-    let mut stream = connect_replication_peer(runtime.clone(), &leader_addr).await?;
-    let transport = negotiate_replication_transport(&mut stream).await?;
-    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
-    let request = Request::new(
-        Uuid::now_v7(),
-        transport::Opcode::ReplicationAck,
-        serde_json::to_vec(&ReplicationAckRequest {
-            follower_node_id: runtime.replication.config().node_id.clone(),
-            applied_sequence,
-            term,
-            leader_node_id,
-        })
-        .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
-    );
-    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
-    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
-    ensure_replication_ok(&response)
 }
 
 struct SnapshotInstallCall {
@@ -2048,7 +2002,7 @@ async fn process_internal_replication_request(
                 return json_response(request.request_id, &response);
             }
 
-            let current_sequence = parse_last_applied_sequence(&engine.info().await?);
+            let current_sequence = engine.last_applied_state().await?.last_applied_sequence;
             let target_sequence = payload
                 .entries
                 .last()
@@ -2183,13 +2137,6 @@ async fn process_internal_replication_request(
                 accepted: true,
                 match_sequence: applied_sequence,
             };
-            spawn_replication_append_ack(
-                runtime.clone(),
-                payload.leader_addr.clone(),
-                payload.term,
-                payload.leader_node_id.clone(),
-                applied_sequence,
-            );
             json_response(request.request_id, &response)
         }
         transport::Opcode::ReplicationInstallSnapshot => {

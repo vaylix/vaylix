@@ -184,6 +184,10 @@ impl Engine {
             .map(|entry| entry.term))
     }
 
+    pub fn last_applied_sequence(&self) -> u64 {
+        self.state.metadata.last_applied_sequence
+    }
+
     pub fn set_consensus_term(&mut self, term: u64) {
         self.current_consensus_term = term;
     }

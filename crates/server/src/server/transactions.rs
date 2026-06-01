@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{
     EngineHandle, ServerRuntimeConfig, SessionState, authorize_command, current_time_millis,
     drive_write_commit, enforce_leader_writeability, map_transaction_result_payload,
-    parse_last_applied_sequence, replication_role_accepts_writes, rollback_uncommitted_tail,
+    replication_role_accepts_writes, rollback_uncommitted_tail,
     send_cluster_heartbeats_role_guarded_with_timeout, validate_command,
     validate_transaction_command,
 };
@@ -56,15 +56,13 @@ pub(super) async fn handle_transaction_command(
             for (_queued_command, result) in queued.iter().zip(results) {
                 encoded.push(map_transaction_result_payload(result));
             }
-            let last_applied_sequence = parse_last_applied_sequence(&engine.info().await?);
-            let last_applied_term = engine.wal_entry_term(last_applied_sequence).await?;
-            let last_applied_checksum = engine.wal_entry_checksum(last_applied_sequence).await?;
+            let last_applied = engine.last_applied_state().await?;
             runtime
                 .replication
                 .set_local_last_applied_state(
-                    last_applied_sequence,
-                    last_applied_term,
-                    last_applied_checksum,
+                    last_applied.last_applied_sequence,
+                    last_applied.last_applied_term,
+                    last_applied.last_applied_checksum,
                 )
                 .await;
             if runtime.replication.role().await == ReplicationRole::Leader
@@ -76,7 +74,9 @@ pub(super) async fn handle_transaction_command(
             {
                 let _ = err;
             }
-            if let Err(err) = drive_write_commit(&engine, runtime, last_applied_sequence).await {
+            if let Err(err) =
+                drive_write_commit(&engine, runtime, last_applied.last_applied_sequence).await
+            {
                 rollback_uncommitted_tail(&engine, runtime).await?;
                 return Err(err);
             }

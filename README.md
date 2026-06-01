@@ -9,6 +9,7 @@ client -> transport -> TCP/TLS -> transport -> server -> engine
 The current server stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, hash-chained audit logging, and Raft-style HA replication with automatic leader election and quorum-backed writes.
 
 Detailed architecture context lives in [LLM.md](LLM.md).
+Benchmark guidance lives in [BENCHMARKING.md](BENCHMARKING.md).
 
 ## Downloads
 
@@ -165,6 +166,14 @@ Release binaries:
 ```bash
 cargo build --release -p server
 cargo build --release -p client
+```
+
+Benchmarking:
+
+```bash
+cargo bench-engine
+cargo bench-transport
+cargo bench-load -- managed-single-node --server-bin target/debug/vaylix --duration-seconds 30
 ```
 
 Offline storage and PITR operations:

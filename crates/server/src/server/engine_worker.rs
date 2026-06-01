@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use transport::Response;
 use uuid::Uuid;
 
-use super::{execute_command, parse_last_applied_sequence};
+use super::execute_command;
 use crate::error::{Result, ServerError};
 
 enum EngineRequest {
@@ -24,6 +24,9 @@ enum EngineRequest {
     },
     AppendNoop {
         consensus_term: u64,
+        respond_to: oneshot::Sender<Result<LogAppendResult>>,
+    },
+    LastAppliedState {
         respond_to: oneshot::Sender<Result<LogAppendResult>>,
     },
     Info {
@@ -104,21 +107,12 @@ impl EngineHandle {
                         engine.set_consensus_term(consensus_term);
                         let result = execute_command(&mut engine, request_id, command).and_then(
                             |response| {
-                                let last_applied_sequence = engine
-                                    .info()
-                                    .map_err(ServerError::from)
-                                    .map(|info| parse_last_applied_sequence(&info))?;
-                                let last_applied_term = engine
-                                    .wal_entry_term(last_applied_sequence)
-                                    .map_err(ServerError::from)?;
-                                let last_applied_checksum = engine
-                                    .wal_entry_checksum(last_applied_sequence)
-                                    .map_err(ServerError::from)?;
+                                let last_applied = last_applied_state(&engine)?;
                                 Ok(ExecuteResult {
                                     response,
-                                    last_applied_sequence,
-                                    last_applied_term,
-                                    last_applied_checksum,
+                                    last_applied_sequence: last_applied.last_applied_sequence,
+                                    last_applied_term: last_applied.last_applied_term,
+                                    last_applied_checksum: last_applied.last_applied_checksum,
                                 })
                             },
                         );
@@ -142,28 +136,14 @@ impl EngineHandle {
                         respond_to,
                     } => {
                         engine.set_consensus_term(consensus_term);
-                        let result =
-                            engine
-                                .append_noop()
-                                .map_err(ServerError::from)
-                                .and_then(|()| {
-                                    let last_applied_sequence = engine
-                                        .info()
-                                        .map_err(ServerError::from)
-                                        .map(|info| parse_last_applied_sequence(&info))?;
-                                    let last_applied_term = engine
-                                        .wal_entry_term(last_applied_sequence)
-                                        .map_err(ServerError::from)?;
-                                    let last_applied_checksum = engine
-                                        .wal_entry_checksum(last_applied_sequence)
-                                        .map_err(ServerError::from)?;
-                                    Ok(LogAppendResult {
-                                        last_applied_sequence,
-                                        last_applied_term,
-                                        last_applied_checksum,
-                                    })
-                                });
+                        let result = engine
+                            .append_noop()
+                            .map_err(ServerError::from)
+                            .and_then(|()| last_applied_state(&engine));
                         let _ = respond_to.send(result);
+                    }
+                    EngineRequest::LastAppliedState { respond_to } => {
+                        let _ = respond_to.send(last_applied_state(&engine));
                     }
                     EngineRequest::Info { respond_to } => {
                         let _ = respond_to.send(engine.info().map_err(ServerError::from));
@@ -295,6 +275,15 @@ impl EngineHandle {
                 consensus_term,
                 respond_to: send,
             })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    pub(super) async fn last_applied_state(&self) -> Result<LogAppendResult> {
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::LastAppliedState { respond_to: send })
             .await
             .map_err(|_| ServerError::EngineWorkerClosed)?;
         recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
@@ -435,4 +424,19 @@ impl EngineHandle {
             .map_err(|_| ServerError::EngineWorkerClosed)?;
         recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
     }
+}
+
+fn last_applied_state(engine: &Engine) -> Result<LogAppendResult> {
+    let last_applied_sequence = engine.last_applied_sequence();
+    let last_applied_term = engine
+        .wal_entry_term(last_applied_sequence)
+        .map_err(ServerError::from)?;
+    let last_applied_checksum = engine
+        .wal_entry_checksum(last_applied_sequence)
+        .map_err(ServerError::from)?;
+    Ok(LogAppendResult {
+        last_applied_sequence,
+        last_applied_term,
+        last_applied_checksum,
+    })
 }
