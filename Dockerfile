@@ -39,7 +39,11 @@ RUN mkdir -p /runtime/var/lib/vaylix/backups \
     && chmod -R u+rwX,g+rwX /runtime/var/lib/vaylix
 
 
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gosu \
+    && rm -rf /var/lib/apt/lists/*
 
 ENV VAYLIX_BIND=0.0.0.0
 ENV VAYLIX_PORT=9173
@@ -50,16 +54,20 @@ ENV VAYLIX_BACKUP_DIR=/var/lib/vaylix/backups
 ENV VAYLIX_USER=vaylix
 ENV VAYLIX_PASSWORD=vaylix
 
-COPY --from=builder --chown=65532:65532 /runtime/var/lib/vaylix /var/lib/vaylix
-COPY --from=builder --chown=65532:65532 /out/vaylix /usr/local/bin/vaylix
+COPY --from=builder /runtime/var/lib/vaylix /var/lib/vaylix
+COPY --from=builder /out/vaylix /usr/local/bin/vaylix
+COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+RUN groupadd --gid 65532 vaylix \
+    && useradd --uid 65532 --gid 65532 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin vaylix \
+    && chmod 0755 /usr/local/bin/vaylix /usr/local/bin/docker-entrypoint.sh
 
 EXPOSE 9173
 
 VOLUME ["/var/lib/vaylix"]
 
-USER 65532:65532
-
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/vaylix", "healthcheck", "--kind", "liveness"]
 
-ENTRYPOINT ["/usr/local/bin/vaylix"]
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["/usr/local/bin/vaylix"]
