@@ -88,6 +88,8 @@ pub enum ServerError {
     ReplicationReadOnly,
     #[error("replication promotion denied: {0}")]
     ReplicationPromotionDenied(String),
+    #[error("{0}")]
+    HealthcheckFailed(String),
 }
 
 impl ServerError {
@@ -133,6 +135,7 @@ impl ServerError {
             Self::ReplicationAckUnavailable => "SRV-036",
             Self::ReplicationReadOnly => "SRV-037",
             Self::ReplicationPromotionDenied(_) => "SRV-038",
+            Self::HealthcheckFailed(_) => "SRV-039",
         }
     }
 
@@ -178,6 +181,7 @@ impl ServerError {
             Self::ReplicationAckUnavailable => "Replication Acknowledgement Unavailable",
             Self::ReplicationReadOnly => "Follower Write Rejected",
             Self::ReplicationPromotionDenied(_) => "Replication Promotion Denied",
+            Self::HealthcheckFailed(_) => "Healthcheck Failed",
         }
     }
 }

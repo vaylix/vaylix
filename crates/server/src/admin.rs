@@ -1,6 +1,7 @@
 use crate::args::{AdminCommand, Args, PitrAction, StorageAction};
 use crate::bootstrap::engine_options;
 use crate::error::{Result, ServerError};
+use crate::healthcheck::run_healthcheck;
 
 /// Executes offline administrative commands that do not start the TCP server.
 pub fn run_admin_command(args: &Args, command: AdminCommand) -> Result<()> {
@@ -55,6 +56,7 @@ pub fn run_admin_command(args: &Args, command: AdminCommand) -> Result<()> {
                 print_storage_inspection(&inspection);
             }
         },
+        AdminCommand::Healthcheck(command) => run_healthcheck(command)?,
     }
     Ok(())
 }

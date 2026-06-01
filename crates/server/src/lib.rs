@@ -5,6 +5,7 @@ pub mod auth;
 mod backup;
 pub mod bootstrap;
 pub mod error;
+pub mod healthcheck;
 pub mod metrics;
 pub mod replication;
 pub mod runtime_state;
@@ -12,8 +13,8 @@ pub mod server;
 pub mod tls;
 
 pub use args::{
-    AdminCommand, Args, PitrAction, PitrCommand, ReplicationRoleMode, StorageAction,
-    StorageCommand, WalSyncMode, WriteAckModeArg,
+    AdminCommand, Args, HealthcheckCommand, HealthcheckKind, PitrAction, PitrCommand,
+    ReplicationRoleMode, StorageAction, StorageCommand, WalSyncMode, WriteAckModeArg,
 };
 pub use error::{Result, ServerError};
 pub use server::Server;

@@ -34,8 +34,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && mkdir -p /out \
     && cp target/release/vaylix /out/vaylix
 
+RUN mkdir -p /runtime/var/lib/vaylix/backups \
+    && chown -R 65532:65532 /runtime/var/lib/vaylix \
+    && chmod -R u+rwX,g+rwX /runtime/var/lib/vaylix
 
-FROM debian:bookworm-slim AS runtime
+
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 ENV VAYLIX_BIND=0.0.0.0
 ENV VAYLIX_PORT=9173
@@ -46,16 +50,16 @@ ENV VAYLIX_BACKUP_DIR=/var/lib/vaylix/backups
 ENV VAYLIX_USER=vaylix
 ENV VAYLIX_PASSWORD=vaylix
 
-WORKDIR /app
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /out/vaylix /usr/local/bin/vaylix
+COPY --from=builder --chown=65532:65532 /runtime/var/lib/vaylix /var/lib/vaylix
+COPY --from=builder --chown=65532:65532 /out/vaylix /usr/local/bin/vaylix
 
 EXPOSE 9173
 
 VOLUME ["/var/lib/vaylix"]
 
-CMD ["vaylix"]
+USER 65532:65532
+
+HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
+    CMD ["/usr/local/bin/vaylix", "healthcheck", "--kind", "liveness"]
+
+ENTRYPOINT ["/usr/local/bin/vaylix"]

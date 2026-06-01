@@ -291,6 +291,40 @@ pub struct Args {
 pub enum AdminCommand {
     Storage(StorageCommand),
     Pitr(PitrCommand),
+    Healthcheck(HealthcheckCommand),
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum HealthcheckKind {
+    Liveness,
+    Readiness,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct HealthcheckCommand {
+    /// Healthcheck mode. Docker should use liveness; readiness is for traffic gating.
+    #[arg(long, env = "VAYLIX_HEALTHCHECK_KIND", value_enum, default_value_t = HealthcheckKind::Liveness)]
+    pub kind: HealthcheckKind,
+
+    /// Host used for the local healthcheck probe.
+    #[arg(long, env = "VAYLIX_HEALTHCHECK_HOST", default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Port used for the local healthcheck probe. Defaults to VAYLIX_PORT, then 9173.
+    #[arg(long, env = "VAYLIX_HEALTHCHECK_PORT")]
+    pub port: Option<u16>,
+
+    /// Username used when the readiness probe must authenticate.
+    #[arg(long, env = "VAYLIX_HEALTHCHECK_USER")]
+    pub user: Option<String>,
+
+    /// Password used when the readiness probe must authenticate.
+    #[arg(long, env = "VAYLIX_HEALTHCHECK_PASSWORD")]
+    pub password: Option<String>,
+
+    /// Probe timeout in milliseconds.
+    #[arg(long, env = "VAYLIX_HEALTHCHECK_TIMEOUT_MS", default_value_t = 2_000)]
+    pub timeout_ms: u64,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -337,7 +371,7 @@ pub enum PitrAction {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdminCommand, Args, PitrAction, StorageAction, WriteAckModeArg};
+    use super::{AdminCommand, Args, HealthcheckKind, PitrAction, StorageAction, WriteAckModeArg};
     use clap::Parser;
 
     #[test]
@@ -398,5 +432,37 @@ mod tests {
 
         let parsed = Args::try_parse_from(["vaylix", "--write-ack-mode", "majority"]).unwrap();
         assert_eq!(parsed.write_ack_mode, WriteAckModeArg::Replica);
+    }
+
+    #[test]
+    fn parses_healthcheck_subcommand() {
+        let parsed = Args::try_parse_from([
+            "vaylix",
+            "healthcheck",
+            "--kind",
+            "readiness",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "9174",
+            "--user",
+            "health",
+            "--password",
+            "secret",
+            "--timeout-ms",
+            "500",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            parsed.command,
+                Some(AdminCommand::Healthcheck(command))
+                if command.kind == HealthcheckKind::Readiness
+                    && command.host == "127.0.0.1"
+                    && command.port == Some(9174)
+                    && command.user.as_deref() == Some("health")
+                    && command.password.as_deref() == Some("secret")
+                    && command.timeout_ms == 500
+        ));
     }
 }
