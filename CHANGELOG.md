@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-01
+
+### Changed
+
+- Switched the runtime container image to a non-root distroless Debian 12 base while preserving `/var/lib/vaylix` ownership for out-of-the-box volume writes.
+- Added a Docker `HEALTHCHECK` that uses the `vaylix healthcheck` subcommand against the local framed protocol instead of requiring a second client binary or shell tooling.
+
+### Fixed
+
+- Fixed container readiness probes against auth-enabled servers by allowing `vaylix healthcheck --kind readiness` to authenticate with `VAYLIX_HEALTHCHECK_USER` / `VAYLIX_HEALTHCHECK_PASSWORD`, explicit CLI credentials, or the configured `VAYLIX_USER` / `VAYLIX_PASSWORD`.
+- Fixed Docker startup probe races by adding a healthcheck start period before failed probes count against the container.
+- Cleaned healthcheck error rendering so `SRV-039` reports the concrete failure once.
+
 ## [0.5.1] - 2026-06-01
 
 ### Changed
