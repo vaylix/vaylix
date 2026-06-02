@@ -117,6 +117,7 @@ The load generator prints a JSON report with:
 - operations per second
 - p50 / p95 / p99 latency in microseconds
 - benchmark parameters used for the run
+- up to eight distinct error samples when operations fail
 
 ## Command Profiles
 
@@ -229,7 +230,9 @@ Managed single-node baseline:
 ```bash
 cargo run -p bench -- managed-single-node \
   --server-bin target/debug/vaylix \
-  --duration-seconds 30
+  --duration-seconds 30 \
+  --wal-sync flush \
+  --write-ack-mode local
 ```
 
 Managed single-node with TLS:
@@ -256,7 +259,9 @@ Managed quorum baseline:
 ```bash
 cargo run -p bench -- managed-quorum \
   --server-bin target/debug/vaylix \
-  --duration-seconds 30
+  --duration-seconds 30 \
+  --wal-sync flush \
+  --write-ack-mode majority
 ```
 
 Managed quorum launcher behavior:
@@ -279,6 +284,36 @@ cargo run -p bench -- managed-single-node \
   --keyspace 128 \
   --value-size 64 \
   --tls
+```
+
+Durability matrix runs:
+
+```bash
+for mode in buffered flush sync; do
+  cargo run -p bench -- managed-single-node \
+    --server-bin target/release/vaylix \
+    --duration-seconds 10 \
+    --connections 16 \
+    --seed-keys 256 \
+    --keyspace 4096 \
+    --value-size 256 \
+    --workload set \
+    --wal-sync "$mode" \
+    --write-ack-mode local
+done
+```
+
+Quorum acknowledgement matrix:
+
+```bash
+for ack in majority all; do
+  cargo run -p bench -- managed-quorum-write-cost \
+    --server-bin target/release/vaylix \
+    --duration-seconds 10 \
+    --connections 16 \
+    --wal-sync flush \
+    --write-ack-mode "$ack"
+done
 ```
 
 ## Flamegraph
@@ -320,9 +355,9 @@ Then drive load from another shell with `vaylix-bench`.
 
 ## Local Valkey Comparison
 
-The `0.5.3` benchmark pass used Docker Hub image `valkey/valkey:8-alpine` for a local reference point. This is not an apples-to-apples product benchmark:
+Use Docker Hub image `valkey/valkey:8-alpine` for a local reference point when you need a rough external write/read target. This is not an apples-to-apples product benchmark:
 
-- Vaylix numbers use the Vaylix framed protocol, authentication, default compression negotiation, serialized engine worker, and WAL `flush`.
+- Vaylix numbers use the Vaylix framed protocol, authentication, negotiated compression, and the configured WAL/write-ack mode.
 - Valkey numbers use `valkey-benchmark` inside the Valkey container over RESP.
 - Valkey in-memory mode has no durable write guarantee. The AOF run with `appendfsync always` is closer to a durability-stressed write path, but still has different storage, protocol, and command semantics.
 
@@ -363,16 +398,4 @@ docker run -d --name valkey-compare valkey/valkey:8-alpine --save "" --appendonl
 docker exec valkey-compare valkey-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 10000 -c 4 -d 64 -r 256 --csv
 ```
 
-Observed local results:
-
-| Target | Mode | Operation | Throughput | p50 | p95 | p99 |
-| --- | --- | --- | ---: | ---: | ---: | ---: |
-| Vaylix | WAL flush | SET | 70.2 ops/s | 56.735 ms | 60.991 ms | 65.247 ms |
-| Vaylix | WAL flush | GET | 5,645.8 ops/s | 0.693 ms | 0.795 ms | 0.894 ms |
-| Vaylix | WAL flush | mixed | 232.2 ops/s | 14.375 ms | 56.799 ms | 58.431 ms |
-| Valkey | in-memory | SET | 89,285.71 ops/s | 0.039 ms | 0.055 ms | 0.063 ms |
-| Valkey | in-memory | GET | 84,033.61 ops/s | 0.039 ms | 0.055 ms | 0.055 ms |
-| Valkey | AOF fsync always | SET | 8,285.00 ops/s | 0.471 ms | 0.567 ms | 0.727 ms |
-| Valkey | AOF fsync always | GET | 156,250.00 ops/s | 0.023 ms | 0.031 ms | 0.047 ms |
-
-The main signal is not that these systems are equivalent; they are not. The useful signal is that Vaylix write throughput is currently dominated by its serialized durable write path and should be treated as the first major performance target before marketing benchmark claims.
+Do not commit local comparison numbers unless a release explicitly asks for them. Hardware, filesystem, container runtime, auth state, durability mode, and replication topology materially change the result.

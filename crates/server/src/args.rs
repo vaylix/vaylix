@@ -116,6 +116,10 @@ pub struct Args {
     #[arg(long, env = "VAYLIX_DISABLE_COMPRESSION", default_value_t = false)]
     pub disable_compression: bool,
 
+    /// Emit one connection log line for every validated request.
+    #[arg(long, env = "VAYLIX_LOG_REQUESTS", default_value_t = false)]
+    pub log_requests: bool,
+
     /// Maximum request payload bytes accepted per command after framing.
     #[arg(
         long,

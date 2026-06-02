@@ -1,5 +1,7 @@
 use crate::constants::MAX_FRAME_LEN;
 
+pub const DEFAULT_COMPRESSION_THRESHOLD_BYTES: usize = 1024;
+
 /// Frame compression modes supported by the transport layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompressionMode {
@@ -37,7 +39,7 @@ impl Default for CodecOptions {
     fn default() -> Self {
         Self {
             compression: CompressionMode::Zstd,
-            compression_threshold_bytes: 0,
+            compression_threshold_bytes: DEFAULT_COMPRESSION_THRESHOLD_BYTES,
             max_frame_len: MAX_FRAME_LEN,
             max_decompressed_frame_len: MAX_FRAME_LEN,
         }

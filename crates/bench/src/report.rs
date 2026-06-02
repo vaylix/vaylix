@@ -13,6 +13,8 @@ pub struct BenchmarkReport {
     pub failed_operations: u64,
     pub operations_per_second: f64,
     pub latency_us: LatencySummary,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub error_samples: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

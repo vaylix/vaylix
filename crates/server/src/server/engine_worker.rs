@@ -1,13 +1,16 @@
-use std::thread;
+use std::{collections::VecDeque, thread, time::Duration};
 
 use command::Command;
-use engine::{Engine, StorageEngine, TransactionResult};
+use engine::{Engine, StorageEngine, TransactionResult, WalSyncPolicy};
 use tokio::sync::{mpsc, oneshot};
 use transport::Response;
 use uuid::Uuid;
 
 use super::execute_command;
 use crate::error::{Result, ServerError};
+
+const MAX_WRITE_BATCH: usize = 64;
+const SYNC_WRITE_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
 enum EngineRequest {
     Execute {
@@ -73,6 +76,13 @@ enum EngineRequest {
     },
 }
 
+struct PendingExecute {
+    request_id: Uuid,
+    consensus_term: u64,
+    command: Command,
+    respond_to: oneshot::Sender<Result<ExecuteResult>>,
+}
+
 pub(super) struct ExecuteResult {
     pub(super) response: Response,
     pub(super) last_applied_sequence: u64,
@@ -96,7 +106,11 @@ impl EngineHandle {
     pub(super) fn new(mut engine: Engine) -> Self {
         let (sender, mut receiver) = mpsc::channel(256);
         thread::spawn(move || {
-            while let Some(request) = receiver.blocking_recv() {
+            let mut pending = VecDeque::new();
+            loop {
+                let Some(request) = pending.pop_front().or_else(|| receiver.blocking_recv()) else {
+                    break;
+                };
                 match request {
                     EngineRequest::Execute {
                         request_id,
@@ -104,19 +118,17 @@ impl EngineHandle {
                         command,
                         respond_to,
                     } => {
-                        engine.set_consensus_term(consensus_term);
-                        let result = execute_command(&mut engine, request_id, command).and_then(
-                            |response| {
-                                let last_applied = last_applied_state(&engine)?;
-                                Ok(ExecuteResult {
-                                    response,
-                                    last_applied_sequence: last_applied.last_applied_sequence,
-                                    last_applied_term: last_applied.last_applied_term,
-                                    last_applied_checksum: last_applied.last_applied_checksum,
-                                })
-                            },
-                        );
-                        let _ = respond_to.send(result);
+                        let execute = PendingExecute {
+                            request_id,
+                            consensus_term,
+                            command,
+                            respond_to,
+                        };
+                        if is_batchable_engine_write(&execute.command) {
+                            process_write_batch(&mut engine, execute, &mut receiver, &mut pending);
+                        } else {
+                            process_single_execute(&mut engine, execute);
+                        }
                     }
                     EngineRequest::ExecuteBatch {
                         request_id: _request_id,
@@ -426,8 +438,150 @@ impl EngineHandle {
     }
 }
 
+fn process_single_execute(engine: &mut Engine, execute: PendingExecute) {
+    engine.set_consensus_term(execute.consensus_term);
+    let result =
+        execute_command(engine, execute.request_id, execute.command).and_then(|response| {
+            let last_applied = last_applied_state(engine)?;
+            Ok(ExecuteResult {
+                response,
+                last_applied_sequence: last_applied.last_applied_sequence,
+                last_applied_term: last_applied.last_applied_term,
+                last_applied_checksum: last_applied.last_applied_checksum,
+            })
+        });
+    let _ = execute.respond_to.send(result);
+}
+
+fn process_write_batch(
+    engine: &mut Engine,
+    first: PendingExecute,
+    receiver: &mut mpsc::Receiver<EngineRequest>,
+    pending: &mut VecDeque<EngineRequest>,
+) {
+    let consensus_term = first.consensus_term;
+    let mut batch = vec![first];
+
+    drain_write_batch(receiver, pending, consensus_term, &mut batch);
+    if engine.wal_sync_policy() == WalSyncPolicy::SyncData && batch.len() < MAX_WRITE_BATCH {
+        thread::sleep(SYNC_WRITE_BATCH_WINDOW);
+        drain_write_batch(receiver, pending, consensus_term, &mut batch);
+    }
+
+    engine.set_consensus_term(consensus_term);
+    let commands = batch
+        .iter()
+        .map(|execute| execute.command.clone())
+        .collect::<Vec<_>>();
+    match engine
+        .execute_command_batch(&commands)
+        .map_err(ServerError::from)
+    {
+        Ok(results) => {
+            for (execute, result) in batch.into_iter().zip(results) {
+                let response = render_transaction_result(execute.request_id, result.result)
+                    .and_then(|response| {
+                        let last_applied =
+                            applied_state_for_sequence(engine, result.last_applied_sequence)?;
+                        Ok(ExecuteResult {
+                            response,
+                            last_applied_sequence: last_applied.last_applied_sequence,
+                            last_applied_term: last_applied.last_applied_term,
+                            last_applied_checksum: last_applied.last_applied_checksum,
+                        })
+                    });
+                let _ = execute.respond_to.send(response);
+            }
+        }
+        Err(err) => {
+            let mut batch = batch.into_iter();
+            if let Some(first) = batch.next() {
+                let _ = first.respond_to.send(Err(err));
+            }
+            for execute in batch {
+                let _ = execute
+                    .respond_to
+                    .send(Err(ServerError::EngineWorkerClosed));
+            }
+        }
+    }
+}
+
+fn drain_write_batch(
+    receiver: &mut mpsc::Receiver<EngineRequest>,
+    pending: &mut VecDeque<EngineRequest>,
+    consensus_term: u64,
+    batch: &mut Vec<PendingExecute>,
+) {
+    while batch.len() < MAX_WRITE_BATCH {
+        match receiver.try_recv() {
+            Ok(EngineRequest::Execute {
+                request_id,
+                consensus_term: request_term,
+                command,
+                respond_to,
+            }) if request_term == consensus_term && is_batchable_engine_write(&command) => {
+                batch.push(PendingExecute {
+                    request_id,
+                    consensus_term: request_term,
+                    command,
+                    respond_to,
+                });
+            }
+            Ok(other) => {
+                pending.push_back(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn is_batchable_engine_write(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Set { .. }
+            | Command::SetNx { .. }
+            | Command::GetDel { .. }
+            | Command::GetEx {
+                expiration: Some(_),
+                ..
+            }
+            | Command::GetEx { persist: true, .. }
+            | Command::MSet { .. }
+            | Command::Delete { .. }
+            | Command::Expire { .. }
+            | Command::Persist { .. }
+            | Command::Rename { .. }
+            | Command::RenameNx { .. }
+            | Command::Clear
+    )
+}
+
+fn render_transaction_result(request_id: Uuid, result: TransactionResult) -> Result<Response> {
+    match result {
+        TransactionResult::Ok => Ok(Response::ok(request_id)),
+        TransactionResult::NotFound => Ok(Response::not_found(request_id)),
+        TransactionResult::Value(value) => Ok(Response::value(request_id, &value)?),
+        TransactionResult::Boolean(value) => Ok(Response::boolean(request_id, value)),
+        TransactionResult::Count(value) => Ok(Response::count(request_id, value)),
+        TransactionResult::Integer(value) => Ok(Response::integer(request_id, value)),
+        TransactionResult::Entries(entries) => Ok(Response::entries(request_id, &entries)?),
+        TransactionResult::Strings(values) => Ok(Response::strings(request_id, &values)?),
+        TransactionResult::Scan(scan) => {
+            Ok(Response::scan(request_id, scan.next_cursor, &scan.keys)?)
+        }
+    }
+}
+
 fn last_applied_state(engine: &Engine) -> Result<LogAppendResult> {
-    let last_applied_sequence = engine.last_applied_sequence();
+    applied_state_for_sequence(engine, engine.last_applied_sequence())
+}
+
+fn applied_state_for_sequence(
+    engine: &Engine,
+    last_applied_sequence: u64,
+) -> Result<LogAppendResult> {
     let last_applied_term = engine
         .wal_entry_term(last_applied_sequence)
         .map_err(ServerError::from)?;

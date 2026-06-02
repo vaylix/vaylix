@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-02
+
+### Added
+
+- Added stateful WAL writer support that keeps the active segment open, appends batches, rotates safely across batch boundaries, and pays the configured flush/sync boundary once per batch.
+- Added server-side write batching for eligible single-command mutations, including bounded draining and group commit for `sync` durability mode.
+- Added managed benchmark controls for WAL durability mode and write acknowledgement mode so single-node and quorum matrices can be run from `vaylix-bench`.
+- Added bounded benchmark error samples so failed load profiles report representative command-level failure reasons.
+
+### Changed
+
+- Reduced standalone write-path lock scope by skipping HA apply-lock acquisition when the node is explicitly running in standalone mode.
+- Made per-request server logging opt-in through `--log-requests` / `VAYLIX_LOG_REQUESTS` instead of logging every request on the hot path by default.
+- Raised the default transport compression threshold so small request/response frames are not compressed unnecessarily.
+- Reduced storage encryption hot-path cost by deriving stable per-key salts from the storage key UUID and secret while keeping backwards-compatible decryption for existing random-salt envelopes.
+- Reduced rollback allocation for normal WAL application by tracking touched keys instead of cloning the full state for every entry.
+
+### Fixed
+
+- Fixed batched command execution so generated WAL entries advance engine metadata and cannot reuse sequence numbers across batches.
+- Fixed in-memory WAL cache replacement to reject conflicting duplicate sequence entries instead of allowing ambiguous replication state.
+- Fixed benchmark backup/restore and read profiles so valid operational outcomes are reported clearly and failed profiles include bounded diagnostics.
+
 ## [0.5.3] - 2026-06-02
 
 ### Added

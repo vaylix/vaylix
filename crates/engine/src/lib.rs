@@ -9,9 +9,9 @@ pub use config::{
     StorageKeyring, WalSyncPolicy,
 };
 pub use engine::{
-    Engine, EngineMetadata, EngineState, Expiration, LogicalBackup, LogicalBackupEntry,
-    PointInTimeTarget, ReplicationSnapshot, ScanPage, SetCondition, SetOptions, SetOutcome,
-    StorageEngine, StorageInspection, TransactionResult,
+    CommandBatchResult, Engine, EngineMetadata, EngineState, Expiration, LogicalBackup,
+    LogicalBackupEntry, PointInTimeTarget, ReplicationSnapshot, ScanPage, SetCondition, SetOptions,
+    SetOutcome, StorageEngine, StorageInspection, TransactionResult,
 };
 pub use error::{EngineError, Result};
 pub use paths::{DEFAULT_DATA_DIR, Paths};

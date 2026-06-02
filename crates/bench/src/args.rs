@@ -42,6 +42,40 @@ pub enum WorkloadKind {
     QuorumWriteCost,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ManagedWalSync {
+    Buffered,
+    Flush,
+    Sync,
+}
+
+impl ManagedWalSync {
+    pub fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Buffered => "buffered",
+            Self::Flush => "flush",
+            Self::Sync => "sync",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
+pub enum ManagedWriteAckMode {
+    Local,
+    Majority,
+    All,
+}
+
+impl ManagedWriteAckMode {
+    pub fn as_cli_value(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Majority => "majority",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(ClapArgs, Debug, Clone, Default)]
 pub struct TlsArgs {
     #[arg(long, env = "VAYLIX_BENCH_TLS", default_value_t = false)]
@@ -181,6 +215,25 @@ pub struct ManagedArgs {
 
     #[arg(long, env = "VAYLIX_BENCH_VALUE_SIZE")]
     pub value_size: Option<usize>,
+
+    #[arg(long, env = "VAYLIX_BENCH_WORKLOAD", value_enum)]
+    pub workload: Option<WorkloadKind>,
+
+    #[arg(
+        long,
+        env = "VAYLIX_BENCH_WAL_SYNC",
+        value_enum,
+        default_value_t = ManagedWalSync::Flush
+    )]
+    pub wal_sync: ManagedWalSync,
+
+    #[arg(
+        long,
+        env = "VAYLIX_BENCH_WRITE_ACK_MODE",
+        value_enum,
+        default_value_t = ManagedWriteAckMode::Majority
+    )]
+    pub write_ack_mode: ManagedWriteAckMode,
 }
 
 #[derive(ClapArgs, Debug, Clone)]

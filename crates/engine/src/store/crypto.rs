@@ -5,6 +5,8 @@ use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use crc32fast::hash;
 use rand::random;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
 
 const ENVELOPE_MAGIC: &[u8; 4] = b"VXE1";
@@ -14,6 +16,11 @@ const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
 const KEY_ID_LEN: usize = 16;
+
+type DerivedKeyCacheKey = (Uuid, String);
+type DerivedKeyCache = HashMap<DerivedKeyCacheKey, [u8; KEY_LEN]>;
+
+static DERIVED_KEY_CACHE: OnceLock<Mutex<DerivedKeyCache>> = OnceLock::new();
 
 fn derive_key(secret: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; KEY_LEN]> {
     let mut key = [0_u8; KEY_LEN];
@@ -30,11 +37,42 @@ fn derive_key(secret: &str, salt: &[u8; SALT_LEN]) -> Result<[u8; KEY_LEN]> {
     Ok(key)
 }
 
+fn stable_salt(key: &StorageKey) -> [u8; SALT_LEN] {
+    *key.id.as_bytes()
+}
+
+fn derive_stable_key(key: &StorageKey, salt: &[u8; SALT_LEN]) -> Result<[u8; KEY_LEN]> {
+    if *salt != stable_salt(key) {
+        return derive_key(&key.secret, salt);
+    }
+
+    let cache = DERIVED_KEY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(derived_key) = cache
+        .lock()
+        .map_err(|_| EngineError::CryptoFailure {
+            resource: "key cache",
+        })?
+        .get(&(key.id, key.secret.clone()))
+        .copied()
+    {
+        return Ok(derived_key);
+    }
+
+    let derived_key = derive_key(&key.secret, salt)?;
+    cache
+        .lock()
+        .map_err(|_| EngineError::CryptoFailure {
+            resource: "key cache",
+        })?
+        .insert((key.id, key.secret.clone()), derived_key);
+    Ok(derived_key)
+}
+
 /// Encrypts plaintext into a versioned, self-describing storage envelope.
 pub fn encrypt(key: &StorageKey, resource: &'static str, plaintext: &[u8]) -> Result<Vec<u8>> {
-    let salt = random::<[u8; SALT_LEN]>();
+    let salt = stable_salt(key);
     let nonce_bytes = random::<[u8; NONCE_LEN]>();
-    let derived_key = derive_key(&key.secret, &salt)?;
+    let derived_key = derive_stable_key(key, &salt)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&derived_key));
     let ciphertext = cipher
         .encrypt(
@@ -122,7 +160,7 @@ pub fn decrypt(
     let key = keyring
         .get(key_id)
         .ok_or(EngineError::UnsupportedStorageFormat { resource })?;
-    let derived_key = derive_key(&key.secret, &salt)?;
+    let derived_key = derive_stable_key(key, &salt)?;
     let cipher = ChaCha20Poly1305::new(Key::from_slice(&derived_key));
     cipher
         .decrypt(

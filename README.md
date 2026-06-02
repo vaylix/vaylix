@@ -17,7 +17,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.5.3`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.6.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -57,6 +57,7 @@ Useful runtime environment variables for containers:
 - `VAYLIX_TLS_KEY`
 - `VAYLIX_TLS_CLIENT_CA`
 - `VAYLIX_WAL_SYNC`
+- `VAYLIX_LOG_REQUESTS`
 - `VAYLIX_WAL_SEGMENT_SIZE_BYTES`
 - `VAYLIX_WAL_RETAIN_SEGMENTS`
 - `VAYLIX_SNAPSHOT_INTERVAL_SECONDS`
@@ -210,11 +211,12 @@ cargo audit
 - Development credentials default to `vaylix / vaylix`; production deployments should override them.
 - When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the env-managed bootstrap admin on startup. Changing those startup credentials rotates that admin and retires the previous env-managed admin.
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
+- Request-level server logging is disabled by default on the hot path. Enable `--log-requests` / `VAYLIX_LOG_REQUESTS=true` only when request tracing is needed.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
 - TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.
 - `METRICS` uses an OpenTelemetry-aligned metric contract under the `vaylix.*` namespace, and `METRICS PROM` exposes Prometheus-safe names translated from that contract.
 - Backups created with `BACKUP TO <path>` are sandboxed under `--backup-dir` / `VAYLIX_BACKUP_DIR`, defaulting to `<data-dir>/backups`.
-- WAL is segmented under `<data-dir>/wal`, snapshots no longer discard all retained WAL history, and PITR restore is currently an offline operation that writes a new target data directory.
+- WAL is segmented under `<data-dir>/wal`. The 0.6.x write path keeps the active WAL segment open and can group concurrent writes behind the configured `VAYLIX_WAL_SYNC` durability boundary without acknowledging a write before that boundary completes.
 - `maintenance on` switches the node into persisted read-only admin mode until `maintenance off`.
 - Audit JSONL records are SHA-256 hash chained and verified on startup. This is tamper-evident logging, not non-repudiation without external anchoring.
 - HA writes should use the default quorum acknowledgement mode. `local` acknowledgement is for explicitly weaker development or disaster-recovery workflows.

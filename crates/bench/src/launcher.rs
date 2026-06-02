@@ -41,7 +41,9 @@ impl ManagedCluster {
             password: &args.password,
             tls: tls.as_ref(),
             peers: &[],
-            role: "leader",
+            role: "standalone",
+            wal_sync: args.wal_sync.as_cli_value(),
+            write_ack_mode: args.write_ack_mode.as_cli_value(),
         })
         .await?;
         let addr = format!("127.0.0.1:{port}");
@@ -97,6 +99,8 @@ impl ManagedCluster {
                 tls: tls.as_ref(),
                 peers: &peers,
                 role: "leader",
+                wal_sync: args.wal_sync.as_cli_value(),
+                write_ack_mode: args.write_ack_mode.as_cli_value(),
             })
             .await?,
         );
@@ -111,6 +115,8 @@ impl ManagedCluster {
                 tls: tls.as_ref(),
                 peers: &peers,
                 role: "follower",
+                wal_sync: args.wal_sync.as_cli_value(),
+                write_ack_mode: args.write_ack_mode.as_cli_value(),
             })
             .await?,
         );
@@ -125,6 +131,8 @@ impl ManagedCluster {
                 tls: tls.as_ref(),
                 peers: &peers,
                 role: "follower",
+                wal_sync: args.wal_sync.as_cli_value(),
+                write_ack_mode: args.write_ack_mode.as_cli_value(),
             })
             .await?,
         );
@@ -250,10 +258,14 @@ struct SpawnServerConfig<'a> {
     tls: Option<&'a GeneratedCerts>,
     peers: &'a [String],
     role: &'a str,
+    wal_sync: &'a str,
+    write_ack_mode: &'a str,
 }
 
 async fn spawn_server(config: SpawnServerConfig<'_>) -> Result<Child> {
     fs::create_dir_all(config.root)?;
+    let stdout = fs::File::create(config.root.join("stdout.log"))?;
+    let stderr = fs::File::create(config.root.join("stderr.log"))?;
     let mut command = Command::new(config.server_bin);
     command
         .arg("--bind")
@@ -266,16 +278,24 @@ async fn spawn_server(config: SpawnServerConfig<'_>) -> Result<Child> {
         .arg(config.username)
         .arg("--password")
         .arg(config.password)
+        .arg("--requests-per-second")
+        .arg("1000000")
+        .arg("--request-burst")
+        .arg("1000000")
+        .arg("--slow-command-threshold-ms")
+        .arg("0")
         .arg("--node-id")
         .arg(config.node_id)
         .arg("--replication-role")
         .arg(config.role)
         .arg("--replication-advertise-addr")
         .arg(format!("127.0.0.1:{}", config.port))
+        .arg("--wal-sync")
+        .arg(config.wal_sync)
         .arg("--write-ack-mode")
-        .arg("majority")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .arg(config.write_ack_mode)
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
     if !config.peers.is_empty() {
         command.arg("--cluster-peers").arg(config.peers.join(","));
     }

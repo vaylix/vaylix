@@ -1,4 +1,4 @@
-use crate::config::EngineOptions;
+use crate::config::{EngineOptions, WalSyncPolicy};
 use crate::engine::{
     EngineState, Expiration, LogicalBackup, LogicalBackupEntry, ScanPage, SetCondition, SetOptions,
     SetOutcome, StorageEngine, TransactionResult,
@@ -6,7 +6,7 @@ use crate::engine::{
 use crate::error::Result;
 use crate::paths::Paths;
 use crate::store::{
-    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, WalReplayTarget, append,
+    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, WalReplayTarget, WalWriter,
     create_active_segment, deserialize, inspect_wal, keyring, load, load_manifest,
     migrate_legacy_wal, prune_sealed_segments, replay, replay_until, save, save_keyring,
     save_manifest, seal_active, serialize,
@@ -42,6 +42,12 @@ pub struct StorageInspection {
     pub wal_size_bytes: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandBatchResult {
+    pub result: TransactionResult,
+    pub last_applied_sequence: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointInTimeTarget {
     Sequence(u64),
@@ -53,6 +59,7 @@ pub struct Engine {
     state: EngineState,
     paths: Paths,
     options: EngineOptions,
+    wal_writer: WalWriter,
     wal_entries: Vec<WalEntry>,
     current_consensus_term: u64,
     recovery_duration_ms: u64,
@@ -118,11 +125,18 @@ impl Engine {
         for entry in &wal_entries {
             state.apply_entry(entry)?;
         }
+        let wal_writer = WalWriter::open(
+            &paths.wal_dir,
+            options.wal_sync,
+            options.wal_segment_size_bytes,
+            state.metadata.last_applied_sequence.saturating_add(1),
+        )?;
 
         Ok(Self {
             state,
             paths,
             options,
+            wal_writer,
             wal_entries,
             current_consensus_term: 0,
             recovery_duration_ms: now_millis().saturating_sub(recovery_started_at_ms),
@@ -188,6 +202,10 @@ impl Engine {
         self.state.metadata.last_applied_sequence
     }
 
+    pub fn wal_sync_policy(&self) -> WalSyncPolicy {
+        self.options.wal_sync
+    }
+
     pub fn set_consensus_term(&mut self, term: u64) {
         self.current_consensus_term = term;
     }
@@ -198,15 +216,12 @@ impl Engine {
         limit: usize,
         max_sequence: Option<u64>,
     ) -> Result<Vec<WalEntry>> {
-        let mut entries = self
-            .wal_entries
-            .iter()
-            .filter(|entry| {
-                entry.sequence > after_sequence
-                    && max_sequence.is_none_or(|max| entry.sequence <= max)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut entries = Vec::new();
+        for entry in self.wal_entries.iter().filter(|entry| {
+            entry.sequence > after_sequence && max_sequence.is_none_or(|max| entry.sequence <= max)
+        }) {
+            push_unique_wal_entry(&mut entries, entry.clone())?;
+        }
         if limit > 0 && entries.len() > limit {
             entries.truncate(limit);
         }
@@ -237,6 +252,7 @@ impl Engine {
             fs::remove_dir_all(&self.paths.wal_dir)?;
         }
         create_active_segment(&self.paths.wal_dir, sequence.saturating_add(1))?;
+        self.reset_wal_writer(sequence.saturating_add(1))?;
         self.wal_entries.clear();
         save_manifest(
             &Manifest {
@@ -257,6 +273,7 @@ impl Engine {
 
     pub fn apply_replication_entries(&mut self, entries: &[WalEntry]) -> Result<u64> {
         let mut last_applied = self.state.metadata.last_applied_sequence;
+        let mut staged = self.state.clone();
         for entry in entries {
             let expected = last_applied.saturating_add(1);
             if entry.sequence != expected {
@@ -265,17 +282,13 @@ impl Engine {
                     entry.sequence
                 )));
             }
-            append(
-                entry,
-                &self.paths.wal_dir,
-                self.options.wal_sync,
-                self.options.keyring.as_ref(),
-                self.options.wal_segment_size_bytes,
-            )?;
-            self.state.apply_entry(entry)?;
-            self.wal_entries.push(entry.clone());
+            staged.apply_entry(entry)?;
             last_applied = entry.sequence;
         }
+        self.wal_writer
+            .append_batch(entries, self.options.keyring.as_ref())?;
+        self.state = staged;
+        self.wal_entries.extend(entries.iter().cloned());
         Ok(last_applied)
     }
 
@@ -295,12 +308,14 @@ impl Engine {
             )));
         }
 
-        let mut retained = self
+        let mut retained = Vec::new();
+        for entry in self
             .wal_entries
             .iter()
             .filter(|entry| entry.sequence <= prefix_sequence)
-            .cloned()
-            .collect::<Vec<_>>();
+        {
+            push_unique_wal_entry(&mut retained, entry.clone())?;
+        }
 
         if let Some(last_retained) = retained.last()
             && last_retained.sequence != prefix_sequence
@@ -316,7 +331,34 @@ impl Engine {
             )));
         }
 
-        for (idx, entry) in entries.iter().enumerate() {
+        let mut replacement_entries = Vec::new();
+        for entry in entries {
+            if entry.sequence <= prefix_sequence {
+                if entry.sequence > baseline_sequence {
+                    let Some(local_entry) = retained
+                        .iter()
+                        .find(|candidate| candidate.sequence == entry.sequence)
+                    else {
+                        return Err(crate::EngineError::InvalidStorageOperation(format!(
+                            "replication replacement overlap missing retained sequence {}",
+                            entry.sequence
+                        )));
+                    };
+                    if local_entry.term != entry.term
+                        || local_entry.checksum()? != entry.checksum()?
+                    {
+                        return Err(crate::EngineError::InvalidStorageOperation(format!(
+                            "replication replacement overlap mismatch at sequence {}",
+                            entry.sequence
+                        )));
+                    }
+                }
+                continue;
+            }
+            push_unique_wal_entry(&mut replacement_entries, entry.clone())?;
+        }
+
+        for (idx, entry) in replacement_entries.iter().enumerate() {
             let expected = prefix_sequence.saturating_add(idx as u64).saturating_add(1);
             if entry.sequence != expected {
                 return Err(crate::EngineError::InvalidStorageOperation(format!(
@@ -325,7 +367,7 @@ impl Engine {
                 )));
             }
         }
-        retained.extend(entries.iter().cloned());
+        retained.extend(replacement_entries);
 
         let mut rebuilt_state = snapshot_state;
         for entry in &retained {
@@ -346,6 +388,11 @@ impl Engine {
                 self.options.wal_segment_size_bytes,
             )?;
         }
+        let next_sequence = retained
+            .last()
+            .map(|entry| entry.sequence.saturating_add(1))
+            .unwrap_or_else(|| baseline_sequence.saturating_add(1));
+        self.reset_wal_writer(next_sequence)?;
 
         self.state = rebuilt_state;
         self.wal_entries = retained;
@@ -538,15 +585,20 @@ impl Engine {
 
     fn append_and_apply(&mut self, operations: Vec<WalOperation>) -> Result<()> {
         let entry = self.next_entry(operations);
-        append(
-            &entry,
-            &self.paths.wal_dir,
-            self.options.wal_sync,
-            self.options.keyring.as_ref(),
-            self.options.wal_segment_size_bytes,
-        )?;
+        self.wal_writer
+            .append(&entry, self.options.keyring.as_ref())?;
         self.state.apply_entry(&entry)?;
         self.wal_entries.push(entry);
+        Ok(())
+    }
+
+    fn reset_wal_writer(&mut self, start_sequence: u64) -> Result<()> {
+        self.wal_writer = WalWriter::open(
+            &self.paths.wal_dir,
+            self.options.wal_sync,
+            self.options.wal_segment_size_bytes,
+            start_sequence,
+        )?;
         Ok(())
     }
 
@@ -712,16 +764,59 @@ impl Engine {
         }
 
         let entry = self.next_entry(operations);
-        append(
-            &entry,
-            &self.paths.wal_dir,
-            self.options.wal_sync,
-            self.options.keyring.as_ref(),
-            self.options.wal_segment_size_bytes,
-        )?;
+        self.wal_writer
+            .append(&entry, self.options.keyring.as_ref())?;
         self.state.apply_entry(&entry)?;
         self.wal_entries.push(entry);
 
+        Ok(results)
+    }
+
+    /// Executes independent data commands as one WAL flush group.
+    ///
+    /// Each command that produces mutations still receives its own WAL sequence,
+    /// preserving replication identity and command-level commit accounting.
+    pub fn execute_command_batch(
+        &mut self,
+        commands: &[Command],
+    ) -> Result<Vec<CommandBatchResult>> {
+        let now_ms = self.now();
+        self.state.purge_expired(now_ms);
+        let mut working = self.state.clone();
+        let mut entries = Vec::new();
+        let mut results = Vec::with_capacity(commands.len());
+        let mut next_sequence = self.state.metadata.last_applied_sequence.saturating_add(1);
+        let mut visible_sequence = self.state.metadata.last_applied_sequence;
+
+        for command in commands {
+            let mut operations = Vec::new();
+            let result =
+                self.evaluate_transaction_command(&mut working, now_ms, &mut operations, command)?;
+            if !operations.is_empty() {
+                let entry = WalEntry::new(
+                    next_sequence,
+                    self.current_consensus_term,
+                    now_ms,
+                    operations,
+                );
+                working.metadata.last_applied_sequence = entry.sequence;
+                working.metadata.updated_at_ms = entry.created_at_ms;
+                visible_sequence = next_sequence;
+                next_sequence = next_sequence.saturating_add(1);
+                entries.push(entry);
+            }
+            results.push(CommandBatchResult {
+                result,
+                last_applied_sequence: visible_sequence,
+            });
+        }
+
+        if !entries.is_empty() {
+            self.wal_writer
+                .append_batch(&entries, self.options.keyring.as_ref())?;
+            self.wal_entries.extend(entries);
+        }
+        self.state = working;
         Ok(results)
     }
 
@@ -794,7 +889,9 @@ impl Engine {
                 };
                 if !allowed {
                     return Ok(if options.return_previous {
-                        TransactionResult::NotFound
+                        previous
+                            .map(TransactionResult::Value)
+                            .unwrap_or(TransactionResult::NotFound)
                     } else if options.condition.is_some() {
                         TransactionResult::Boolean(false)
                     } else {
@@ -1090,6 +1187,28 @@ impl Engine {
             )),
         }
     }
+}
+
+fn push_unique_wal_entry(entries: &mut Vec<WalEntry>, entry: WalEntry) -> Result<()> {
+    if let Some(last) = entries.last() {
+        if entry.sequence < last.sequence {
+            return Err(crate::EngineError::InvalidStorageOperation(format!(
+                "non-monotonic in-memory WAL cache: previous {}, got {}",
+                last.sequence, entry.sequence
+            )));
+        }
+        if entry.sequence == last.sequence {
+            if entry.term != last.term || entry.checksum()? != last.checksum()? {
+                return Err(crate::EngineError::InvalidStorageOperation(format!(
+                    "conflicting duplicate in-memory WAL entry at sequence {}",
+                    entry.sequence
+                )));
+            }
+            return Ok(());
+        }
+    }
+    entries.push(entry);
+    Ok(())
 }
 
 impl StorageEngine for Engine {
@@ -1478,9 +1597,16 @@ impl StorageEngine for Engine {
             self.options.keyring.as_ref(),
         )?;
 
+        self.wal_writer.close_active()?;
         let _ = seal_active(&self.paths.wal_dir, self.options.keyring.as_ref())?;
         let active_wal_start_sequence = sequence.saturating_add(1);
         create_active_segment(&self.paths.wal_dir, active_wal_start_sequence)?;
+        self.wal_writer = WalWriter::open(
+            &self.paths.wal_dir,
+            self.options.wal_sync,
+            self.options.wal_segment_size_bytes,
+            active_wal_start_sequence,
+        )?;
         let _ = prune_sealed_segments(&self.paths.wal_dir, self.options.wal_retain_segments)?;
         let wal_report = inspect_wal(&self.paths.wal_dir).ok();
         let oldest_retained_sequence = wal_report
@@ -1837,6 +1963,36 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_before_first_write_keeps_wal_writer_on_visible_active_segment() {
+        let (mut engine, root) = engine();
+
+        engine.snapshot().unwrap();
+        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.snapshot().unwrap();
+
+        let wal_report = crate::inspect_wal(&root.join("wal")).unwrap();
+        assert_eq!(wal_report.active_segment_count, 1);
+        assert!(
+            wal_report.sealed_segment_count >= 1,
+            "expected a sealed segment after write and snapshot, got {wal_report:?}"
+        );
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let mut reloaded = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn wal_entries_since_capped_hides_uncommitted_tail() {
         let (mut engine, root) = engine();
 
@@ -1858,6 +2014,40 @@ mod tests {
             full.iter().map(|entry| entry.sequence).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn command_batches_advance_metadata_sequence() {
+        let (mut engine, root) = engine();
+
+        let first = engine
+            .execute_command_batch(&[Command::Set {
+                key: "batch:1".to_string(),
+                value: "one".to_string(),
+                options: command::SetOptions::default(),
+            }])
+            .unwrap();
+        assert_eq!(first[0].last_applied_sequence, 1);
+
+        let second = engine
+            .execute_command_batch(&[Command::Set {
+                key: "batch:2".to_string(),
+                value: "two".to_string(),
+                options: command::SetOptions::default(),
+            }])
+            .unwrap();
+        assert_eq!(second[0].last_applied_sequence, 2);
+        assert_eq!(engine.state().metadata.last_applied_sequence, 2);
+
+        let sequences = engine
+            .wal_entries_since(0, 32)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.sequence)
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
 
         fs::remove_dir_all(root).ok();
     }
