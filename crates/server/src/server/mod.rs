@@ -283,8 +283,6 @@ impl Server {
                             let metrics = Arc::clone(&metrics);
                             let runtime = runtime.clone();
 
-                            log_connection_event("INFO", connection_id, Some(peer_addr), "accepted client");
-
                             tokio::spawn(async move {
                                 let _permit = permit;
                                 let result = if let Some(tls_state) = runtime.tls_state.clone() {
@@ -318,7 +316,11 @@ impl Server {
                                 };
 
                                 match result {
-                                    Ok(()) => log_connection_event("INFO", connection_id, Some(peer_addr), "client disconnected"),
+                                    Ok(outcome) => {
+                                        if !outcome.suppress_info_logs {
+                                            log_connection_event("INFO", connection_id, Some(peer_addr), "client disconnected");
+                                        }
+                                    }
                                     Err(err) => log_connection_event("ERROR", connection_id, Some(peer_addr), &format!("[{}] {}: {err}", err.code(), err.name())),
                                 }
 
@@ -1296,6 +1298,17 @@ async fn rollback_uncommitted_tail(
     Ok(())
 }
 
+fn replacement_entries_after(
+    prefix_sequence: u64,
+    entries: &[engine::WalEntry],
+) -> Vec<engine::WalEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.sequence > prefix_sequence)
+        .cloned()
+        .collect()
+}
+
 async fn send_vote_request(
     runtime: ServerRuntimeConfig,
     member: &ClusterMember,
@@ -1406,6 +1419,10 @@ async fn negotiate_replication_transport(stream: &mut TcpStream) -> Result<Codec
     transport::client_options_from_server_hello(&server_hello).map_err(ServerError::from)
 }
 
+struct ClientOutcome {
+    suppress_info_logs: bool,
+}
+
 async fn authenticate_replication_peer(
     stream: &mut TcpStream,
     transport: CodecOptions,
@@ -1433,30 +1450,40 @@ async fn handle_client<S>(
     peer_addr: Option<SocketAddr>,
     mut stream: S,
     mut shutdown: watch::Receiver<bool>,
-) -> Result<()>
+) -> Result<ClientOutcome>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut session = SessionState::new(&runtime.guards);
     let client_hello = match read_client_hello_from_async(&mut stream).await {
         Ok(hello) => hello,
-        Err(TransportError::UnexpectedEof) => return Ok(()),
+        Err(TransportError::UnexpectedEof) => {
+            return Ok(ClientOutcome {
+                suppress_info_logs: true,
+            });
+        }
         Err(err) => return Err(err.into()),
     };
+    let suppress_info_logs = is_healthcheck_client(&client_hello);
+    if !suppress_info_logs {
+        log_connection_event("INFO", connection_id, peer_addr, "accepted client");
+    }
     let transport = match negotiate_server_options(&client_hello, runtime.transport) {
         Ok((server_hello, transport)) => {
             write_server_hello_to_async(&mut stream, &server_hello).await?;
-            log_connection_event(
-                "INFO",
-                connection_id,
-                peer_addr,
-                &format!(
-                    "negotiated protocol={} compression={} max_frame_len={}",
-                    server_hello.protocol_version,
-                    server_hello.compression.as_str(),
-                    server_hello.max_frame_len
-                ),
-            );
+            if !suppress_info_logs {
+                log_connection_event(
+                    "INFO",
+                    connection_id,
+                    peer_addr,
+                    &format!(
+                        "negotiated protocol={} compression={} max_frame_len={}",
+                        server_hello.protocol_version,
+                        server_hello.compression.as_str(),
+                        server_hello.max_frame_len
+                    ),
+                );
+            }
             transport
         }
         Err(err) => {
@@ -1472,7 +1499,7 @@ where
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
-                        return Ok(());
+                        return Ok(ClientOutcome { suppress_info_logs });
                     }
                     continue;
                 }
@@ -1481,8 +1508,10 @@ where
                         Ok(result) => result,
                         Err(_) => {
                             metrics.idle_disconnects.fetch_add(1, Ordering::Relaxed);
-                            log_connection_event("INFO", connection_id, peer_addr, "disconnecting idle client");
-                            return Ok(());
+                            if !suppress_info_logs {
+                                log_connection_event("INFO", connection_id, peer_addr, "disconnecting idle client");
+                            }
+                            return Ok(ClientOutcome { suppress_info_logs });
                         }
                     }
                 }
@@ -1491,7 +1520,7 @@ where
             tokio::select! {
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
-                        return Ok(());
+                        return Ok(ClientOutcome { suppress_info_logs });
                     }
                     continue;
                 }
@@ -1550,15 +1579,17 @@ where
 
         validate_request(&request, &runtime.guards)?;
         metrics.requests_total.fetch_add(1, Ordering::Relaxed);
-        log_connection_event(
-            "INFO",
-            connection_id,
-            peer_addr,
-            &format!(
-                "received request_id={} opcode={:?}",
-                request.request_id, request.opcode
-            ),
-        );
+        if runtime.log_requests {
+            log_connection_event(
+                "INFO",
+                connection_id,
+                peer_addr,
+                &format!(
+                    "received request_id={} opcode={:?}",
+                    request.request_id, request.opcode
+                ),
+            );
+        }
 
         if is_internal_replication_opcode(request.opcode) {
             let request_id = request.request_id;
@@ -1690,7 +1721,11 @@ where
         }
     }
 
-    Ok(())
+    Ok(ClientOutcome { suppress_info_logs })
+}
+
+fn is_healthcheck_client(client_hello: &transport::ClientHello) -> bool {
+    client_hello.client_name == "vaylix-healthcheck"
 }
 
 async fn verify_backup_dump(dump: &str, engine: EngineHandle) -> Result<Vec<(String, String)>> {
@@ -2058,17 +2093,11 @@ async fn process_internal_replication_request(
                     let local_checksum = engine.wal_entry_checksum(entry.sequence).await?;
                     let entry_checksum = entry.checksum().map_err(ServerError::from)?;
                     if local_term != Some(entry.term) || local_checksum != Some(entry_checksum) {
-                        let replacement = payload
-                            .entries
-                            .iter()
-                            .skip_while(|candidate| candidate.sequence < entry.sequence)
-                            .cloned()
-                            .collect::<Vec<_>>();
+                        let prefix_sequence = entry.sequence.saturating_sub(1);
+                        let replacement =
+                            replacement_entries_after(prefix_sequence, &payload.entries);
                         let applied_sequence = engine
-                            .replace_replication_suffix(
-                                entry.sequence.saturating_sub(1),
-                                replacement,
-                            )
+                            .replace_replication_suffix(prefix_sequence, replacement)
                             .await?;
                         let applied_term = engine.wal_entry_term(applied_sequence).await?;
                         let applied_checksum = engine.wal_entry_checksum(applied_sequence).await?;
@@ -2113,8 +2142,9 @@ async fn process_internal_replication_request(
                         current_sequence.max(overlap_match_sequence)
                     }
                 } else if current_sequence.saturating_add(1) != suffix[0].sequence {
+                    let replacement = replacement_entries_after(overlap_match_sequence, &suffix);
                     engine
-                        .replace_replication_suffix(overlap_match_sequence, suffix)
+                        .replace_replication_suffix(overlap_match_sequence, replacement)
                         .await?
                 } else {
                     engine.apply_replication_entries(suffix).await?
@@ -2555,6 +2585,31 @@ async fn process_command(
                     .execute(request_id, consensus_term, command)
                     .await?
                     .response);
+            }
+
+            if runtime.replication.role().await == ReplicationRole::Standalone {
+                let consensus_term = runtime.replication.current_term().await;
+                let execute_result = engine
+                    .execute(request_id, consensus_term, command.clone())
+                    .await?;
+                let response = execute_result.response;
+                let last_applied_sequence = execute_result.last_applied_sequence;
+                let last_applied_term = execute_result.last_applied_term;
+                let last_applied_checksum = execute_result.last_applied_checksum;
+                runtime
+                    .replication
+                    .set_local_last_applied_state(
+                        last_applied_sequence,
+                        last_applied_term,
+                        last_applied_checksum,
+                    )
+                    .await;
+                if let Err(err) = drive_write_commit(&engine, runtime, last_applied_sequence).await
+                {
+                    rollback_uncommitted_tail(&engine, runtime).await?;
+                    return Err(err);
+                }
+                return Ok(response);
             }
 
             let _write_guard = runtime.replication_apply_lock.lock().await;
@@ -3069,8 +3124,8 @@ mod tests {
     use super::{
         AuditContext, AuthLockoutState, MaintenanceMode, RateLimiter, ServerGuards, SessionState,
         backup_manifest_path, error_response, execute_command, handle_auth,
-        handle_transaction_command, process_command, record_semantic_audit_event,
-        record_slow_command_event, structured_info, validate_command,
+        handle_transaction_command, is_healthcheck_client, process_command,
+        record_semantic_audit_event, record_slow_command_event, structured_info, validate_command,
     };
     use crate::audit::AuditLogger;
     use crate::auth::{AuthConfig, Permission, PermissionGrant};
@@ -3087,7 +3142,7 @@ mod tests {
         Engine, Expiration, Paths, Result, ScanPage, SetCondition, SetOptions, SetOutcome,
         StorageEngine, StorageKey, StorageKeyring, WalSyncPolicy,
     };
-    use transport::{CodecOptions, Response, Status};
+    use transport::{ClientHello, CodecOptions, Response, Status};
     use uuid::Uuid;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
@@ -3120,6 +3175,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn identifies_internal_healthcheck_client_for_connection_log_suppression() {
+        assert!(is_healthcheck_client(&ClientHello::new(
+            "vaylix-healthcheck",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(!is_healthcheck_client(&ClientHello::new(
+            "vaylix-client",
+            env!("CARGO_PKG_VERSION")
+        )));
+    }
+
     fn guards() -> ServerGuards {
         ServerGuards {
             max_request_payload_bytes: 1024 * 1024,
@@ -3144,6 +3211,7 @@ mod tests {
             guards: guards(),
             tls_state: None,
             transport: CodecOptions::default(),
+            log_requests: false,
             backup_dir,
             mtls_enabled: false,
             slow_command_threshold: Some(Duration::from_millis(100)),

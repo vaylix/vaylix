@@ -32,6 +32,7 @@ pub struct ServerRuntimeConfig {
     pub guards: ServerGuards,
     pub tls_state: Option<Arc<crate::tls::TlsState>>,
     pub transport: CodecOptions,
+    pub log_requests: bool,
     pub audit_logger: Arc<AuditLogger>,
     pub backup_dir: PathBuf,
     pub mtls_enabled: bool,

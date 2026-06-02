@@ -82,6 +82,7 @@ fn example_certs(args: ExampleCertsArgs) -> Result<BenchmarkReport> {
         failed_operations: 0,
         operations_per_second: 0.0,
         latency_us: LatencySummary::zero(),
+        error_samples: Vec::new(),
     })
 }
 
@@ -107,7 +108,7 @@ async fn managed_single_node(args: ManagedArgs) -> Result<BenchmarkReport> {
         keyspace,
         value_size,
         seed_keys,
-        workload: WorkloadKind::Mixed,
+        workload: args.workload.unwrap_or(WorkloadKind::Mixed),
     };
     run_profile("managed-single-node".to_string(), run_config(&run)).await
 }
@@ -353,15 +354,18 @@ async fn run_profile(profile: String, args: RunConfig) -> Result<BenchmarkReport
 
     let mut completed_operations = 0u64;
     let mut failed_operations = 0u64;
+    let mut error_samples = Vec::new();
     let mut histogram = Histogram::<u64>::new(3).expect("histogram");
     for task in tasks {
         let WorkerReport {
             completed,
             failed,
             histogram: worker_histogram,
+            error_samples: worker_errors,
         } = task.await??;
         completed_operations += completed;
         failed_operations += failed;
+        extend_error_samples(&mut error_samples, worker_errors);
         histogram
             .add(worker_histogram)
             .expect("merge worker histogram");
@@ -388,6 +392,7 @@ async fn run_profile(profile: String, args: RunConfig) -> Result<BenchmarkReport
         failed_operations,
         operations_per_second: completed_operations as f64 / args.duration_seconds as f64,
         latency_us,
+        error_samples,
     })
 }
 
@@ -410,27 +415,44 @@ async fn connect_with_retry(
 
 async fn select_writable_addr(cluster: &ManagedCluster) -> Result<String> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut last_errors = Vec::new();
     loop {
         for addr in &cluster.candidate_addrs {
             let mut config = cluster.connection.clone();
             config.addr = addr.clone();
-            if let Ok(client) = BenchmarkClient::connect(&config).await
-                && let Ok(response) = client
+            match BenchmarkClient::connect(&config).await {
+                Ok(client) => match client
                     .send(Command::Set {
                         key: "__bench-leader-probe__".to_string(),
                         value: "1".to_string(),
                         options: Default::default(),
                     })
                     .await
-                && response.status == transport::Status::Ok
-            {
-                return Ok(addr.clone());
+                {
+                    Ok(response) if response.status == transport::Status::Ok => {
+                        return Ok(addr.clone());
+                    }
+                    Ok(response) => {
+                        let message = response
+                            .decode_error_message()
+                            .unwrap_or_else(|_| format!("status {:?}", response.status));
+                        last_errors.push(format!("{addr}: {message}"));
+                    }
+                    Err(err) => {
+                        last_errors.push(format!("{addr}: {err}"));
+                    }
+                },
+                Err(err) => {
+                    last_errors.push(format!("{addr}: {err}"));
+                }
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(BenchError::InvalidConfiguration(
-                "could not identify a writable quorum leader".to_string(),
-            ));
+            last_errors.dedup();
+            return Err(BenchError::InvalidConfiguration(format!(
+                "could not identify a writable quorum leader; last errors: {}",
+                last_errors.join(" | ")
+            )));
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -459,6 +481,7 @@ struct WorkerReport {
     completed: u64,
     failed: u64,
     histogram: Histogram<u64>,
+    error_samples: Vec<String>,
 }
 
 async fn run_worker(
@@ -472,6 +495,7 @@ async fn run_worker(
     let mut rng = SmallRng::seed_from_u64(0x5eed_u64 + worker_id as u64);
     let mut completed = 0u64;
     let mut failed = 0u64;
+    let mut error_samples = Vec::new();
     let mut operation_index = 0u64;
     let mut histogram = Histogram::<u64>::new(3).expect("histogram");
     let value = "v".repeat(value_size);
@@ -492,7 +516,10 @@ async fn run_worker(
         histogram.record(latency_us.max(1)).expect("record latency");
         match response {
             Ok(()) => completed += 1,
-            Err(_) => failed += 1,
+            Err(err) => {
+                failed += 1;
+                push_error_sample(&mut error_samples, err.to_string());
+            }
         }
         operation_index += 1;
     }
@@ -501,7 +528,22 @@ async fn run_worker(
         completed,
         failed,
         histogram,
+        error_samples,
     })
+}
+
+fn extend_error_samples(samples: &mut Vec<String>, errors: Vec<String>) {
+    for error in errors {
+        push_error_sample(samples, error);
+    }
+}
+
+fn push_error_sample(samples: &mut Vec<String>, error: String) {
+    const MAX_ERROR_SAMPLES: usize = 8;
+    if samples.len() >= MAX_ERROR_SAMPLES || samples.iter().any(|sample| sample == &error) {
+        return;
+    }
+    samples.push(error);
 }
 
 async fn run_operation(

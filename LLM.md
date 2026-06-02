@@ -324,6 +324,8 @@ WAL management:
 - WAL lives under `<data-dir>/wal/`
 - active segment name: `active-<start_sequence>.wal`
 - sealed segment name: `<start_sequence>-<end_sequence>.wal`
+- the 0.6 write path keeps the active segment open through a stateful writer instead of reopening and rediscovering the active segment for every append
+- eligible standalone writes may be appended as bounded batches; `flush` and `sync` modes must not acknowledge a write before the configured batch durability boundary completes
 - runtime controls:
   - `--wal-segment-size-bytes`
   - `--wal-retain-segments`
@@ -465,7 +467,7 @@ Do not document sharding, MVCC, distributed transactions, or linearizable follow
 Transport compression is enabled by default for outbound frames in the current client/server binaries:
 
 - default mode: `zstd`
-- default threshold: `0`
+- default threshold: `1024` bytes
 - compression is selected during startup negotiation
 - readers decompress automatically based on the frame flag
 - frame checksums validate the on-wire compressed payload
@@ -480,6 +482,7 @@ Still missing:
 
 Current runtime protections:
 
+- request-level server logs are disabled by default on the hot path; use `--log-requests` / `VAYLIX_LOG_REQUESTS=true` for request tracing
 - per-session token-bucket rate limiting
 - request payload size limits
 - key/value size limits
@@ -590,7 +593,7 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.5.3`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.6.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 

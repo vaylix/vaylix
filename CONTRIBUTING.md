@@ -91,6 +91,8 @@ If you change:
 
 then update the relevant top-level docs in the same PR.
 
+Keep local benchmark measurements out of committed docs unless a release explicitly requires them. Commit the methodology, flags, and reproducible commands; keep machine-specific numbers in PR discussion or release validation notes.
+
 ## Security Expectations
 
 - never commit secrets, private keys, tokens, or environment files

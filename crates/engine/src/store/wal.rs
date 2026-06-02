@@ -105,7 +105,129 @@ impl SegmentFile {
     }
 }
 
+/// Stateful WAL appender that keeps the active segment open across writes.
+///
+/// The entry format is identical to [`append`]. The only behavioral difference is
+/// that callers can append several entries and pay the configured flush/sync
+/// cost once per batch, while still rotating segments only at entry boundaries.
+pub struct WalWriter {
+    wal_dir: PathBuf,
+    sync_policy: WalSyncPolicy,
+    max_segment_size_bytes: u64,
+    active: SegmentFile,
+    file: Option<File>,
+    file_len: u64,
+}
+
+impl WalWriter {
+    /// Opens the active segment, creating one at `start_sequence` when missing.
+    pub fn open(
+        wal_dir: &Path,
+        sync_policy: WalSyncPolicy,
+        max_segment_size_bytes: u64,
+        start_sequence: u64,
+    ) -> Result<Self> {
+        fs::create_dir_all(wal_dir)?;
+        let active = active_segment_file(wal_dir)?.unwrap_or_else(|| {
+            let path = wal_dir.join(format!("active-{start_sequence}.wal"));
+            SegmentFile {
+                path,
+                start_sequence,
+                end_sequence: None,
+                active: true,
+            }
+        });
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active.path)?;
+        let file_len = file.metadata()?.len();
+
+        Ok(Self {
+            wal_dir: wal_dir.to_path_buf(),
+            sync_policy,
+            max_segment_size_bytes,
+            active,
+            file: Some(file),
+            file_len,
+        })
+    }
+
+    /// Appends one entry and applies the configured durability boundary.
+    pub fn append(&mut self, entry: &WalEntry, keyring: Option<&StorageKeyring>) -> Result<()> {
+        self.append_batch(std::slice::from_ref(entry), keyring)
+    }
+
+    /// Appends a batch of entries and applies one durability boundary per touched segment.
+    pub fn append_batch(
+        &mut self,
+        entries: &[WalEntry],
+        keyring: Option<&StorageKeyring>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        for entry in entries {
+            let written = append_encoded_entry(self.file_mut()?, entry, keyring)?;
+            self.file_len = self.file_len.saturating_add(written);
+            if self.max_segment_size_bytes > 0 && self.file_len >= self.max_segment_size_bytes {
+                let sync_policy = self.sync_policy;
+                sync_file(self.file_mut()?, sync_policy)?;
+                self.rotate_after(entry.sequence)?;
+            }
+        }
+
+        let sync_policy = self.sync_policy;
+        sync_file(self.file_mut()?, sync_policy)
+    }
+
+    /// Closes the active file after applying the configured durability boundary.
+    ///
+    /// Snapshotting may rename or remove the visible active segment. The writer
+    /// must release its file handle before that happens so future appends cannot
+    /// continue writing to a stale unlinked file.
+    pub fn close_active(&mut self) -> Result<()> {
+        let sync_policy = self.sync_policy;
+        if let Some(mut file) = self.file.take() {
+            sync_file(&mut file, sync_policy)?;
+        }
+        Ok(())
+    }
+
+    fn file_mut(&mut self) -> Result<&mut File> {
+        self.file.as_mut().ok_or_else(|| {
+            EngineError::Io(std::io::Error::other("wal writer active file is closed"))
+        })
+    }
+
+    fn rotate_after(&mut self, last_sequence: u64) -> Result<()> {
+        let active_path = self.active.path.clone();
+        let sealed_path =
+            sealed_segment_path(&self.wal_dir, self.active.start_sequence, last_sequence);
+        drop(self.file.take());
+        fs::rename(active_path, sealed_path)?;
+
+        let next_start = last_sequence.saturating_add(1);
+        let next_path = self.wal_dir.join(format!("active-{next_start}.wal"));
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&next_path)?;
+        self.active = SegmentFile {
+            path: next_path,
+            start_sequence: next_start,
+            end_sequence: None,
+            active: true,
+        };
+        self.file = Some(file);
+        self.file_len = 0;
+        Ok(())
+    }
+}
+
 /// Appends a WAL entry durably to the active segment on disk.
+#[cfg(test)]
 pub fn append(
     entry: &WalEntry,
     wal_dir: &Path,
@@ -113,31 +235,8 @@ pub fn append(
     keyring: Option<&StorageKeyring>,
     max_segment_size_bytes: u64,
 ) -> Result<()> {
-    fs::create_dir_all(wal_dir)?;
-    let active = active_segment_file(wal_dir)?.unwrap_or_else(|| {
-        let path = wal_dir.join(format!("active-{}.wal", entry.sequence));
-        SegmentFile {
-            path,
-            start_sequence: entry.sequence,
-            end_sequence: None,
-            active: true,
-        }
-    });
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&active.path)?;
-    append_encoded_entry(&mut file, entry, keyring)?;
-    sync_file(&mut file, sync_policy)?;
-    let file_len = file.metadata()?.len();
-    drop(file);
-
-    if max_segment_size_bytes > 0 && file_len >= max_segment_size_bytes {
-        rotate_active_after(entry.sequence, wal_dir, &active)?;
-    }
-
-    Ok(())
+    let mut writer = WalWriter::open(wal_dir, sync_policy, max_segment_size_bytes, entry.sequence)?;
+    writer.append(entry, keyring)
 }
 
 /// Creates a fresh empty active WAL segment starting at the provided sequence.
@@ -292,8 +391,10 @@ pub fn write_entries(
         fs::remove_dir_all(wal_dir)?;
     }
     fs::create_dir_all(wal_dir)?;
-    for entry in entries {
-        append(entry, wal_dir, sync_policy, keyring, max_segment_size_bytes)?;
+    if let Some(first) = entries.first() {
+        let mut writer =
+            WalWriter::open(wal_dir, sync_policy, max_segment_size_bytes, first.sequence)?;
+        writer.append_batch(entries, keyring)?;
     }
     Ok(())
 }
@@ -322,7 +423,7 @@ fn append_encoded_entry(
     file: &mut File,
     entry: &WalEntry,
     keyring: Option<&StorageKeyring>,
-) -> Result<()> {
+) -> Result<u64> {
     let bytes = binary::encode(entry).map_err(|err| EngineError::WalSerialize(err.to_string()))?;
     let durable_bytes = match keyring {
         Some(keyring) => encrypt(keyring.active(), "wal entry", &bytes)?,
@@ -334,7 +435,7 @@ fn append_encoded_entry(
     file.write_all(&length.to_le_bytes())?;
     file.write_all(&checksum.to_le_bytes())?;
     file.write_all(&durable_bytes)?;
-    Ok(())
+    Ok(8_u64.saturating_add(durable_bytes.len() as u64))
 }
 
 fn sync_file(file: &mut File, sync_policy: WalSyncPolicy) -> Result<()> {
@@ -347,14 +448,6 @@ fn sync_file(file: &mut File, sync_policy: WalSyncPolicy) -> Result<()> {
             file.sync_data()?;
         }
     }
-    Ok(())
-}
-
-fn rotate_active_after(last_sequence: u64, wal_dir: &Path, active: &SegmentFile) -> Result<()> {
-    let sealed = sealed_segment_path(wal_dir, active.start_sequence, last_sequence);
-    fs::rename(&active.path, sealed)?;
-    let next_active = wal_dir.join(format!("active-{}.wal", last_sequence + 1));
-    File::create(next_active)?;
     Ok(())
 }
 
@@ -582,8 +675,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        WalEntry, WalOperation, WalReplayTarget, append, inspect, migrate_legacy, replay,
-        replay_until, seal_active, sealed_segment_path,
+        WalEntry, WalOperation, WalReplayTarget, WalWriter, append, inspect, migrate_legacy,
+        replay, replay_until, seal_active, sealed_segment_path,
     };
     use crate::WalSyncPolicy;
 
@@ -672,6 +765,27 @@ mod tests {
         assert_eq!(report.sealed_segment_count, 1);
         assert_eq!(report.active_start_sequence, 2);
         assert!(sealed_segment_path(&wal_dir, 1, 1).exists());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn writer_appends_batches_and_rotates_at_entry_boundaries() {
+        let root = temp_dir("wal-writer-batch");
+        let wal_dir = root.join("wal");
+        let keyring = keyring("wal-key");
+        let entries = [sample_entry(1), sample_entry(2), sample_entry(3)];
+
+        let mut writer = WalWriter::open(&wal_dir, WalSyncPolicy::Flush, 1, 1).unwrap();
+        writer.append_batch(&entries, Some(&keyring)).unwrap();
+        drop(writer);
+
+        let replay = replay(&wal_dir, Some(&keyring)).unwrap();
+        assert_eq!(replay.entries, entries);
+
+        let report = inspect(&wal_dir).unwrap();
+        assert_eq!(report.sealed_segment_count, 3);
+        assert_eq!(report.active_start_sequence, 4);
 
         fs::remove_dir_all(root).ok();
     }

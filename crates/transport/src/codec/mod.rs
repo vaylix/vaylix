@@ -695,11 +695,29 @@ mod tests {
     }
 
     #[test]
-    fn default_encoding_compresses_frames() {
+    fn default_encoding_leaves_small_frames_uncompressed() {
         let request = Request::from_command(
             id(10),
             Command::Ping {
                 message: Some("hello".to_string()),
+            },
+        )
+        .unwrap();
+
+        let encoded = encode_request(&request).unwrap();
+
+        assert_eq!(encoded[5], 0);
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn default_encoding_compresses_large_frames() {
+        let request = Request::from_command(
+            id(10),
+            Command::Set {
+                key: "blob".to_string(),
+                value: "x".repeat(4_096),
+                options: SetOptions::default(),
             },
         )
         .unwrap();

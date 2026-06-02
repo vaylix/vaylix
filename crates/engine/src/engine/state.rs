@@ -45,6 +45,61 @@ pub struct RollbackPlan {
     previous: EngineState,
 }
 
+#[derive(Default)]
+struct EntryRollback {
+    keys: BTreeMap<String, (Option<String>, Option<u64>)>,
+    clear_snapshot: Option<(BTreeMap<String, String>, BTreeMap<String, u64>)>,
+}
+
+impl EntryRollback {
+    fn remember_key(&mut self, state: &EngineState, key: &str) {
+        if self.clear_snapshot.is_some() || self.keys.contains_key(key) {
+            return;
+        }
+        self.keys.insert(
+            key.to_string(),
+            (
+                state.data.get(key).cloned(),
+                state.expirations.get(key).copied(),
+            ),
+        );
+    }
+
+    fn remember_clear(&mut self, state: &EngineState) {
+        if self.clear_snapshot.is_none() {
+            self.clear_snapshot = Some((state.data.clone(), state.expirations.clone()));
+            self.keys.clear();
+        }
+    }
+
+    fn rollback(self, state: &mut EngineState, metadata: EngineMetadata) {
+        if let Some((data, expirations)) = self.clear_snapshot {
+            state.data = data;
+            state.expirations = expirations;
+        } else {
+            for (key, (value, expiration)) in self.keys {
+                match value {
+                    Some(value) => {
+                        state.data.insert(key.clone(), value);
+                    }
+                    None => {
+                        state.data.remove(&key);
+                    }
+                }
+                match expiration {
+                    Some(expires_at_ms) => {
+                        state.expirations.insert(key, expires_at_ms);
+                    }
+                    None => {
+                        state.expirations.remove(&key);
+                    }
+                }
+            }
+        }
+        state.metadata = metadata;
+    }
+}
+
 impl EngineState {
     /// Builds an empty state with current metadata.
     pub fn new() -> Self {
@@ -77,11 +132,12 @@ impl EngineState {
 
     /// Applies a single WAL entry to the in-memory state atomically.
     pub fn apply_entry(&mut self, entry: &WalEntry) -> Result<()> {
-        let rollback = self.rollback_point();
+        let metadata = self.metadata.clone();
+        let mut rollback = EntryRollback::default();
 
         for operation in &entry.operations {
-            if let Err(err) = self.apply_operation(operation) {
-                self.rollback(rollback);
+            if let Err(err) = self.apply_operation(operation, &mut rollback) {
+                rollback.rollback(self, metadata);
                 return Err(err);
             }
         }
@@ -167,29 +223,39 @@ impl EngineState {
         self.metadata.last_applied_sequence = sequence;
     }
 
-    fn apply_operation(&mut self, operation: &WalOperation) -> Result<()> {
+    fn apply_operation(
+        &mut self,
+        operation: &WalOperation,
+        rollback: &mut EntryRollback,
+    ) -> Result<()> {
         match operation {
             WalOperation::Set { key, value } => {
+                rollback.remember_key(self, key);
                 self.data.insert(key.clone(), value.clone());
                 self.expirations.remove(key);
             }
             WalOperation::Delete { key } => {
+                rollback.remember_key(self, key);
                 self.data.remove(key);
                 self.expirations.remove(key);
             }
             WalOperation::Expire { key, expires_at_ms } => {
+                rollback.remember_key(self, key);
                 if self.data.contains_key(key) {
                     self.expirations.insert(key.clone(), *expires_at_ms);
                 }
             }
             WalOperation::Persist { key } => {
+                rollback.remember_key(self, key);
                 self.expirations.remove(key);
             }
             WalOperation::Clear => {
+                rollback.remember_clear(self);
                 self.data.clear();
                 self.expirations.clear();
             }
             WalOperation::CheckInteger { key, delta } => {
+                rollback.remember_key(self, key);
                 let current = self
                     .data
                     .get(key)
