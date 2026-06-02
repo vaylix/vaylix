@@ -17,7 +17,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.6.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.7.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -73,6 +73,7 @@ Useful runtime environment variables for containers:
 - `VAYLIX_REQUESTS_PER_SECOND`
 - `VAYLIX_REQUEST_BURST`
 - `VAYLIX_AUDIT_LOG_PATH`
+- `VAYLIX_AUDIT_COMMANDS`
 - `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`
 - `VAYLIX_AUTH_FAILURE_WINDOW_SECONDS`
 - `VAYLIX_AUTH_FAILURE_LIMIT`
@@ -97,7 +98,7 @@ Useful runtime environment variables for containers:
 
 ## High Availability
 
-Vaylix 0.5.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
+Vaylix 0.7.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
 
 Recommended production shape:
 
@@ -129,6 +130,10 @@ Operational commands:
 - `cluster join <node-id> <host:port>` and `cluster remove <node-id>` update membership from the leader.
 
 Followers may serve local stale reads; clients that require linearizable read-after-write behavior should route reads to the current leader reported by `show cluster` / `show replication`.
+
+The engine uses a sharded in-memory store for live `String -> String` data while preserving deterministic snapshots, backups, and replication payloads. Leader and standalone nodes also maintain a committed read index for `GET`, `MGET`, `EXISTS`, and `TTL`. The index advances only after the configured WAL durability and HA acknowledgement boundary has completed, so fast-path reads do not expose an uncommitted local tail.
+
+Leader writes are coordinated through a single HA write coordinator. Concurrent eligible writes share one ordered local WAL batch and one replicated frontier, but responses are still held until the configured local durability and quorum/all acknowledgement boundary completes.
 
 ## Run from Binaries
 
@@ -212,11 +217,12 @@ cargo audit
 - When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the env-managed bootstrap admin on startup. Changing those startup credentials rotates that admin and retires the previous env-managed admin.
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
 - Request-level server logging is disabled by default on the hot path. Enable `--log-requests` / `VAYLIX_LOG_REQUESTS=true` only when request tracing is needed.
+- Security/operator audit events remain enabled by default. Generic per-command audit lines are opt-in through `--audit-commands` / `VAYLIX_AUDIT_COMMANDS=true` because full command auditing is intentionally expensive on read-heavy in-memory workloads.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
 - TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.
 - `METRICS` uses an OpenTelemetry-aligned metric contract under the `vaylix.*` namespace, and `METRICS PROM` exposes Prometheus-safe names translated from that contract.
 - Backups created with `BACKUP TO <path>` are sandboxed under `--backup-dir` / `VAYLIX_BACKUP_DIR`, defaulting to `<data-dir>/backups`.
-- WAL is segmented under `<data-dir>/wal`. The 0.6.x write path keeps the active WAL segment open and can group concurrent writes behind the configured `VAYLIX_WAL_SYNC` durability boundary without acknowledging a write before that boundary completes.
+- WAL is segmented under `<data-dir>/wal`. The write path keeps the active WAL segment open, runs append/flush/sync work through a dedicated WAL I/O worker, and can group concurrent writes behind the configured `VAYLIX_WAL_SYNC` durability boundary without acknowledging a write before that boundary completes.
 - `maintenance on` switches the node into persisted read-only admin mode until `maintenance off`.
 - Audit JSONL records are SHA-256 hash chained and verified on startup. This is tamper-evident logging, not non-repudiation without external anchoring.
 - HA writes should use the default quorum acknowledgement mode. `local` acknowledgement is for explicitly weaker development or disaster-recovery workflows.

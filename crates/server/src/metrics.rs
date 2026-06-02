@@ -34,6 +34,12 @@ enum MetricId {
     ExpiredKeyRemovedCount,
     SlowCommandCount,
     WalEntryReplayedCount,
+    ReadFastPathHitCount,
+    ReadFastPathFallbackCount,
+    HaWriteBatchCount,
+    HaWriteCoordinatedCount,
+    HaWriteBatchMaxSize,
+    ReadIndexLag,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +177,48 @@ const METRIC_DESCRIPTORS: &[MetricDescriptor] = &[
         help: "Number of WAL entries replayed during recovery.",
         kind: MetricKind::Counter,
     },
+    MetricDescriptor {
+        id: MetricId::ReadFastPathHitCount,
+        otel_name: "vaylix.server.read.fastpath.hit.count",
+        unit: "{request}",
+        help: "Number of safe read commands served from the committed read index.",
+        kind: MetricKind::Counter,
+    },
+    MetricDescriptor {
+        id: MetricId::ReadFastPathFallbackCount,
+        otel_name: "vaylix.server.read.fastpath.fallback.count",
+        unit: "{request}",
+        help: "Number of safe read commands routed through the engine path.",
+        kind: MetricKind::Counter,
+    },
+    MetricDescriptor {
+        id: MetricId::HaWriteBatchCount,
+        otel_name: "vaylix.server.ha.write.batch.count",
+        unit: "{batch}",
+        help: "Number of leader write batches processed by the HA write coordinator.",
+        kind: MetricKind::Counter,
+    },
+    MetricDescriptor {
+        id: MetricId::HaWriteCoordinatedCount,
+        otel_name: "vaylix.server.ha.write.coordinated.count",
+        unit: "{request}",
+        help: "Number of leader write requests processed through the HA write coordinator.",
+        kind: MetricKind::Counter,
+    },
+    MetricDescriptor {
+        id: MetricId::HaWriteBatchMaxSize,
+        otel_name: "vaylix.server.ha.write.batch.max.size",
+        unit: "{request}",
+        help: "Largest leader write batch observed since process start.",
+        kind: MetricKind::Gauge,
+    },
+    MetricDescriptor {
+        id: MetricId::ReadIndexLag,
+        otel_name: "vaylix.server.read.index.lag",
+        unit: "{entry}",
+        help: "Current committed read-index lag behind the latest acknowledged write.",
+        kind: MetricKind::Gauge,
+    },
 ];
 
 /// Process-wide counters collected by the server runtime.
@@ -193,6 +241,12 @@ pub struct Metrics {
     pub expired_keys_removed: AtomicU64,
     pub slow_commands_total: AtomicU64,
     pub wal_entries_replayed_total: AtomicU64,
+    pub read_fast_path_hits: AtomicU64,
+    pub read_fast_path_fallbacks: AtomicU64,
+    pub ha_write_batches: AtomicU64,
+    pub ha_write_coordinated: AtomicU64,
+    pub ha_write_batch_max_size: AtomicU64,
+    pub read_index_lag: AtomicU64,
 }
 
 impl Metrics {
@@ -223,6 +277,14 @@ impl Metrics {
             MetricId::WalEntryReplayedCount => {
                 self.wal_entries_replayed_total.load(Ordering::Relaxed)
             }
+            MetricId::ReadFastPathHitCount => self.read_fast_path_hits.load(Ordering::Relaxed),
+            MetricId::ReadFastPathFallbackCount => {
+                self.read_fast_path_fallbacks.load(Ordering::Relaxed)
+            }
+            MetricId::HaWriteBatchCount => self.ha_write_batches.load(Ordering::Relaxed),
+            MetricId::HaWriteCoordinatedCount => self.ha_write_coordinated.load(Ordering::Relaxed),
+            MetricId::HaWriteBatchMaxSize => self.ha_write_batch_max_size.load(Ordering::Relaxed),
+            MetricId::ReadIndexLag => self.read_index_lag.load(Ordering::Relaxed),
         }
     }
 

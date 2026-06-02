@@ -117,6 +117,12 @@ pub(super) fn record_audit_event(logger: &AuditLogger, context: AuditContext<'_>
     record_audit_event_with(logger, context, "command", BTreeMap::new());
 }
 
+pub(super) fn record_command_audit_event(runtime: &ServerRuntimeConfig, context: AuditContext<'_>) {
+    if runtime.audit_commands {
+        record_audit_event(&runtime.audit_logger, context);
+    }
+}
+
 pub(super) fn record_runtime_event(
     logger: &AuditLogger,
     event_type: &str,

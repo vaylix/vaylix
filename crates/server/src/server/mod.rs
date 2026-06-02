@@ -38,7 +38,10 @@ mod authorization;
 mod commands;
 mod config;
 mod engine_worker;
+mod ha_write_coordinator;
 mod lifecycle;
+mod read_index;
+mod replication_client;
 mod session;
 mod transactions;
 mod validation;
@@ -46,7 +49,8 @@ mod validation;
 pub(crate) use audit_events::log_event;
 use audit_events::{
     auth_lockout_key, current_time_millis, log_connection_event, opcode_name, record_audit_event,
-    record_runtime_event, record_semantic_audit_event, record_slow_command_event,
+    record_command_audit_event, record_runtime_event, record_semantic_audit_event,
+    record_slow_command_event,
 };
 use authorization::{authorize_command, is_allowed_during_maintenance};
 use commands::{
@@ -54,7 +58,12 @@ use commands::{
 };
 pub use config::{ServerGuards, ServerRuntimeConfig};
 use engine_worker::EngineHandle;
+pub use ha_write_coordinator::HaWriteCoordinator;
+use ha_write_coordinator::is_ha_write_coordinator_command;
 use lifecycle::{spawn_expiration_sweeper, spawn_snapshotter, spawn_tls_reloader};
+pub use read_index::CommittedReadIndex;
+use read_index::is_fast_path_read;
+pub use replication_client::ReplicationClientPool;
 #[cfg(test)]
 use session::RateLimiter;
 use session::{AuditContext, SessionState};
@@ -107,7 +116,7 @@ impl Server {
         port: u16,
         max_connections: usize,
         mut engine: Engine,
-        runtime: ServerRuntimeConfig,
+        mut runtime: ServerRuntimeConfig,
     ) -> Result<Self> {
         let recovered_entries = engine
             .info()?
@@ -177,10 +186,19 @@ impl Server {
         metrics
             .wal_entries_replayed_total
             .store(recovered_entries, Ordering::Relaxed);
+        runtime
+            .read_index
+            .rebuild_from_engine_state(&engine.replication_snapshot().state);
+        let engine = EngineHandle::new(engine);
+        runtime.ha_write_coordinator = Some(Arc::new(HaWriteCoordinator::start(
+            engine.clone(),
+            Arc::clone(&metrics),
+            runtime.clone(),
+        )));
 
         Ok(Self {
             listener,
-            engine: EngineHandle::new(engine),
+            engine,
             connection_slots: Arc::new(Semaphore::new(max_connections)),
             next_connection_id: AtomicU64::new(1),
             runtime,
@@ -981,8 +999,9 @@ async fn send_cluster_appends_locked(
         .await?;
     let cached_by_sequence = cached_entries
         .iter()
-        .map(|entry| (entry.sequence, entry.clone()))
-        .collect::<std::collections::BTreeMap<_, _>>();
+        .enumerate()
+        .map(|(index, entry)| (entry.sequence, index))
+        .collect::<std::collections::HashMap<_, _>>();
     let mut fanout = JoinSet::new();
     for (member, _next_sequence, prev_sequence) in peer_plans {
         let (prev_term, prev_entry_checksum, entries, snapshot) = if prev_sequence == 0 {
@@ -993,7 +1012,8 @@ async fn send_cluster_appends_locked(
                 .cloned()
                 .collect::<Vec<_>>();
             (None, None, entries, None)
-        } else if let Some(prev_entry) = cached_by_sequence.get(&prev_sequence).cloned() {
+        } else if let Some(prev_entry_index) = cached_by_sequence.get(&prev_sequence).copied() {
+            let prev_entry = &cached_entries[prev_entry_index];
             let prev_term = Some(prev_entry.term);
             let prev_entry_checksum = Some(prev_entry.checksum().map_err(ServerError::from)?);
             let entries = cached_entries
@@ -1272,8 +1292,13 @@ async fn drive_write_commit(
             if Instant::now() >= deadline {
                 return runtime.replication.wait_for_write_ack(sequence).await;
             }
+        } else if runtime.replication.commit_sequence().await >= sequence {
+            return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        runtime
+            .replication
+            .wait_for_commit_change_until(deadline)
+            .await;
     }
 }
 
@@ -1334,19 +1359,10 @@ async fn send_append_request(
     member: &ClusterMember,
     payload: AppendEntriesRequest,
 ) -> Result<AppendEntriesResponse> {
-    let mut stream = connect_replication_peer(runtime.clone(), &member.advertise_addr).await?;
-    let transport = negotiate_replication_transport(&mut stream).await?;
-    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
-    let request = Request::new(
-        Uuid::now_v7(),
-        transport::Opcode::ReplicationAppend,
-        serde_json::to_vec(&payload)
-            .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
-    );
-    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
-    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
-    ensure_replication_ok(&response)?;
-    decode_json_payload(&response.payload)
+    runtime
+        .replication_clients
+        .append(runtime.clone(), member.clone(), payload)
+        .await
 }
 
 async fn send_heartbeat_request(
@@ -1354,19 +1370,10 @@ async fn send_heartbeat_request(
     member: &ClusterMember,
     payload: HeartbeatRequest,
 ) -> Result<crate::replication::HeartbeatResponse> {
-    let mut stream = connect_replication_peer(runtime.clone(), &member.advertise_addr).await?;
-    let transport = negotiate_replication_transport(&mut stream).await?;
-    authenticate_replication_peer(&mut stream, transport, &runtime).await?;
-    let request = Request::new(
-        Uuid::now_v7(),
-        transport::Opcode::ReplicationHeartbeat,
-        serde_json::to_vec(&payload)
-            .map_err(|err| ServerError::InvalidArguments(err.to_string()))?,
-    );
-    transport::write_request_to_async_with_options(&mut stream, &request, transport).await?;
-    let response = transport::read_response_from_async_with_options(&mut stream, transport).await?;
-    ensure_replication_ok(&response)?;
-    decode_json_payload(&response.payload)
+    runtime
+        .replication_clients
+        .heartbeat(runtime.clone(), member.clone(), payload)
+        .await
 }
 
 struct SnapshotInstallCall {
@@ -1673,8 +1680,8 @@ where
             None
         };
         write_response_to_async_with_options(&mut stream, &response, transport).await?;
-        record_audit_event(
-            &runtime.audit_logger,
+        record_command_audit_event(
+            &runtime,
             AuditContext {
                 connection_id,
                 peer_addr,
@@ -1958,7 +1965,7 @@ fn replication_role_accepts_writes(role: ReplicationRole) -> bool {
 
 async fn process_internal_replication_request(
     engine: EngineHandle,
-    _metrics: Arc<Metrics>,
+    metrics: Arc<Metrics>,
     runtime: &ServerRuntimeConfig,
     session: &mut SessionState,
     request: Request,
@@ -2109,6 +2116,18 @@ async fn process_internal_replication_request(
                                 applied_checksum,
                             )
                             .await;
+                        let committed_sequence = runtime
+                            .replication
+                            .commit_sequence()
+                            .await
+                            .min(applied_sequence);
+                        advance_read_index_to(
+                            &engine,
+                            metrics.as_ref(),
+                            runtime,
+                            committed_sequence,
+                        )
+                        .await?;
                         if applied_sequence >= target_sequence {
                             runtime
                                 .replication
@@ -2156,6 +2175,12 @@ async fn process_internal_replication_request(
                 .replication
                 .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
                 .await;
+            let committed_sequence = runtime
+                .replication
+                .commit_sequence()
+                .await
+                .min(applied_sequence);
+            advance_read_index_to(&engine, metrics.as_ref(), runtime, committed_sequence).await?;
             if applied_sequence >= target_sequence {
                 runtime
                     .replication
@@ -2200,6 +2225,10 @@ async fn process_internal_replication_request(
                 .replication
                 .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
                 .await;
+            runtime
+                .read_index
+                .rebuild_from_engine_state(&engine.replication_snapshot().await?.state);
+            metrics.read_index_lag.store(0, Ordering::Relaxed);
             let response = SnapshotInstallResponse {
                 term: runtime.replication.current_term().await,
                 accepted: true,
@@ -2428,10 +2457,26 @@ async fn process_command(
         Command::RestoreFrom { path } => {
             let path = resolve_backup_path(&runtime.backup_dir, &path, true)?;
             let dump = std::fs::read_to_string(path)?;
-            Ok(engine
-                .execute(request_id, 0, Command::Restore { dump })
-                .await?
-                .response)
+            let consensus_term = runtime.replication.current_term().await;
+            let execute_result = engine
+                .execute(request_id, consensus_term, Command::Restore { dump })
+                .await?;
+            let last_applied_sequence = execute_result.last_applied_sequence;
+            runtime
+                .replication
+                .set_local_last_applied_state(
+                    last_applied_sequence,
+                    execute_result.last_applied_term,
+                    execute_result.last_applied_checksum,
+                )
+                .await;
+            if let Err(err) = drive_write_commit(&engine, runtime, last_applied_sequence).await {
+                rollback_uncommitted_tail(&engine, runtime).await?;
+                return Err(err);
+            }
+            advance_read_index_to(&engine, metrics.as_ref(), runtime, last_applied_sequence)
+                .await?;
+            Ok(execute_result.response)
         }
         Command::RestoreCheck { dump } => Ok(Response::count(
             request_id,
@@ -2580,6 +2625,15 @@ async fn process_command(
         }
         command => {
             if !is_write_command(&command) {
+                if should_use_read_fast_path(runtime).await && is_fast_path_read(&command) {
+                    metrics.read_fast_path_hits.fetch_add(1, Ordering::Relaxed);
+                    return runtime.read_index.read_command(request_id, &command);
+                }
+                if is_fast_path_read(&command) {
+                    metrics
+                        .read_fast_path_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let consensus_term = runtime.replication.current_term().await;
                 return Ok(engine
                     .execute(request_id, consensus_term, command)
@@ -2609,7 +2663,16 @@ async fn process_command(
                     rollback_uncommitted_tail(&engine, runtime).await?;
                     return Err(err);
                 }
+                advance_read_index_to(&engine, metrics.as_ref(), runtime, last_applied_sequence)
+                    .await?;
                 return Ok(response);
+            }
+
+            if runtime.replication.role().await == ReplicationRole::Leader
+                && is_ha_write_coordinator_command(&command)
+                && let Some(coordinator) = &runtime.ha_write_coordinator
+            {
+                return coordinator.execute(request_id, command).await;
             }
 
             let _write_guard = runtime.replication_apply_lock.lock().await;
@@ -2650,10 +2713,46 @@ async fn process_command(
                     rollback_uncommitted_tail(&engine, runtime).await?;
                     return Err(err);
                 }
+                advance_read_index_to(&engine, metrics.as_ref(), runtime, last_applied_sequence)
+                    .await?;
             }
             Ok(response)
         }
     }
+}
+
+async fn should_use_read_fast_path(runtime: &ServerRuntimeConfig) -> bool {
+    matches!(
+        runtime.replication.role().await,
+        ReplicationRole::Standalone | ReplicationRole::Leader
+    )
+}
+
+async fn advance_read_index_to(
+    engine: &EngineHandle,
+    metrics: &Metrics,
+    runtime: &ServerRuntimeConfig,
+    target_sequence: u64,
+) -> Result<()> {
+    let mut after_sequence = runtime.read_index.committed_sequence();
+    while after_sequence < target_sequence {
+        let entries = engine
+            .wal_entries_since(
+                after_sequence,
+                runtime.replication.config().fetch_batch_size,
+            )
+            .await?;
+        if entries.is_empty() {
+            break;
+        }
+        runtime.read_index.apply_entries(&entries)?;
+        after_sequence = runtime.read_index.committed_sequence();
+    }
+    metrics.read_index_lag.store(
+        runtime.read_index.lag_to(target_sequence),
+        Ordering::Relaxed,
+    );
+    Ok(())
 }
 
 fn cluster_entries_from_snapshot(snapshot: &ReplicationStatusSnapshot) -> Vec<(String, String)> {
@@ -3037,6 +3136,7 @@ async fn structured_info(
             .into_iter()
             .map(|(key, value)| (format!("metrics.{key}"), value)),
     );
+    entries.extend(runtime.replication_clients.snapshot());
     entries.sort_by(|left, right| left.0.cmp(&right.0));
 
     Ok(entries)
@@ -3122,10 +3222,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        AuditContext, AuthLockoutState, MaintenanceMode, RateLimiter, ServerGuards, SessionState,
-        backup_manifest_path, error_response, execute_command, handle_auth,
-        handle_transaction_command, is_healthcheck_client, process_command,
-        record_semantic_audit_event, record_slow_command_event, structured_info, validate_command,
+        AuditContext, AuthLockoutState, CommittedReadIndex, MaintenanceMode, RateLimiter,
+        ReplicationClientPool, ServerGuards, SessionState, backup_manifest_path, error_response,
+        execute_command, handle_auth, handle_transaction_command, is_healthcheck_client,
+        process_command, record_semantic_audit_event, record_slow_command_event, structured_info,
+        validate_command,
     };
     use crate::audit::AuditLogger;
     use crate::auth::{AuthConfig, Permission, PermissionGrant};
@@ -3212,6 +3313,7 @@ mod tests {
             tls_state: None,
             transport: CodecOptions::default(),
             log_requests: false,
+            audit_commands: false,
             backup_dir,
             mtls_enabled: false,
             slow_command_threshold: Some(Duration::from_millis(100)),
@@ -3249,6 +3351,9 @@ mod tests {
                 })
                 .unwrap(),
             ),
+            read_index: Arc::new(CommittedReadIndex::default()),
+            replication_clients: Arc::new(ReplicationClientPool::default()),
+            ha_write_coordinator: None,
             replication_fanout_lock: Arc::new(tokio::sync::Mutex::new(())),
             replication_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
@@ -3621,6 +3726,64 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(queued.decode_value().unwrap(), "QUEUED");
+    }
+
+    #[test]
+    fn committed_reads_use_fast_path_after_acknowledged_write() {
+        let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
+        let mut session = SessionState::new(&guards());
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        runtime_handle
+            .block_on(authenticate(
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(1),
+                "dbuser",
+                "secret",
+            ))
+            .unwrap();
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("read-fast-path")).unwrap(),
+            engine::EngineOptions {
+                keyring: Some(test_keyring("read-fast-path-key")),
+                ..engine::EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        runtime_handle
+            .block_on(run_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(2),
+                Command::Set {
+                    key: "hello".to_string(),
+                    value: "world".to_string(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap();
+        let response = runtime_handle
+            .block_on(run_command(
+                handle,
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(3),
+                Command::Get {
+                    key: "hello".to_string(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(response.decode_value().unwrap(), "world");
+        assert_eq!(metrics.read_fast_path_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.read_fast_path_fallbacks.load(Ordering::Relaxed), 0);
     }
 
     #[test]

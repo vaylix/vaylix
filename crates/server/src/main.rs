@@ -3,6 +3,10 @@ use server::admin::run_admin_command;
 use server::bootstrap::build_server_launch_config;
 use server::{Args, Server};
 
+#[cfg(all(unix, not(target_env = "musl"), not(debug_assertions)))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     if let Err(err) = try_main().await {

@@ -37,7 +37,7 @@ The long-term target is broader:
 - `crates/transport`
   - frame layout, opcodes, request/response types, codec, sync/async framed I/O
 - `crates/engine`
-  - in-memory state, expirations, segmented WAL, snapshots, manifest, recovery, storage encryption, key rotation
+  - sharded in-memory state, expirations, segmented WAL, snapshots, manifest, recovery, storage encryption, key rotation
 - `crates/server`
   - Tokio listener, authentication, RBAC, TLS accept, session handling, quotas, rate limiting, maintenance mode, engine worker runtime
 - `crates/client`
@@ -46,8 +46,9 @@ The long-term target is broader:
 ## Current Data Model
 
 - User-visible model: `String -> String`
-- In-memory map: `BTreeMap<String, String>`
-- Expirations: per-key absolute timestamps in milliseconds
+- In-memory map: sharded `DashMap<String, StoredValue>`
+- Expirations: per-key absolute timestamps in milliseconds stored beside the value
+- Leader writes: eligible standalone commands are batched by a dedicated HA write coordinator into one local WAL batch and one replicated frontier before acknowledgement
 - Supported command families:
   - auth
   - ping
@@ -324,7 +325,9 @@ WAL management:
 - WAL lives under `<data-dir>/wal/`
 - active segment name: `active-<start_sequence>.wal`
 - sealed segment name: `<start_sequence>-<end_sequence>.wal`
-- the 0.6 write path keeps the active segment open through a stateful writer instead of reopening and rediscovering the active segment for every append
+- the write path keeps the active segment open through a stateful writer instead of reopening and rediscovering the active segment for every append
+- WAL append/flush/sync work runs behind a dedicated WAL I/O worker while sequence assignment remains in the engine coordinator
+- in-memory WAL entry term/checksum identities are cached for replication metadata lookups
 - eligible standalone writes may be appended as bounded batches; `flush` and `sync` modes must not acknowledge a write before the configured batch durability boundary completes
 - runtime controls:
   - `--wal-segment-size-bytes`
@@ -419,6 +422,7 @@ Audit logging is implemented as append-only JSON lines under the data directory 
 
 - default path: `<data-dir>/audit.log`
 - optional override: `--audit-log-path`
+- generic every-command audit is opt-in with `--audit-commands` / `VAYLIX_AUDIT_COMMANDS=true`
 
 Each event records:
 
@@ -441,7 +445,7 @@ Each event records:
 
 The audit chain uses a fixed zero genesis hash for the first event. On startup, the server verifies existing audit lines and fails closed if a line has malformed JSON, invalid sequence, mismatched previous hash, mismatched event hash, or an unsupported hash algorithm. This makes local tampering detectable, but it is not non-repudiation: a local attacker who can rewrite the entire log can recompute a fresh chain unless the latest hash is anchored externally.
 
-Passwords and payload contents are not written to the audit log. Semantic event types are recorded for authentication success/failure and RBAC/auth mutations such as create/drop user, password rotation, create/drop role, grant/revoke role, and grant/revoke permission. Slow command audit events are emitted when command latency is at or above `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`; the default is `100`, and `0` disables slow-command events.
+Passwords and payload contents are not written to the audit log. Semantic event types are recorded for authentication success/failure and RBAC/auth mutations such as create/drop user, password rotation, create/drop role, grant/revoke role, and grant/revoke permission. Generic command audit lines are disabled by default for the read/write hot path; enable `--audit-commands` when operators need every command represented in the hash chain. Slow command audit events are emitted when command latency is at or above `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`; the default is `100`, and `0` disables slow-command events.
 
 ## Scalability Direction
 
@@ -452,6 +456,7 @@ Current state:
 - pre-vote, majority election, heartbeats, append entries, snapshot install, and automatic leader failover
 - quorum-backed write acknowledgement by default through the `replica` / `majority` mode
 - follower-side catch-up through append entries, retained WAL history, and snapshot bootstrap fallback
+- leader commit waiters are notified on commit-index advancement rather than relying only on fixed polling sleeps
 - no sharding
 
 Architectural target:
@@ -593,7 +598,7 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.6.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.7.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 

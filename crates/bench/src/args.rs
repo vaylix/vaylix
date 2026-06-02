@@ -108,6 +108,9 @@ pub struct RunArgs {
     #[arg(long, env = "VAYLIX_BENCH_CONNECTIONS", default_value_t = 32)]
     pub connections: usize,
 
+    #[arg(long, env = "VAYLIX_BENCH_PIPELINE_DEPTH")]
+    pub pipeline_depth: Option<usize>,
+
     #[arg(long, env = "VAYLIX_BENCH_DURATION_SECONDS", default_value_t = 30)]
     pub duration_seconds: u64,
 
@@ -162,6 +165,9 @@ pub struct ProfileArgs {
     #[arg(long, env = "VAYLIX_BENCH_CONNECTIONS")]
     pub connections: Option<usize>,
 
+    #[arg(long, env = "VAYLIX_BENCH_PIPELINE_DEPTH")]
+    pub pipeline_depth: Option<usize>,
+
     #[arg(long, env = "VAYLIX_BENCH_KEYSPACE")]
     pub keyspace: Option<usize>,
 
@@ -206,6 +212,9 @@ pub struct ManagedArgs {
 
     #[arg(long, env = "VAYLIX_BENCH_CONNECTIONS")]
     pub connections: Option<usize>,
+
+    #[arg(long, env = "VAYLIX_BENCH_PIPELINE_DEPTH")]
+    pub pipeline_depth: Option<usize>,
 
     #[arg(long, env = "VAYLIX_BENCH_SEED_KEYS")]
     pub seed_keys: Option<usize>,

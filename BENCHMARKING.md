@@ -115,9 +115,19 @@ The load generator prints a JSON report with:
 
 - completed and failed operations
 - operations per second
+- pipeline depth used by the worker connections
 - p50 / p95 / p99 latency in microseconds
 - benchmark parameters used for the run
 - up to eight distinct error samples when operations fail
+
+For `0.7.0` and later, read-heavy profiles should be run against leader or standalone nodes when
+measuring the committed read fast path and sharded in-memory store. Followers intentionally keep
+stale/local read behavior and are not the baseline for leader read latency.
+
+`vaylix-bench` supports `--pipeline-depth` / `VAYLIX_BENCH_PIPELINE_DEPTH` for independent
+single-command workloads. Read-heavy workloads default to pipelining; write-heavy and stateful
+flows default to depth `1` because ordered write acknowledgement and transaction semantics make
+deep per-connection pipelining a latency tradeoff rather than a free throughput win.
 
 ## Command Profiles
 
@@ -170,7 +180,9 @@ cargo run -p bench -- quorum-write-cost \
 ```
 
 Run this against the current leader of a quorum cluster. It measures acknowledged `SET`
-latency under the server's configured write acknowledgement mode.
+latency under the server's configured write acknowledgement mode. On `0.7.0` and later, this
+profile exercises the HA write coordinator path that batches concurrent leader writes into one
+local WAL batch and one replicated frontier.
 
 Managed variants are available for local smoke and repeatable baselines:
 
@@ -379,6 +391,7 @@ target/release/vaylix-bench run \
   --password vaylix \
   --duration-seconds 5 \
   --connections 4 \
+  --pipeline-depth 1 \
   --keyspace 256 \
   --value-size 64 \
   --workload set

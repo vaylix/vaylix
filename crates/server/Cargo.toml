@@ -1,6 +1,6 @@
 [package]
 name = "server"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 
 [features]
@@ -39,6 +39,10 @@ tokio-rustls = "0.26.4"
 uuid = { version = "1.23.2", features = ["serde", "v7"] }
 x509-parser = "0.18.1"
 libc = "0.2.178"
+parking_lot = "0.12.5"
+
+[target.'cfg(all(unix, not(target_env = "musl")))'.dependencies]
+tikv-jemallocator = "0.6.0"
 
 [dev-dependencies]
 tokio = { version = "1.52.3", features = [

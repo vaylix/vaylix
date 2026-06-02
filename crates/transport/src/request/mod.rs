@@ -488,13 +488,13 @@ impl Request {
 }
 
 fn encode_key(key: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(string_u16_len(key));
     put_string_u16(&mut buf, key)?;
     Ok(buf.to_vec())
 }
 
 fn encode_dump(dump: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(string_u32_len(dump));
     put_string_u32(&mut buf, dump)?;
     Ok(buf.to_vec())
 }
@@ -507,7 +507,13 @@ fn decode_dump(payload: &[u8]) -> Result<String> {
 }
 
 fn encode_set(key: &str, value: &str, options: &SetOptions) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(
+        string_u16_len(key)
+            + string_u32_len(value)
+            + 1
+            + expiration_encoded_len(options.expiration)
+            + 2,
+    );
     put_string_u16(&mut buf, key)?;
     put_string_u32(&mut buf, value)?;
     buf.put_u8(encode_condition(options.condition));
@@ -518,7 +524,8 @@ fn encode_set(key: &str, value: &str, options: &SetOptions) -> Result<Vec<u8>> {
 }
 
 fn encode_get_ex(key: &str, expiration: Option<Expiration>, persist: bool) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf =
+        BytesMut::with_capacity(string_u16_len(key) + expiration_encoded_len(expiration) + 1);
     put_string_u16(&mut buf, key)?;
     encode_expiration(&mut buf, expiration)?;
     buf.put_u8(u8::from(persist));
@@ -526,14 +533,16 @@ fn encode_get_ex(key: &str, expiration: Option<Expiration>, persist: bool) -> Re
 }
 
 fn encode_key_value(key: &str, value: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(string_u16_len(key) + string_u32_len(value));
     put_string_u16(&mut buf, key)?;
     put_string_u32(&mut buf, value)?;
     Ok(buf.to_vec())
 }
 
 fn encode_three_strings(first: &str, second: &str, third: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(
+        string_u16_len(first) + string_u16_len(second) + string_u16_len(third),
+    );
     put_string_u16(&mut buf, first)?;
     put_string_u16(&mut buf, second)?;
     put_string_u16(&mut buf, third)?;
@@ -541,7 +550,7 @@ fn encode_three_strings(first: &str, second: &str, third: &str) -> Result<Vec<u8
 }
 
 fn encode_key_u64(key: &str, value: u64) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(string_u16_len(key) + 8);
     put_string_u16(&mut buf, key)?;
     buf.put_u64(value);
     Ok(buf.to_vec())
@@ -549,7 +558,7 @@ fn encode_key_u64(key: &str, value: u64) -> Result<Vec<u8>> {
 
 fn encode_keys(keys: &[String]) -> Result<Vec<u8>> {
     let key_count = u16::try_from(keys.len()).map_err(|_| TransportError::CorruptedPayload)?;
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(keys_payload_len(keys));
     buf.put_u16(key_count);
 
     for key in keys {
@@ -561,7 +570,7 @@ fn encode_keys(keys: &[String]) -> Result<Vec<u8>> {
 
 fn encode_pairs(entries: &[(String, String)]) -> Result<Vec<u8>> {
     let pair_count = u16::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(pairs_payload_len(entries));
     buf.put_u16(pair_count);
 
     for (key, value) in entries {
@@ -573,7 +582,7 @@ fn encode_pairs(entries: &[(String, String)]) -> Result<Vec<u8>> {
 }
 
 fn encode_optional_string(value: Option<&str>) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(1 + value.map_or(0, string_u32_len));
     match value {
         Some(value) => {
             buf.put_u8(1);
@@ -585,7 +594,8 @@ fn encode_optional_string(value: Option<&str>) -> Result<Vec<u8>> {
 }
 
 fn encode_scan(cursor: u64, pattern: Option<&str>, count: Option<u16>) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf =
+        BytesMut::with_capacity(10 + pattern.map_or(0, string_u16_len) + count.map_or(0, |_| 2));
     buf.put_u64(cursor);
     match pattern {
         Some(pattern) => {
@@ -625,6 +635,32 @@ fn encode_expiration(buf: &mut BytesMut, expiration: Option<Expiration>) -> Resu
         }
     }
     Ok(())
+}
+
+fn string_u16_len(value: &str) -> usize {
+    2 + value.len()
+}
+
+fn string_u32_len(value: &str) -> usize {
+    4 + value.len()
+}
+
+fn expiration_encoded_len(expiration: Option<Expiration>) -> usize {
+    match expiration {
+        None => 1,
+        Some(Expiration::Ex(_)) | Some(Expiration::Px(_)) => 9,
+    }
+}
+
+fn keys_payload_len(keys: &[String]) -> usize {
+    2 + keys.iter().map(|key| string_u16_len(key)).sum::<usize>()
+}
+
+fn pairs_payload_len(entries: &[(String, String)]) -> usize {
+    2 + entries
+        .iter()
+        .map(|(key, value)| string_u16_len(key) + string_u32_len(value))
+        .sum::<usize>()
 }
 
 fn decode_single_key(payload: &[u8]) -> Result<String> {

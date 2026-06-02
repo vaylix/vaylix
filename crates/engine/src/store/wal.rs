@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 use super::binary;
 
@@ -119,6 +121,154 @@ pub struct WalWriter {
     file_len: u64,
 }
 
+/// Dedicated WAL I/O worker handle.
+///
+/// The engine remains the authority for sequence assignment and state
+/// application, but append/flush/sync filesystem work is performed on this
+/// worker thread. Callers still wait for the durability result before
+/// acknowledging writes, preserving existing `buffered`/`flush`/`sync`
+/// semantics.
+pub struct WalWriterHandle {
+    sender: mpsc::Sender<WalWriterCommand>,
+}
+
+enum WalWriterCommand {
+    AppendBatch {
+        entries: Vec<WalEntry>,
+        keyring: Option<StorageKeyring>,
+        respond_to: mpsc::Sender<Result<()>>,
+    },
+    CloseActive {
+        respond_to: mpsc::Sender<Result<()>>,
+    },
+    Reset {
+        start_sequence: u64,
+        respond_to: mpsc::Sender<Result<()>>,
+    },
+    Shutdown,
+}
+
+impl WalWriterHandle {
+    /// Starts a WAL worker with an open active segment.
+    pub fn open(
+        wal_dir: &Path,
+        sync_policy: WalSyncPolicy,
+        max_segment_size_bytes: u64,
+        start_sequence: u64,
+    ) -> Result<Self> {
+        let writer = WalWriter::open(wal_dir, sync_policy, max_segment_size_bytes, start_sequence)?;
+        let wal_dir = wal_dir.to_path_buf();
+        let (sender, receiver) = mpsc::channel();
+        thread::Builder::new()
+            .name("vaylix-wal-io".to_string())
+            .spawn(move || {
+                run_wal_writer_worker(
+                    receiver,
+                    writer,
+                    wal_dir,
+                    sync_policy,
+                    max_segment_size_bytes,
+                );
+            })
+            .map_err(EngineError::Io)?;
+        Ok(Self { sender })
+    }
+
+    /// Appends a batch and waits for the configured durability boundary.
+    pub fn append_batch(
+        &self,
+        entries: &[WalEntry],
+        keyring: Option<&StorageKeyring>,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let (respond_to, response) = mpsc::channel();
+        self.sender
+            .send(WalWriterCommand::AppendBatch {
+                entries: entries.to_vec(),
+                keyring: keyring.cloned(),
+                respond_to,
+            })
+            .map_err(|_| EngineError::Io(std::io::Error::other("wal writer worker closed")))?;
+        response
+            .recv()
+            .map_err(|_| EngineError::Io(std::io::Error::other("wal writer worker closed")))?
+    }
+
+    /// Closes the active file after applying the configured durability boundary.
+    pub fn close_active(&self) -> Result<()> {
+        let (respond_to, response) = mpsc::channel();
+        self.sender
+            .send(WalWriterCommand::CloseActive { respond_to })
+            .map_err(|_| EngineError::Io(std::io::Error::other("wal writer worker closed")))?;
+        response
+            .recv()
+            .map_err(|_| EngineError::Io(std::io::Error::other("wal writer worker closed")))?
+    }
+
+    /// Reopens the active writer at a new sequence after snapshot or suffix replacement.
+    pub fn reset(&self, start_sequence: u64) -> Result<()> {
+        let (respond_to, response) = mpsc::channel();
+        self.sender
+            .send(WalWriterCommand::Reset {
+                start_sequence,
+                respond_to,
+            })
+            .map_err(|_| EngineError::Io(std::io::Error::other("wal writer worker closed")))?;
+        response
+            .recv()
+            .map_err(|_| EngineError::Io(std::io::Error::other("wal writer worker closed")))?
+    }
+}
+
+impl Drop for WalWriterHandle {
+    fn drop(&mut self) {
+        let _ = self.sender.send(WalWriterCommand::Shutdown);
+    }
+}
+
+fn run_wal_writer_worker(
+    receiver: mpsc::Receiver<WalWriterCommand>,
+    mut writer: WalWriter,
+    wal_dir: PathBuf,
+    sync_policy: WalSyncPolicy,
+    max_segment_size_bytes: u64,
+) {
+    for command in receiver {
+        match command {
+            WalWriterCommand::AppendBatch {
+                entries,
+                keyring,
+                respond_to,
+            } => {
+                let result = writer.append_batch(&entries, keyring.as_ref());
+                let _ = respond_to.send(result);
+            }
+            WalWriterCommand::CloseActive { respond_to } => {
+                let result = writer.close_active();
+                let _ = respond_to.send(result);
+            }
+            WalWriterCommand::Reset {
+                start_sequence,
+                respond_to,
+            } => {
+                let result = WalWriter::open(
+                    &wal_dir,
+                    sync_policy,
+                    max_segment_size_bytes,
+                    start_sequence,
+                )
+                .map(|next| {
+                    writer = next;
+                });
+                let _ = respond_to.send(result);
+            }
+            WalWriterCommand::Shutdown => break,
+        }
+    }
+}
+
 impl WalWriter {
     /// Opens the active segment, creating one at `start_sequence` when missing.
     pub fn open(
@@ -154,6 +304,7 @@ impl WalWriter {
     }
 
     /// Appends one entry and applies the configured durability boundary.
+    #[cfg(test)]
     pub fn append(&mut self, entry: &WalEntry, keyring: Option<&StorageKeyring>) -> Result<()> {
         self.append_batch(std::slice::from_ref(entry), keyring)
     }

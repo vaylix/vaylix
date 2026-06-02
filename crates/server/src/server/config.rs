@@ -9,6 +9,7 @@ use crate::audit::AuditLogger;
 use crate::auth::AuthConfig;
 use crate::replication::ReplicationRuntime;
 use crate::runtime_state::{AuthLockoutState, MaintenanceMode};
+use crate::server::{CommittedReadIndex, HaWriteCoordinator, ReplicationClientPool};
 
 /// Runtime guardrails for request validation, quotas, and abuse controls.
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ pub struct ServerRuntimeConfig {
     pub tls_state: Option<Arc<crate::tls::TlsState>>,
     pub transport: CodecOptions,
     pub log_requests: bool,
+    pub audit_commands: bool,
     pub audit_logger: Arc<AuditLogger>,
     pub backup_dir: PathBuf,
     pub mtls_enabled: bool,
@@ -48,6 +50,9 @@ pub struct ServerRuntimeConfig {
     pub insecure_auth_disabled: bool,
     pub insecure_default_credentials: bool,
     pub replication: Arc<ReplicationRuntime>,
+    pub read_index: Arc<CommittedReadIndex>,
+    pub replication_clients: Arc<ReplicationClientPool>,
+    pub ha_write_coordinator: Option<Arc<HaWriteCoordinator>>,
     pub replication_fanout_lock: Arc<Mutex<()>>,
     pub replication_apply_lock: Arc<Mutex<()>>,
 }

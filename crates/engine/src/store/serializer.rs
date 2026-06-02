@@ -25,6 +25,7 @@ mod tests {
 
     use super::{deserialize, serialize};
     use crate::EngineState;
+    use crate::engine::EngineStore;
     use crate::engine::state::EngineMetadata;
 
     #[test]
@@ -35,8 +36,7 @@ mod tests {
         expirations.insert("name".to_string(), 500);
 
         let state = EngineState {
-            data,
-            expirations,
+            store: EngineStore::from_parts(data, expirations),
             metadata: EngineMetadata {
                 version: 2,
                 created_at_ms: 123,
@@ -49,8 +49,8 @@ mod tests {
         let bytes = serialize(&state).unwrap();
         let decoded = deserialize(&bytes).unwrap();
 
-        assert_eq!(decoded.data.get("name").map(String::as_str), Some("alice"));
-        assert_eq!(decoded.expirations.get("name").copied(), Some(500));
+        assert_eq!(decoded.raw_value("name").as_deref(), Some("alice"));
+        assert_eq!(decoded.raw_expiration("name"), Some(500));
         assert_eq!(decoded.metadata.created_at_ms, 123);
         assert_eq!(decoded.metadata.updated_at_ms, 456);
         assert_eq!(decoded.metadata.last_snapshot_at_ms, Some(789));

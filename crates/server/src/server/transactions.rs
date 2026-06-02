@@ -6,9 +6,9 @@ use transport::Response;
 use uuid::Uuid;
 
 use super::{
-    EngineHandle, ServerRuntimeConfig, SessionState, authorize_command, current_time_millis,
-    drive_write_commit, enforce_leader_writeability, map_transaction_result_payload,
-    replication_role_accepts_writes, rollback_uncommitted_tail,
+    EngineHandle, ServerRuntimeConfig, SessionState, advance_read_index_to, authorize_command,
+    current_time_millis, drive_write_commit, enforce_leader_writeability,
+    map_transaction_result_payload, replication_role_accepts_writes, rollback_uncommitted_tail,
     send_cluster_heartbeats_role_guarded_with_timeout, validate_command,
     validate_transaction_command,
 };
@@ -80,6 +80,13 @@ pub(super) async fn handle_transaction_command(
                 rollback_uncommitted_tail(&engine, runtime).await?;
                 return Err(err);
             }
+            advance_read_index_to(
+                &engine,
+                metrics.as_ref(),
+                runtime,
+                last_applied.last_applied_sequence,
+            )
+            .await?;
             metrics
                 .transactions_committed
                 .fetch_add(1, Ordering::Relaxed);
