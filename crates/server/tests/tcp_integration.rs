@@ -1571,7 +1571,9 @@ async fn enforces_rate_limits_over_the_network() {
     .unwrap();
 
     let mut runtime = runtime(None);
-    runtime.guards.requests_per_second = 1;
+    // AUTH consumes the only burst token. Disable refill so the next request
+    // deterministically exercises the network rate-limit error path.
+    runtime.guards.requests_per_second = 0;
     runtime.guards.request_burst = 1;
     let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime)
         .await
