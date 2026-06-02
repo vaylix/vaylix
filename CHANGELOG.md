@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-06-02
+
+### Added
+
+- Added an image-internal Rust `vaylix-init` binary that prepares container data directories, repairs ownership for Linux bind mounts, drops to the configured runtime UID/GID, and execs the server without requiring a shell entrypoint.
+
+### Changed
+
+- Switched the runtime container image from Debian slim plus shell/gosu bootstrap to Debian 13 distroless `gcr.io/distroless/cc-debian13`.
+- Kept out-of-the-box Docker bind-mount behavior by running only the init bootstrap as root and the database server process as UID/GID `65532`.
+- Changed the server/storage default data directory to `/var/lib/vaylix` in all runtimes instead of an OS-specific user data directory.
+- Documented the distroless runtime model and benchmark workflow in the top-level project docs.
+- Documented local Valkey comparison results for in-memory and AOF fsync-always benchmark modes.
+
+### Fixed
+
+- Fixed the benchmark load generator so valid `GET` misses count as completed read operations instead of failed benchmark operations.
+
 ## [0.5.2] - 2026-06-01
 
 ### Changed

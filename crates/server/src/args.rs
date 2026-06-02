@@ -83,9 +83,9 @@ pub struct Args {
     #[arg(long, env = "VAYLIX_TLS_CLIENT_CA", requires = "ssl")]
     pub tls_client_ca: Option<PathBuf>,
 
-    /// Optional data directory override. This is the directory that should be mounted in containers.
-    #[arg(long, env = "VAYLIX_DATA_DIR")]
-    pub data_dir: Option<PathBuf>,
+    /// Durable server data directory.
+    #[arg(long, env = "VAYLIX_DATA_DIR", default_value = engine::DEFAULT_DATA_DIR)]
+    pub data_dir: PathBuf,
 
     /// Directory used for server-side logical backup and restore files.
     #[arg(long, env = "VAYLIX_BACKUP_DIR")]

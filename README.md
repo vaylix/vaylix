@@ -17,7 +17,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.5.1`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.5.3`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -37,6 +37,10 @@ docker run --rm \
 
 Mount `/var/lib/vaylix` for persistence. The data directory contains snapshots, WAL, manifests, the storage keyring, encrypted auth/RBAC metadata, backups, and the audit log.
 
+The published container uses a Debian 13 distroless runtime. It starts through the image-internal `vaylix-init` binary as root only long enough to create and repair ownership for `VAYLIX_DATA_DIR` and `VAYLIX_BACKUP_DIR`, then drops privileges and execs the server as UID/GID `65532`. This keeps Linux bind mounts working without manual host `chown` while keeping the database process unprivileged.
+
+The server data directory defaults to `/var/lib/vaylix` in every runtime. Use `--data-dir` or `VAYLIX_DATA_DIR` only when an operator-controlled mount policy requires a different durable path. The interactive client still stores local history under the OS user data directory.
+
 Useful runtime environment variables for containers:
 
 - `VAYLIX_BIND`
@@ -44,6 +48,8 @@ Useful runtime environment variables for containers:
 - `VAYLIX_MAX_CONNECTIONS`
 - `VAYLIX_DATA_DIR`
 - `VAYLIX_BACKUP_DIR`
+- `VAYLIX_RUNTIME_UID`
+- `VAYLIX_RUNTIME_GID`
 - `VAYLIX_USER`
 - `VAYLIX_PASSWORD`
 - `VAYLIX_SSL`
@@ -128,7 +134,7 @@ Followers may serve local stale reads; clients that require linearizable read-af
 Start a local server:
 
 ```bash
-vaylix --bind 127.0.0.1 --port 9173 --user vaylix --password vaylix
+vaylix --bind 127.0.0.1 --port 9173 --data-dir ./vaylix-data --user vaylix --password vaylix
 ```
 
 Connect with the client:
@@ -143,6 +149,7 @@ Enable TLS when certificate material is available:
 vaylix \
   --bind 127.0.0.1 \
   --port 9173 \
+  --data-dir ./vaylix-data \
   --ssl \
   --tls-cert ./certs/server.crt \
   --tls-key ./certs/server.key

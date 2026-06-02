@@ -542,6 +542,7 @@ They also include operational hardening fields such as `runtime.transaction_max_
 ## Client Runtime
 
 - interactive REPL
+- local history uses the OS user data directory through `directories::ProjectDirs`
 - local-only commands:
   - `help`
   - `exit`
@@ -556,8 +557,12 @@ The local `help` command is formatted as a readable command reference with gramm
 ## Packaging, Docker, and Data Directory
 
 - default container/server data directory: `/var/lib/vaylix`
+- default server data directory in all runtimes: `/var/lib/vaylix`
 - intended Docker volume mount:
   - `-v vaylix-data:/var/lib/vaylix`
+- runtime container base: Debian 13 distroless `gcr.io/distroless/cc-debian13`
+- image bootstrap binary: `/usr/local/bin/vaylix-init`
+- server runtime identity after bootstrap: UID/GID `65532`
 
 This path is the durable storage root for:
 
@@ -567,6 +572,10 @@ This path is the durable storage root for:
 - storage keyring
 - encrypted auth/RBAC metadata
 - logical backup files under the backup directory
+
+The image starts `vaylix-init` as root only to create `VAYLIX_DATA_DIR` / `VAYLIX_BACKUP_DIR`, recursively repair data-directory ownership for Linux bind mounts, then call `setgid`, `setuid`, and `exec` the real `vaylix` server command. Do not replace this with a shell entrypoint; the runtime image is distroless and intentionally has no shell or package manager.
+
+Do not reintroduce a server default based on per-user OS project directories. Server storage is durable database state and must default to `/var/lib/vaylix`; local development should pass `--data-dir ./vaylix-data` or another explicit writable path. Client-local state such as REPL history may continue to use user-space project directories.
 
 ## CI and Release
 
@@ -581,7 +590,7 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.5.1`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.5.3`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 

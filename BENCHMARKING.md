@@ -303,6 +303,7 @@ Profile the server binary itself under a realistic deployment:
 cargo flamegraph -p server --bin vaylix -- \
   --bind 127.0.0.1 \
   --port 9173 \
+  --data-dir .tmp-vaylix-flamegraph \
   --user vaylix \
   --password vaylix
 ```
@@ -312,6 +313,66 @@ Then drive load from another shell with `vaylix-bench`.
 ## Practical Notes
 
 - Do not compare single-node and quorum numbers directly without recording `--write-ack-mode`, replication topology, auth state, and compression state.
+- Read-heavy workloads treat `GET` misses as completed database operations. A miss is a valid key/value read result, not a benchmark transport or server failure.
 - Failed operations during load usually indicate rate limiting, auth errors, or a benchmark target that is already saturated. Treat that as a signal, not noise.
 - Criterion isolates micro-level regressions; `vaylix-bench` captures contention, protocol, and replication effects; flamegraphs explain where the CPU went.
 - The managed launcher is for reproducible local baselines, not production orchestration. Use external orchestration when benchmarking real deployment topology, filesystems, or network characteristics.
+
+## Local Valkey Comparison
+
+The `0.5.3` benchmark pass used Docker Hub image `valkey/valkey:8-alpine` for a local reference point. This is not an apples-to-apples product benchmark:
+
+- Vaylix numbers use the Vaylix framed protocol, authentication, default compression negotiation, serialized engine worker, and WAL `flush`.
+- Valkey numbers use `valkey-benchmark` inside the Valkey container over RESP.
+- Valkey in-memory mode has no durable write guarantee. The AOF run with `appendfsync always` is closer to a durability-stressed write path, but still has different storage, protocol, and command semantics.
+
+Vaylix local single-node command run:
+
+```bash
+target/release/vaylix \
+  --bind 127.0.0.1 \
+  --port 19175 \
+  --data-dir .tmp-vaylix-compare \
+  --user vaylix \
+  --password vaylix \
+  --requests-per-second 100000 \
+  --request-burst 100000
+
+target/release/vaylix-bench run \
+  --addr 127.0.0.1:19175 \
+  --username vaylix \
+  --password vaylix \
+  --duration-seconds 5 \
+  --connections 4 \
+  --keyspace 256 \
+  --value-size 64 \
+  --workload set
+```
+
+Valkey in-memory run:
+
+```bash
+docker run -d --name valkey-compare valkey/valkey:8-alpine --save "" --appendonly no
+docker exec valkey-compare valkey-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 10000 -c 4 -d 64 -r 256 --csv
+```
+
+Valkey AOF fsync-always run:
+
+```bash
+docker run -d --name valkey-compare valkey/valkey:8-alpine --save "" --appendonly yes --appendfsync always
+docker exec valkey-compare valkey-benchmark -h 127.0.0.1 -p 6379 -t set,get -n 10000 -c 4 -d 64 -r 256 --csv
+```
+
+Observed local results:
+
+| Target | Mode | Operation | Throughput | p50 | p95 | p99 |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| Vaylix | WAL flush | SET | 70.2 ops/s | 56.735 ms | 60.991 ms | 65.247 ms |
+| Vaylix | WAL flush | GET | 5,645.8 ops/s | 0.693 ms | 0.795 ms | 0.894 ms |
+| Vaylix | WAL flush | mixed | 232.2 ops/s | 14.375 ms | 56.799 ms | 58.431 ms |
+| Valkey | in-memory | SET | 89,285.71 ops/s | 0.039 ms | 0.055 ms | 0.063 ms |
+| Valkey | in-memory | GET | 84,033.61 ops/s | 0.039 ms | 0.055 ms | 0.055 ms |
+| Valkey | AOF fsync always | SET | 8,285.00 ops/s | 0.471 ms | 0.567 ms | 0.727 ms |
+| Valkey | AOF fsync always | GET | 156,250.00 ops/s | 0.023 ms | 0.031 ms | 0.047 ms |
+
+The main signal is not that these systems are equivalent; they are not. The useful signal is that Vaylix write throughput is currently dominated by its serialized durable write path and should be treated as the first major performance target before marketing benchmark claims.
