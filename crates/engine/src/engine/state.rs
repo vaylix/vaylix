@@ -1,6 +1,7 @@
+use crate::engine::{EngineStore, StoredValue};
 use crate::error::{EngineError, Result};
 use crate::store::{WalEntry, WalOperation};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,14 +30,47 @@ pub struct EngineMetadata {
 }
 
 /// In-memory database state rebuilt from snapshots and the WAL.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineState {
-    /// Primary key/value store.
-    pub data: BTreeMap<String, String>,
-    /// Per-key expiration timestamps in unix milliseconds.
-    pub expirations: BTreeMap<String, u64>,
+    /// Sharded primary key/value store.
+    pub store: EngineStore,
     /// Engine metadata.
     pub metadata: EngineMetadata,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedEngineState {
+    data: BTreeMap<String, String>,
+    expirations: BTreeMap<String, u64>,
+    metadata: EngineMetadata,
+}
+
+impl Serialize for EngineState {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let (data, expirations) = self.store.to_parts();
+        PersistedEngineState {
+            data,
+            expirations,
+            metadata: self.metadata.clone(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for EngineState {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedEngineState::deserialize(deserializer)?;
+        Ok(Self {
+            store: EngineStore::from_parts(persisted.data, persisted.expirations),
+            metadata: persisted.metadata,
+        })
+    }
 }
 
 /// Rollback checkpoint used to revert a partially applied state mutation.
@@ -47,8 +81,8 @@ pub struct RollbackPlan {
 
 #[derive(Default)]
 struct EntryRollback {
-    keys: BTreeMap<String, (Option<String>, Option<u64>)>,
-    clear_snapshot: Option<(BTreeMap<String, String>, BTreeMap<String, u64>)>,
+    keys: BTreeMap<String, Option<StoredValue>>,
+    clear_snapshot: Option<EngineStore>,
 }
 
 impl EntryRollback {
@@ -56,42 +90,27 @@ impl EntryRollback {
         if self.clear_snapshot.is_some() || self.keys.contains_key(key) {
             return;
         }
-        self.keys.insert(
-            key.to_string(),
-            (
-                state.data.get(key).cloned(),
-                state.expirations.get(key).copied(),
-            ),
-        );
+        self.keys.insert(key.to_string(), state.store.get(key));
     }
 
     fn remember_clear(&mut self, state: &EngineState) {
         if self.clear_snapshot.is_none() {
-            self.clear_snapshot = Some((state.data.clone(), state.expirations.clone()));
+            self.clear_snapshot = Some(state.store.clone());
             self.keys.clear();
         }
     }
 
     fn rollback(self, state: &mut EngineState, metadata: EngineMetadata) {
-        if let Some((data, expirations)) = self.clear_snapshot {
-            state.data = data;
-            state.expirations = expirations;
+        if let Some(store) = self.clear_snapshot {
+            state.store = store;
         } else {
-            for (key, (value, expiration)) in self.keys {
+            for (key, value) in self.keys {
                 match value {
                     Some(value) => {
-                        state.data.insert(key.clone(), value);
+                        state.store.insert_entry(key, value);
                     }
                     None => {
-                        state.data.remove(&key);
-                    }
-                }
-                match expiration {
-                    Some(expires_at_ms) => {
-                        state.expirations.insert(key, expires_at_ms);
-                    }
-                    None => {
-                        state.expirations.remove(&key);
+                        state.store.remove(&key);
                     }
                 }
             }
@@ -106,8 +125,7 @@ impl EngineState {
         let now_ms = now_millis();
 
         Self {
-            data: BTreeMap::new(),
-            expirations: BTreeMap::new(),
+            store: EngineStore::new(),
             metadata: EngineMetadata {
                 version: ENGINE_VERSION,
                 created_at_ms: now_ms,
@@ -150,49 +168,36 @@ impl EngineState {
 
     /// Removes expired keys and returns the number of keys dropped.
     pub fn purge_expired(&mut self, now_ms: u64) -> usize {
-        let expired_keys: Vec<String> = self
-            .expirations
-            .iter()
-            .filter(|(_, expires_at_ms)| **expires_at_ms <= now_ms)
-            .map(|(key, _)| key.clone())
-            .collect();
-
-        for key in &expired_keys {
-            self.data.remove(key);
-            self.expirations.remove(key);
-        }
-
-        if !expired_keys.is_empty() {
+        let removed = self.store.purge_expired(now_ms);
+        if removed > 0 {
             self.metadata.updated_at_ms = now_ms;
         }
-
-        expired_keys.len()
+        removed
     }
 
     /// Returns the live value for a key after expiration cleanup.
     pub fn get_live(&mut self, key: &str, now_ms: u64) -> Option<String> {
         self.purge_expired(now_ms);
-        self.data.get(key).cloned()
+        self.store.get_value(key)
     }
 
     /// Returns whether the key is currently live after expiration cleanup.
     pub fn has_live_key(&mut self, key: &str, now_ms: u64) -> bool {
         self.purge_expired(now_ms);
-        self.data.contains_key(key)
+        self.store.contains_key(key)
     }
 
     /// Returns the remaining TTL for a key after expiration cleanup.
     pub fn ttl_for(&mut self, key: &str, now_ms: u64) -> i64 {
         self.purge_expired(now_ms);
 
-        if !self.data.contains_key(key) {
+        if !self.store.contains_key(key) {
             return TTL_KEY_MISSING;
         }
 
-        match self.expirations.get(key).copied() {
+        match self.store.expiration(key) {
             Some(expires_at_ms) if expires_at_ms <= now_ms => {
-                self.data.remove(key);
-                self.expirations.remove(key);
+                self.store.remove(key);
                 self.metadata.updated_at_ms = now_ms;
                 TTL_KEY_MISSING
             }
@@ -203,17 +208,77 @@ impl EngineState {
 
     /// Returns all live keys in deterministic order.
     pub fn live_keys(&mut self, now_ms: u64) -> Vec<String> {
-        self.purge_expired(now_ms);
-        self.data.keys().cloned().collect()
+        self.store.live_keys_sorted(now_ms)
     }
 
     /// Returns all live entries in deterministic order.
     pub fn live_entries(&mut self, now_ms: u64) -> Vec<(String, String)> {
-        self.purge_expired(now_ms);
-        self.data
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
+        self.store.live_entries_sorted(now_ms)
+    }
+
+    /// Returns all data and expiration entries in deterministic persisted form.
+    pub fn to_persisted_parts(&self) -> (BTreeMap<String, String>, BTreeMap<String, u64>) {
+        self.store.to_parts()
+    }
+
+    /// Returns the current key count without sweeping expirations.
+    pub fn key_count(&self) -> usize {
+        self.store.len()
+    }
+
+    /// Returns whether the keyspace is empty without sweeping expirations.
+    pub fn is_empty(&self) -> bool {
+        self.store.is_empty()
+    }
+
+    /// Returns the stored value without sweeping expirations.
+    pub fn raw_value(&self, key: &str) -> Option<String> {
+        self.store.get_value(key)
+    }
+
+    /// Returns the stored value and expiration without sweeping expirations.
+    pub fn raw_entry(&self, key: &str) -> Option<StoredValue> {
+        self.store.get(key)
+    }
+
+    /// Returns whether the key exists without sweeping expirations.
+    pub fn raw_contains_key(&self, key: &str) -> bool {
+        self.store.contains_key(key)
+    }
+
+    /// Returns a raw expiration without sweeping expirations.
+    pub fn raw_expiration(&self, key: &str) -> Option<u64> {
+        self.store.expiration(key)
+    }
+
+    /// Inserts or replaces a value and removes any expiration.
+    pub fn set_raw_value(&mut self, key: String, value: String) {
+        self.store.insert_value(key, value);
+    }
+
+    /// Inserts or replaces a complete stored entry.
+    pub fn set_raw_entry(&mut self, key: String, entry: StoredValue) {
+        self.store.insert_entry(key, entry);
+    }
+
+    /// Removes a key and returns the previous entry, if present.
+    pub fn remove_raw(&mut self, key: &str) -> Option<StoredValue> {
+        self.store.remove(key)
+    }
+
+    /// Sets an expiration when the key exists.
+    pub fn set_expiration_if_present(&mut self, key: &str, expires_at_ms: u64) -> bool {
+        self.store.set_expiration_if_present(key, expires_at_ms)
+    }
+
+    /// Clears an expiration and reports whether one existed.
+    pub fn clear_expiration(&mut self, key: &str) -> bool {
+        self.store.clear_expiration(key)
+    }
+
+    /// Clears all stored keys.
+    pub fn clear_all(&mut self) {
+        self.store.clear();
     }
 
     /// Marks the state as successfully snapshotted.
@@ -231,36 +296,27 @@ impl EngineState {
         match operation {
             WalOperation::Set { key, value } => {
                 rollback.remember_key(self, key);
-                self.data.insert(key.clone(), value.clone());
-                self.expirations.remove(key);
+                self.store.insert_value(key.clone(), value.clone());
             }
             WalOperation::Delete { key } => {
                 rollback.remember_key(self, key);
-                self.data.remove(key);
-                self.expirations.remove(key);
+                self.store.remove(key);
             }
             WalOperation::Expire { key, expires_at_ms } => {
                 rollback.remember_key(self, key);
-                if self.data.contains_key(key) {
-                    self.expirations.insert(key.clone(), *expires_at_ms);
-                }
+                self.store.set_expiration_if_present(key, *expires_at_ms);
             }
             WalOperation::Persist { key } => {
                 rollback.remember_key(self, key);
-                self.expirations.remove(key);
+                self.store.clear_expiration(key);
             }
             WalOperation::Clear => {
                 rollback.remember_clear(self);
-                self.data.clear();
-                self.expirations.clear();
+                self.store.clear();
             }
             WalOperation::CheckInteger { key, delta } => {
                 rollback.remember_key(self, key);
-                let current = self
-                    .data
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| "0".to_string());
+                let current = self.store.get_value(key).unwrap_or_else(|| "0".to_string());
                 let parsed =
                     current
                         .parse::<i64>()
@@ -271,8 +327,7 @@ impl EngineState {
                 let next = parsed
                     .checked_add(*delta)
                     .ok_or_else(|| EngineError::NumericOverflow { key: key.clone() })?;
-                self.data.insert(key.clone(), next.to_string());
-                self.expirations.remove(key);
+                self.store.insert_value(key.clone(), next.to_string());
             }
         }
 
@@ -310,8 +365,7 @@ mod tests {
     fn initializes_with_metadata_and_empty_data() {
         let state = EngineState::new();
 
-        assert!(state.data.is_empty());
-        assert!(state.expirations.is_empty());
+        assert!(state.is_empty());
         assert_eq!(state.metadata.version, ENGINE_VERSION);
         assert!(state.metadata.created_at_ms > 0);
         assert_eq!(state.metadata.last_applied_sequence, 0);
@@ -330,7 +384,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        assert_eq!(state.data.get("name").map(String::as_str), Some("alice"));
+        assert_eq!(state.raw_value("name").as_deref(), Some("alice"));
 
         state
             .apply_entry(&entry(
@@ -340,7 +394,7 @@ mod tests {
                 },
             ))
             .unwrap();
-        assert!(!state.data.contains_key("name"));
+        assert!(!state.raw_contains_key("name"));
         assert_eq!(state.metadata.last_applied_sequence, 2);
     }
 

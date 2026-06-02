@@ -11,7 +11,10 @@ use crate::error::{Result, ServerError};
 use crate::replication::{
     ClusterMember, ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
 };
-use crate::server::{AuthLockoutState, MaintenanceMode, ServerGuards, ServerRuntimeConfig};
+use crate::server::{
+    AuthLockoutState, CommittedReadIndex, MaintenanceMode, ReplicationClientPool, ServerGuards,
+    ServerRuntimeConfig,
+};
 
 /// Fully resolved dependencies required to start a server instance.
 ///
@@ -86,6 +89,9 @@ pub fn build_server_launch_config(args: &Args) -> Result<ServerLaunchConfig> {
             cluster_members,
             &paths,
         ))?),
+        read_index: Arc::new(CommittedReadIndex::default()),
+        replication_clients: Arc::new(ReplicationClientPool::default()),
+        ha_write_coordinator: None,
         replication_fanout_lock: Arc::new(Mutex::new(())),
         replication_apply_lock: Arc::new(Mutex::new(())),
     };

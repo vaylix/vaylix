@@ -6,6 +6,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-02
+
+### Added
+
+- Added a sharded `DashMap`-backed engine store with value and expiration metadata colocated per key.
+- Added a dedicated WAL I/O worker thread so append/flush/sync filesystem work is separated from the in-memory engine coordinator.
+- Added Unix release-build jemalloc support for the server binary on supported non-musl targets.
+- Added a committed read index for leader/standalone `GET`, `MGET`, `EXISTS`, and `TTL` fast-path reads after auth, RBAC, validation, rate-limit, maintenance, and leader-read checks.
+- Added persistent replication peer workers for leader append and heartbeat RPCs so quorum writes no longer reconnect, renegotiate, and re-authenticate for every hot-path fanout.
+- Added a dedicated HA write coordinator that batches concurrent leader writes into one ordered local WAL batch and one replicated frontier.
+- Added read fast-path and replication client diagnostics to `METRICS` / `INFO`.
+- Added cached in-memory WAL entry identities for replication term/checksum lookup.
+
+### Changed
+
+- Preserved the existing snapshot/logical backup/replication payload shape by exporting deterministic sorted views from the sharded live store.
+- Reduced quorum write acknowledgement latency by rechecking commit advancement immediately after successful append fanout instead of sleeping through the happy path.
+- Replaced fixed commit polling sleeps with notification-driven commit advancement waits.
+- Reduced batched write memory pressure by replacing full `EngineState` cloning with touched-key rollback tracking for normal command batches.
+- Reduced ordered write-coordinator overhead by moving batched command payloads instead of cloning them before engine execution.
+- Reduced leader append fanout allocation by avoiding duplicate cached WAL entry clones during follower planning.
+- Reduced binary transport allocator churn by pre-sizing common request and response payload buffers.
+
+### Fixed
+
+- Kept the committed read index coherent after `RESTORE FROM`, follower append application, and snapshot install paths.
+
 ## [0.6.0] - 2026-06-02
 
 ### Added

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::error::{Result, ServerError};
 use crate::server::log_event;
@@ -275,6 +275,7 @@ struct ReplicationState {
 pub struct ReplicationRuntime {
     config: ReplicationConfig,
     state: Arc<Mutex<ReplicationState>>,
+    commit_notify: Arc<Notify>,
 }
 
 impl ReplicationRuntime {
@@ -376,6 +377,7 @@ impl ReplicationRuntime {
                 election_suppressed_until,
                 members,
             })),
+            commit_notify: Arc::new(Notify::new()),
         })
     }
 
@@ -524,6 +526,7 @@ impl ReplicationRuntime {
         checksum: Option<u32>,
     ) {
         let mut state = self.state.lock().await;
+        let previous_commit_sequence = state.commit_sequence;
         state.local_last_applied_sequence = sequence;
         state.local_last_applied_term = term;
         state.local_last_applied_checksum = checksum;
@@ -532,6 +535,7 @@ impl ReplicationRuntime {
         } else if state.role == ReplicationRole::Leader {
             recompute_commit_sequence(&self.config, &mut state);
         }
+        self.notify_commit_if_advanced(previous_commit_sequence, &state);
     }
 
     pub async fn update_follower_phase(
@@ -564,6 +568,7 @@ impl ReplicationRuntime {
         leader_node_id: &str,
     ) {
         let mut state = self.state.lock().await;
+        let previous_commit_sequence = state.commit_sequence;
         if state.role != ReplicationRole::Leader
             || state.current_term != term
             || leader_node_id != self.config.node_id
@@ -582,6 +587,7 @@ impl ReplicationRuntime {
         if state.role == ReplicationRole::Leader {
             recompute_commit_sequence(&self.config, &mut state);
         }
+        self.notify_commit_if_advanced(previous_commit_sequence, &state);
     }
 
     pub async fn wait_for_write_ack(&self, sequence: u64) -> Result<()> {
@@ -591,6 +597,7 @@ impl ReplicationRuntime {
 
         let deadline = Instant::now() + self.config.ack_timeout;
         loop {
+            let notified = self.commit_notify.notified();
             {
                 let state = self.state.lock().await;
                 let total_voters = voter_count(&state.members);
@@ -616,8 +623,16 @@ impl ReplicationRuntime {
                     mode: self.config.write_ack_mode.as_str().to_string(),
                 });
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            wait_until_notified_or_deadline(notified, deadline).await;
         }
+    }
+
+    pub async fn wait_for_commit_change_until(&self, deadline: Instant) {
+        let notified = self.commit_notify.notified();
+        if Instant::now() >= deadline {
+            return;
+        }
+        wait_until_notified_or_deadline(notified, deadline).await;
     }
 
     pub async fn retention_floor_sequence(&self) -> Option<u64> {
@@ -997,6 +1012,7 @@ impl ReplicationRuntime {
         state.bootstrap_release_at = None;
         state.leader_node_id = Some(request.leader_node_id.clone());
         state.leader_advertise_addr = Some(request.leader_addr.clone());
+        let previous_commit_sequence = state.commit_sequence;
         state.commit_sequence = state.commit_sequence.max(request.commit_sequence);
         state.leader_target_sequence = state.leader_target_sequence.max(
             request
@@ -1024,6 +1040,7 @@ impl ReplicationRuntime {
             .map(|member| (member.node_id.clone(), member))
             .collect();
         persist_state(&self.config, &state)?;
+        self.notify_commit_if_advanced(previous_commit_sequence, &state);
         Ok(HeartbeatResponse {
             term: state.current_term,
             accepted: true,
@@ -1056,6 +1073,7 @@ impl ReplicationRuntime {
         state.bootstrap_release_at = None;
         state.leader_node_id = Some(leader_node_id);
         state.leader_advertise_addr = leader_addr;
+        let previous_commit_sequence = state.commit_sequence;
         state.commit_sequence = state.commit_sequence.max(commit_sequence);
         state.leader_target_sequence = state
             .leader_target_sequence
@@ -1082,6 +1100,7 @@ impl ReplicationRuntime {
                 .collect();
         }
         persist_state(&self.config, &state)?;
+        self.notify_commit_if_advanced(previous_commit_sequence, &state);
         Ok(())
     }
 
@@ -1156,6 +1175,7 @@ impl ReplicationRuntime {
         leader_node_id: &str,
     ) {
         let mut state = self.state.lock().await;
+        let previous_commit_sequence = state.commit_sequence;
         if state.role != ReplicationRole::Leader
             || state.current_term != term
             || leader_node_id != self.config.node_id
@@ -1189,6 +1209,13 @@ impl ReplicationRuntime {
                 .min(fallback_next.max(1));
         }
         recompute_commit_sequence(&self.config, &mut state);
+        self.notify_commit_if_advanced(previous_commit_sequence, &state);
+    }
+
+    fn notify_commit_if_advanced(&self, previous_commit_sequence: u64, state: &ReplicationState) {
+        if state.commit_sequence > previous_commit_sequence {
+            self.commit_notify.notify_waiters();
+        }
     }
 
     pub async fn local_advertise_addr(&self) -> Option<String> {
@@ -1271,6 +1298,16 @@ impl ReplicationRuntime {
             quorum_size: quorum,
             members,
         }
+    }
+}
+
+async fn wait_until_notified_or_deadline(
+    notified: impl std::future::Future<Output = ()>,
+    deadline: Instant,
+) {
+    tokio::select! {
+        _ = notified => {}
+        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {}
     }
 }
 

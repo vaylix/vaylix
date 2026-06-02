@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, thread, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    thread,
+    time::Duration,
+};
 
 use command::Command;
 use engine::{Engine, StorageEngine, TransactionResult, WalSyncPolicy};
@@ -9,6 +13,7 @@ use uuid::Uuid;
 use super::execute_command;
 use crate::error::{Result, ServerError};
 
+const ENGINE_QUEUE_CAPACITY: usize = 1024;
 const MAX_WRITE_BATCH: usize = 64;
 const SYNC_WRITE_BATCH_WINDOW: Duration = Duration::from_millis(2);
 
@@ -24,6 +29,11 @@ enum EngineRequest {
         consensus_term: u64,
         commands: Vec<Command>,
         respond_to: oneshot::Sender<Result<Vec<TransactionResult>>>,
+    },
+    ExecuteWriteBatch {
+        consensus_term: u64,
+        commands: Vec<(Uuid, Command)>,
+        respond_to: oneshot::Sender<Result<Vec<ExecuteResult>>>,
     },
     AppendNoop {
         consensus_term: u64,
@@ -83,6 +93,11 @@ struct PendingExecute {
     respond_to: oneshot::Sender<Result<ExecuteResult>>,
 }
 
+struct PendingBatchResponse {
+    request_id: Uuid,
+    respond_to: oneshot::Sender<Result<ExecuteResult>>,
+}
+
 pub(super) struct ExecuteResult {
     pub(super) response: Response,
     pub(super) last_applied_sequence: u64,
@@ -90,6 +105,7 @@ pub(super) struct ExecuteResult {
     pub(super) last_applied_checksum: Option<u32>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct LogAppendResult {
     pub(super) last_applied_sequence: u64,
     pub(super) last_applied_term: Option<u64>,
@@ -104,7 +120,7 @@ pub(super) struct EngineHandle {
 
 impl EngineHandle {
     pub(super) fn new(mut engine: Engine) -> Self {
-        let (sender, mut receiver) = mpsc::channel(256);
+        let (sender, mut receiver) = mpsc::channel(ENGINE_QUEUE_CAPACITY);
         thread::spawn(move || {
             let mut pending = VecDeque::new();
             loop {
@@ -142,6 +158,17 @@ impl EngineHandle {
                                 .execute_transaction(&commands)
                                 .map_err(ServerError::from),
                         );
+                    }
+                    EngineRequest::ExecuteWriteBatch {
+                        consensus_term,
+                        commands,
+                        respond_to,
+                    } => {
+                        let _ = respond_to.send(process_explicit_write_batch(
+                            &mut engine,
+                            consensus_term,
+                            commands,
+                        ));
                     }
                     EngineRequest::AppendNoop {
                         consensus_term,
@@ -271,6 +298,26 @@ impl EngineHandle {
         self.sender
             .send(EngineRequest::ExecuteBatch {
                 request_id,
+                consensus_term,
+                commands,
+                respond_to: send,
+            })
+            .await
+            .map_err(|_| ServerError::EngineWorkerClosed)?;
+        recv.await.map_err(|_| ServerError::EngineWorkerClosed)?
+    }
+
+    pub(super) async fn execute_write_batch(
+        &self,
+        consensus_term: u64,
+        commands: Vec<(Uuid, Command)>,
+    ) -> Result<Vec<ExecuteResult>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (send, recv) = oneshot::channel();
+        self.sender
+            .send(EngineRequest::ExecuteWriteBatch {
                 consensus_term,
                 commands,
                 respond_to: send,
@@ -469,42 +516,105 @@ fn process_write_batch(
     }
 
     engine.set_consensus_term(consensus_term);
-    let commands = batch
-        .iter()
-        .map(|execute| execute.command.clone())
-        .collect::<Vec<_>>();
+    let mut pending_responses = Vec::with_capacity(batch.len());
+    let mut commands = Vec::with_capacity(batch.len());
+    for execute in batch {
+        pending_responses.push(PendingBatchResponse {
+            request_id: execute.request_id,
+            respond_to: execute.respond_to,
+        });
+        commands.push(execute.command);
+    }
+
     match engine
         .execute_command_batch(&commands)
         .map_err(ServerError::from)
     {
         Ok(results) => {
-            for (execute, result) in batch.into_iter().zip(results) {
-                let response = render_transaction_result(execute.request_id, result.result)
-                    .and_then(|response| {
-                        let last_applied =
-                            applied_state_for_sequence(engine, result.last_applied_sequence)?;
-                        Ok(ExecuteResult {
-                            response,
-                            last_applied_sequence: last_applied.last_applied_sequence,
-                            last_applied_term: last_applied.last_applied_term,
-                            last_applied_checksum: last_applied.last_applied_checksum,
-                        })
-                    });
-                let _ = execute.respond_to.send(response);
+            let mut applied_state_cache = BTreeMap::new();
+            for (pending_response, result) in pending_responses.into_iter().zip(results) {
+                let response = render_transaction_result(
+                    pending_response.request_id,
+                    result.result,
+                )
+                .and_then(|response| {
+                    let last_applied = match applied_state_cache
+                        .get(&result.last_applied_sequence)
+                        .copied()
+                    {
+                        Some(cached) => cached,
+                        None => {
+                            let state =
+                                applied_state_for_sequence(engine, result.last_applied_sequence)?;
+                            applied_state_cache.insert(result.last_applied_sequence, state);
+                            state
+                        }
+                    };
+                    Ok(ExecuteResult {
+                        response,
+                        last_applied_sequence: last_applied.last_applied_sequence,
+                        last_applied_term: last_applied.last_applied_term,
+                        last_applied_checksum: last_applied.last_applied_checksum,
+                    })
+                });
+                let _ = pending_response.respond_to.send(response);
             }
         }
         Err(err) => {
-            let mut batch = batch.into_iter();
-            if let Some(first) = batch.next() {
+            let mut pending_responses = pending_responses.into_iter();
+            if let Some(first) = pending_responses.next() {
                 let _ = first.respond_to.send(Err(err));
             }
-            for execute in batch {
-                let _ = execute
+            for pending_response in pending_responses {
+                let _ = pending_response
                     .respond_to
                     .send(Err(ServerError::EngineWorkerClosed));
             }
         }
     }
+}
+
+fn process_explicit_write_batch(
+    engine: &mut Engine,
+    consensus_term: u64,
+    batch: Vec<(Uuid, Command)>,
+) -> Result<Vec<ExecuteResult>> {
+    engine.set_consensus_term(consensus_term);
+    let mut request_ids = Vec::with_capacity(batch.len());
+    let mut commands = Vec::with_capacity(batch.len());
+    for (request_id, command) in batch {
+        request_ids.push(request_id);
+        commands.push(command);
+    }
+
+    let results = engine
+        .execute_command_batch(&commands)
+        .map_err(ServerError::from)?;
+    let mut applied_state_cache = BTreeMap::new();
+    request_ids
+        .into_iter()
+        .zip(results)
+        .map(|(request_id, result)| {
+            let response = render_transaction_result(request_id, result.result)?;
+            let last_applied = match applied_state_cache
+                .get(&result.last_applied_sequence)
+                .copied()
+            {
+                Some(cached) => cached,
+                None => {
+                    let state = applied_state_for_sequence(engine, result.last_applied_sequence)?;
+                    applied_state_cache.insert(result.last_applied_sequence, state);
+                    state
+                }
+            };
+            Ok(ExecuteResult {
+                response,
+                last_applied_sequence: last_applied.last_applied_sequence,
+                last_applied_term: last_applied.last_applied_term,
+                last_applied_checksum: last_applied.last_applied_checksum,
+            })
+        })
+        .collect()
 }
 
 fn drain_write_batch(

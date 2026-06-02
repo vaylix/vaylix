@@ -37,7 +37,7 @@ The long-term target is broader:
 - `crates/transport`
   - frame layout, opcodes, request/response types, codec, sync/async framed I/O
 - `crates/engine`
-  - in-memory state, expirations, segmented WAL, snapshots, manifest, recovery, storage encryption, key rotation
+  - sharded in-memory state, expirations, segmented WAL, snapshots, manifest, recovery, storage encryption, key rotation
 - `crates/server`
   - Tokio listener, authentication, RBAC, TLS accept, session handling, quotas, rate limiting, maintenance mode, engine worker runtime
 - `crates/client`
@@ -46,8 +46,9 @@ The long-term target is broader:
 ## Current Data Model
 
 - User-visible model: `String -> String`
-- In-memory map: `BTreeMap<String, String>`
-- Expirations: per-key absolute timestamps in milliseconds
+- In-memory map: sharded `DashMap<String, StoredValue>`
+- Expirations: per-key absolute timestamps in milliseconds stored beside the value
+- Leader writes: eligible standalone commands are batched by a dedicated HA write coordinator into one local WAL batch and one replicated frontier before acknowledgement
 - Supported command families:
   - auth
   - ping
@@ -324,7 +325,9 @@ WAL management:
 - WAL lives under `<data-dir>/wal/`
 - active segment name: `active-<start_sequence>.wal`
 - sealed segment name: `<start_sequence>-<end_sequence>.wal`
-- the 0.6 write path keeps the active segment open through a stateful writer instead of reopening and rediscovering the active segment for every append
+- the write path keeps the active segment open through a stateful writer instead of reopening and rediscovering the active segment for every append
+- WAL append/flush/sync work runs behind a dedicated WAL I/O worker while sequence assignment remains in the engine coordinator
+- in-memory WAL entry term/checksum identities are cached for replication metadata lookups
 - eligible standalone writes may be appended as bounded batches; `flush` and `sync` modes must not acknowledge a write before the configured batch durability boundary completes
 - runtime controls:
   - `--wal-segment-size-bytes`
@@ -452,6 +455,7 @@ Current state:
 - pre-vote, majority election, heartbeats, append entries, snapshot install, and automatic leader failover
 - quorum-backed write acknowledgement by default through the `replica` / `majority` mode
 - follower-side catch-up through append entries, retained WAL history, and snapshot bootstrap fallback
+- leader commit waiters are notified on commit-index advancement rather than relying only on fixed polling sleeps
 - no sharding
 
 Architectural target:
@@ -593,7 +597,7 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.6.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.7.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 

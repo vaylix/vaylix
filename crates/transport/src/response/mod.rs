@@ -115,23 +115,19 @@ impl Response {
 
     /// Builds a response containing an unsigned count value.
     pub fn count(request_id: Uuid, count: u64) -> Self {
-        let mut buf = BytesMut::with_capacity(8);
-        buf.put_u64(count);
-        Self::new(request_id, Status::Ok, buf.to_vec())
+        Self::new(request_id, Status::Ok, count.to_be_bytes().to_vec())
     }
 
     /// Builds a response containing a signed integer value.
     pub fn integer(request_id: Uuid, value: i64) -> Self {
-        let mut buf = BytesMut::with_capacity(8);
-        buf.put_i64(value);
-        Self::new(request_id, Status::Ok, buf.to_vec())
+        Self::new(request_id, Status::Ok, value.to_be_bytes().to_vec())
     }
 
     /// Builds a response containing a list of key/value pairs.
     pub fn entries(request_id: Uuid, entries: &[(String, String)]) -> Result<Self> {
         let entry_count =
             u32::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(entries_payload_len(entries));
         buf.put_u32(entry_count);
 
         for (key, value) in entries {
@@ -146,7 +142,7 @@ impl Response {
     pub fn strings(request_id: Uuid, values: &[Option<String>]) -> Result<Self> {
         let value_count =
             u32::try_from(values.len()).map_err(|_| TransportError::CorruptedPayload)?;
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(strings_payload_len(values));
         buf.put_u32(value_count);
 
         for value in values {
@@ -165,7 +161,7 @@ impl Response {
     /// Builds a cursor-based scan response.
     pub fn scan(request_id: Uuid, next_cursor: u64, keys: &[String]) -> Result<Self> {
         let key_count = u32::try_from(keys.len()).map_err(|_| TransportError::CorruptedPayload)?;
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(scan_payload_len(keys));
         buf.put_u64(next_cursor);
         buf.put_u32(key_count);
 
@@ -180,7 +176,7 @@ impl Response {
     pub fn exec_results(request_id: Uuid, results: &[ExecResultPayload]) -> Result<Self> {
         let result_count =
             u32::try_from(results.len()).map_err(|_| TransportError::CorruptedPayload)?;
-        let mut buf = BytesMut::new();
+        let mut buf = BytesMut::with_capacity(exec_results_payload_len(results));
         buf.put_u32(result_count);
 
         for result in results {
@@ -320,7 +316,7 @@ impl Response {
 }
 
 fn encode_string_u32(value: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(string_u32_len(value));
     put_string_u32(&mut buf, value)?;
     Ok(buf.to_vec())
 }
@@ -333,11 +329,71 @@ fn decode_string_u32(payload: &[u8]) -> Result<String> {
 }
 
 fn encode_error_payload(code: &str, name: &str, message: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(
+        string_u16_len(code) + string_u16_len(name) + string_u32_len(message),
+    );
     put_string_u16(&mut buf, code)?;
     put_string_u16(&mut buf, name)?;
     put_string_u32(&mut buf, message)?;
     Ok(buf.to_vec())
+}
+
+fn string_u16_len(value: &str) -> usize {
+    2 + value.len()
+}
+
+fn string_u32_len(value: &str) -> usize {
+    4 + value.len()
+}
+
+fn entries_payload_len(entries: &[(String, String)]) -> usize {
+    4 + entries
+        .iter()
+        .map(|(key, value)| string_u16_len(key) + string_u32_len(value))
+        .sum::<usize>()
+}
+
+fn strings_payload_len(values: &[Option<String>]) -> usize {
+    4 + values
+        .iter()
+        .map(|value| 1 + value.as_ref().map_or(0, |value| string_u32_len(value)))
+        .sum::<usize>()
+}
+
+fn scan_payload_len(keys: &[String]) -> usize {
+    12 + keys.iter().map(|key| string_u16_len(key)).sum::<usize>()
+}
+
+fn exec_results_payload_len(results: &[ExecResultPayload]) -> usize {
+    4 + results.iter().map(exec_result_payload_len).sum::<usize>()
+}
+
+fn exec_result_payload_len(result: &ExecResultPayload) -> usize {
+    match result {
+        ExecResultPayload::Ok | ExecResultPayload::NotFound => 1,
+        ExecResultPayload::Value(value) => 1 + string_u32_len(value),
+        ExecResultPayload::Boolean(_) => 2,
+        ExecResultPayload::Count(_) | ExecResultPayload::Integer(_) => 9,
+        ExecResultPayload::Entries(entries) => {
+            5 + entries
+                .iter()
+                .map(|(key, value)| string_u16_len(key) + string_u32_len(value))
+                .sum::<usize>()
+        }
+        ExecResultPayload::Strings(values) => {
+            5 + values
+                .iter()
+                .map(|value| 1 + value.as_ref().map_or(0, |value| string_u32_len(value)))
+                .sum::<usize>()
+        }
+        ExecResultPayload::Scan(scan) => {
+            13 + scan
+                .keys
+                .iter()
+                .map(|key| string_u16_len(key))
+                .sum::<usize>()
+        }
+    }
 }
 
 fn encode_exec_result(buf: &mut BytesMut, result: &ExecResultPayload) -> Result<()> {

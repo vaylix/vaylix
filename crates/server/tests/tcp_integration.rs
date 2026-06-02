@@ -21,7 +21,9 @@ use server::auth::AuthConfig;
 use server::replication::{
     ClusterMember, ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
 };
-use server::server::{ServerGuards, ServerRuntimeConfig};
+use server::server::{
+    CommittedReadIndex, ReplicationClientPool, ServerGuards, ServerRuntimeConfig,
+};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
@@ -367,6 +369,9 @@ fn runtime_with_tls(
         insecure_auth_disabled: false,
         insecure_default_credentials: true,
         replication: standalone_replication("test-node"),
+        read_index: Arc::new(CommittedReadIndex::default()),
+        replication_clients: Arc::new(ReplicationClientPool::default()),
+        ha_write_coordinator: None,
         replication_fanout_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         replication_apply_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
     }

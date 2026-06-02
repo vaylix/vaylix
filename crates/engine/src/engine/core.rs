@@ -1,12 +1,12 @@
 use crate::config::{EngineOptions, WalSyncPolicy};
 use crate::engine::{
-    EngineState, Expiration, LogicalBackup, LogicalBackupEntry, ScanPage, SetCondition, SetOptions,
-    SetOutcome, StorageEngine, TransactionResult,
+    EngineState, EngineStore, Expiration, LogicalBackup, LogicalBackupEntry, ScanPage,
+    SetCondition, SetOptions, SetOutcome, StorageEngine, StoredValue, TransactionResult,
 };
 use crate::error::Result;
 use crate::paths::Paths;
 use crate::store::{
-    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, WalReplayTarget, WalWriter,
+    Manifest, STORAGE_FORMAT_VERSION, WalEntry, WalOperation, WalReplayTarget, WalWriterHandle,
     create_active_segment, deserialize, inspect_wal, keyring, load, load_manifest,
     migrate_legacy_wal, prune_sealed_segments, replay, replay_until, save, save_keyring,
     save_manifest, seal_active, serialize,
@@ -14,6 +14,7 @@ use crate::store::{
 use crate::{EngineMetadata, StorageKeyring};
 use command::Command;
 use crc32fast::hash;
+use std::collections::BTreeMap;
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,6 +49,91 @@ pub struct CommandBatchResult {
     pub last_applied_sequence: u64,
 }
 
+#[derive(Default)]
+struct BatchRollback {
+    metadata: Option<EngineMetadata>,
+    keys: std::collections::BTreeMap<String, Option<StoredValue>>,
+    clear_snapshot: Option<EngineStore>,
+}
+
+impl BatchRollback {
+    fn new(state: &EngineState) -> Self {
+        Self {
+            metadata: Some(state.metadata.clone()),
+            keys: std::collections::BTreeMap::new(),
+            clear_snapshot: None,
+        }
+    }
+
+    fn remember_command(&mut self, state: &EngineState, command: &Command) {
+        match command {
+            Command::Set { key, .. }
+            | Command::SetNx { key, .. }
+            | Command::GetDel { key }
+            | Command::GetEx { key, .. }
+            | Command::Expire { key, .. }
+            | Command::Persist { key }
+            | Command::Incr { key }
+            | Command::Decr { key } => self.remember_key(state, key),
+            Command::MSet { entries } => {
+                for (key, _) in entries {
+                    self.remember_key(state, key);
+                }
+            }
+            Command::Delete { keys } | Command::MGet { keys } => {
+                for key in keys {
+                    self.remember_key(state, key);
+                }
+            }
+            Command::Rename {
+                source,
+                destination,
+            }
+            | Command::RenameNx {
+                source,
+                destination,
+            } => {
+                self.remember_key(state, source);
+                self.remember_key(state, destination);
+            }
+            Command::Clear => self.remember_clear(state),
+            _ => {}
+        }
+    }
+
+    fn remember_key(&mut self, state: &EngineState, key: &str) {
+        if self.clear_snapshot.is_some() || self.keys.contains_key(key) {
+            return;
+        }
+        self.keys.insert(key.to_string(), state.raw_entry(key));
+    }
+
+    fn remember_clear(&mut self, state: &EngineState) {
+        if self.clear_snapshot.is_none() {
+            self.clear_snapshot = Some(state.store.clone());
+            self.keys.clear();
+        }
+    }
+
+    fn rollback(self, state: &mut EngineState) {
+        if let Some(store) = self.clear_snapshot {
+            state.store = store;
+        } else {
+            for (key, value) in self.keys {
+                match value {
+                    Some(value) => state.set_raw_entry(key, value),
+                    None => {
+                        state.remove_raw(&key);
+                    }
+                }
+            }
+        }
+        if let Some(metadata) = self.metadata {
+            state.metadata = metadata;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointInTimeTarget {
     Sequence(u64),
@@ -59,12 +145,19 @@ pub struct Engine {
     state: EngineState,
     paths: Paths,
     options: EngineOptions,
-    wal_writer: WalWriter,
+    wal_writer: WalWriterHandle,
     wal_entries: Vec<WalEntry>,
+    wal_entry_identities: BTreeMap<u64, WalEntryIdentity>,
     current_consensus_term: u64,
     recovery_duration_ms: u64,
     wal_entries_replayed_total: u64,
     last_snapshot_duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalEntryIdentity {
+    term: u64,
+    checksum: u32,
 }
 
 impl Engine {
@@ -121,11 +214,12 @@ impl Engine {
 
         let replay = replay(&paths.wal_dir, options.keyring.as_ref())?;
         let wal_entries = replay.entries;
+        let wal_entry_identities = build_wal_entry_identities(&wal_entries)?;
         let wal_entries_replayed_total = wal_entries.len() as u64;
         for entry in &wal_entries {
             state.apply_entry(entry)?;
         }
-        let wal_writer = WalWriter::open(
+        let wal_writer = WalWriterHandle::open(
             &paths.wal_dir,
             options.wal_sync,
             options.wal_segment_size_bytes,
@@ -138,6 +232,7 @@ impl Engine {
             options,
             wal_writer,
             wal_entries,
+            wal_entry_identities,
             current_consensus_term: 0,
             recovery_duration_ms: now_millis().saturating_sub(recovery_started_at_ms),
             wal_entries_replayed_total,
@@ -180,11 +275,10 @@ impl Engine {
         if sequence == 0 {
             return Ok(None);
         }
-        self.wal_entries
-            .iter()
-            .find(|entry| entry.sequence == sequence)
-            .map(|entry| entry.checksum())
-            .transpose()
+        Ok(self
+            .wal_entry_identities
+            .get(&sequence)
+            .map(|identity| identity.checksum))
     }
 
     pub fn wal_entry_term(&self, sequence: u64) -> Result<Option<u64>> {
@@ -192,10 +286,9 @@ impl Engine {
             return Ok(None);
         }
         Ok(self
-            .wal_entries
-            .iter()
-            .find(|entry| entry.sequence == sequence)
-            .map(|entry| entry.term))
+            .wal_entry_identities
+            .get(&sequence)
+            .map(|identity| identity.term))
     }
 
     pub fn last_applied_sequence(&self) -> u64 {
@@ -248,12 +341,14 @@ impl Engine {
             &self.paths.snapshot_tmp_path,
             self.options.keyring.as_ref(),
         )?;
+        self.wal_writer.close_active()?;
         if self.paths.wal_dir.exists() {
             fs::remove_dir_all(&self.paths.wal_dir)?;
         }
         create_active_segment(&self.paths.wal_dir, sequence.saturating_add(1))?;
         self.reset_wal_writer(sequence.saturating_add(1))?;
         self.wal_entries.clear();
+        self.wal_entry_identities.clear();
         save_manifest(
             &Manifest {
                 storage_format_version: STORAGE_FORMAT_VERSION,
@@ -285,10 +380,12 @@ impl Engine {
             staged.apply_entry(entry)?;
             last_applied = entry.sequence;
         }
+        let identities = build_wal_entry_identities(entries)?;
         self.wal_writer
             .append_batch(entries, self.options.keyring.as_ref())?;
         self.state = staged;
         self.wal_entries.extend(entries.iter().cloned());
+        self.wal_entry_identities.extend(identities);
         Ok(last_applied)
     }
 
@@ -374,6 +471,7 @@ impl Engine {
             rebuilt_state.apply_entry(entry)?;
         }
 
+        self.wal_writer.close_active()?;
         if self.paths.wal_dir.exists() {
             fs::remove_dir_all(&self.paths.wal_dir)?;
         }
@@ -396,6 +494,7 @@ impl Engine {
 
         self.state = rebuilt_state;
         self.wal_entries = retained;
+        self.wal_entry_identities = build_wal_entry_identities(&self.wal_entries)?;
         Ok(self.state.metadata.last_applied_sequence)
     }
 
@@ -585,21 +684,17 @@ impl Engine {
 
     fn append_and_apply(&mut self, operations: Vec<WalOperation>) -> Result<()> {
         let entry = self.next_entry(operations);
+        let identity = wal_entry_identity(&entry)?;
         self.wal_writer
-            .append(&entry, self.options.keyring.as_ref())?;
+            .append_batch(std::slice::from_ref(&entry), self.options.keyring.as_ref())?;
         self.state.apply_entry(&entry)?;
+        self.wal_entry_identities.insert(entry.sequence, identity);
         self.wal_entries.push(entry);
         Ok(())
     }
 
     fn reset_wal_writer(&mut self, start_sequence: u64) -> Result<()> {
-        self.wal_writer = WalWriter::open(
-            &self.paths.wal_dir,
-            self.options.wal_sync,
-            self.options.wal_segment_size_bytes,
-            start_sequence,
-        )?;
-        Ok(())
+        self.wal_writer.reset(start_sequence)
     }
 
     pub fn append_noop(&mut self) -> Result<()> {
@@ -720,7 +815,7 @@ impl Engine {
 
     fn maybe_get_existing_value(&mut self, key: &str) -> Option<String> {
         self.state.purge_expired(self.now());
-        self.state.data.get(key).cloned()
+        self.state.raw_value(key)
     }
 
     fn map_command_expiration(expiration: Option<command::Expiration>) -> Option<Expiration> {
@@ -750,7 +845,7 @@ impl Engine {
         let mut results = Vec::with_capacity(commands.len());
 
         for command in commands {
-            results.push(self.evaluate_transaction_command(
+            results.push(Self::evaluate_transaction_command(
                 &mut working,
                 now_ms,
                 &mut operations,
@@ -764,9 +859,11 @@ impl Engine {
         }
 
         let entry = self.next_entry(operations);
+        let identity = wal_entry_identity(&entry)?;
         self.wal_writer
-            .append(&entry, self.options.keyring.as_ref())?;
+            .append_batch(std::slice::from_ref(&entry), self.options.keyring.as_ref())?;
         self.state.apply_entry(&entry)?;
+        self.wal_entry_identities.insert(entry.sequence, identity);
         self.wal_entries.push(entry);
 
         Ok(results)
@@ -782,16 +879,27 @@ impl Engine {
     ) -> Result<Vec<CommandBatchResult>> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let mut working = self.state.clone();
+        let mut rollback = BatchRollback::new(&self.state);
         let mut entries = Vec::new();
         let mut results = Vec::with_capacity(commands.len());
         let mut next_sequence = self.state.metadata.last_applied_sequence.saturating_add(1);
         let mut visible_sequence = self.state.metadata.last_applied_sequence;
 
         for command in commands {
+            rollback.remember_command(&self.state, command);
             let mut operations = Vec::new();
-            let result =
-                self.evaluate_transaction_command(&mut working, now_ms, &mut operations, command)?;
+            let result = match Self::evaluate_transaction_command(
+                &mut self.state,
+                now_ms,
+                &mut operations,
+                command,
+            ) {
+                Ok(result) => result,
+                Err(err) => {
+                    rollback.rollback(&mut self.state);
+                    return Err(err);
+                }
+            };
             if !operations.is_empty() {
                 let entry = WalEntry::new(
                     next_sequence,
@@ -799,8 +907,8 @@ impl Engine {
                     now_ms,
                     operations,
                 );
-                working.metadata.last_applied_sequence = entry.sequence;
-                working.metadata.updated_at_ms = entry.created_at_ms;
+                self.state.metadata.last_applied_sequence = entry.sequence;
+                self.state.metadata.updated_at_ms = entry.created_at_ms;
                 visible_sequence = next_sequence;
                 next_sequence = next_sequence.saturating_add(1);
                 entries.push(entry);
@@ -812,16 +920,21 @@ impl Engine {
         }
 
         if !entries.is_empty() {
-            self.wal_writer
-                .append_batch(&entries, self.options.keyring.as_ref())?;
+            let identities = build_wal_entry_identities(&entries)?;
+            if let Err(err) = self
+                .wal_writer
+                .append_batch(&entries, self.options.keyring.as_ref())
+            {
+                rollback.rollback(&mut self.state);
+                return Err(err);
+            }
+            self.wal_entry_identities.extend(identities);
             self.wal_entries.extend(entries);
         }
-        self.state = working;
         Ok(results)
     }
 
     fn evaluate_transaction_command(
-        &self,
         state: &mut EngineState,
         now_ms: u64,
         operations: &mut Vec<WalOperation>,
@@ -833,17 +946,16 @@ impl Engine {
             Command::Ping { message } => Ok(TransactionResult::Value(
                 message.clone().unwrap_or_else(|| "PONG".to_string()),
             )),
-            Command::Get { key } => Ok(match state.data.get(key).cloned() {
+            Command::Get { key } => Ok(match state.raw_value(key) {
                 Some(value) => TransactionResult::Value(value),
                 None => TransactionResult::NotFound,
             }),
             Command::GetDel { key } => {
-                let value = state.data.remove(key);
-                state.expirations.remove(key);
-                match value {
-                    Some(value) => {
+                let entry = state.remove_raw(key);
+                match entry {
+                    Some(entry) => {
                         operations.push(WalOperation::Delete { key: key.clone() });
-                        Ok(TransactionResult::Value(value))
+                        Ok(TransactionResult::Value(entry.value))
                     }
                     None => Ok(TransactionResult::NotFound),
                 }
@@ -853,34 +965,34 @@ impl Engine {
                 expiration,
                 persist,
             } => {
-                let Some(value) = state.data.get(key).cloned() else {
+                let Some(entry) = state.raw_entry(key) else {
                     return Ok(TransactionResult::NotFound);
                 };
                 if let Some(expiration) = Self::map_command_expiration(*expiration) {
                     let expires_at_ms = Self::resolve_expiration(now_ms, expiration);
                     if expires_at_ms <= now_ms {
-                        state.data.remove(key);
-                        state.expirations.remove(key);
+                        state.remove_raw(key);
                         operations.push(WalOperation::Delete { key: key.clone() });
                     } else {
-                        state.expirations.insert(key.clone(), expires_at_ms);
+                        state.set_expiration_if_present(key, expires_at_ms);
                         operations.push(WalOperation::Expire {
                             key: key.clone(),
                             expires_at_ms,
                         });
                     }
-                } else if *persist && state.expirations.remove(key).is_some() {
+                } else if *persist && state.clear_expiration(key) {
                     operations.push(WalOperation::Persist { key: key.clone() });
                 }
-                Ok(TransactionResult::Value(value))
+                Ok(TransactionResult::Value(entry.value))
             }
             Command::Set {
                 key,
                 value,
                 options,
             } => {
-                let previous = state.data.get(key).cloned();
-                let previous_expiration = state.expirations.get(key).copied();
+                let previous_entry = state.raw_entry(key);
+                let previous = previous_entry.as_ref().map(|entry| entry.value.clone());
+                let previous_expiration = previous_entry.and_then(|entry| entry.expires_at_ms);
                 let mapped = Self::map_command_set_options(options.clone());
                 let allowed = match mapped.condition {
                     Some(SetCondition::Nx) => previous.is_none(),
@@ -899,8 +1011,7 @@ impl Engine {
                     });
                 }
 
-                state.data.insert(key.clone(), value.clone());
-                state.expirations.remove(key);
+                state.set_raw_value(key.clone(), value.clone());
                 operations.push(WalOperation::Set {
                     key: key.clone(),
                     value: value.clone(),
@@ -909,11 +1020,10 @@ impl Engine {
                 if let Some(expiration) = mapped.expiration {
                     let expires_at_ms = Self::resolve_expiration(now_ms, expiration);
                     if expires_at_ms <= now_ms {
-                        state.data.remove(key);
-                        state.expirations.remove(key);
+                        state.remove_raw(key);
                         operations.push(WalOperation::Delete { key: key.clone() });
                     } else {
-                        state.expirations.insert(key.clone(), expires_at_ms);
+                        state.set_expiration_if_present(key, expires_at_ms);
                         operations.push(WalOperation::Expire {
                             key: key.clone(),
                             expires_at_ms,
@@ -922,7 +1032,7 @@ impl Engine {
                 } else if mapped.keep_ttl
                     && let Some(expires_at_ms) = previous_expiration
                 {
-                    state.expirations.insert(key.clone(), expires_at_ms);
+                    state.set_expiration_if_present(key, expires_at_ms);
                     operations.push(WalOperation::Expire {
                         key: key.clone(),
                         expires_at_ms,
@@ -940,11 +1050,10 @@ impl Engine {
                 })
             }
             Command::SetNx { key, value } => {
-                if state.data.contains_key(key) {
+                if state.raw_contains_key(key) {
                     return Ok(TransactionResult::Boolean(false));
                 }
-                state.data.insert(key.clone(), value.clone());
-                state.expirations.remove(key);
+                state.set_raw_value(key.clone(), value.clone());
                 operations.push(WalOperation::Set {
                     key: key.clone(),
                     value: value.clone(),
@@ -952,14 +1061,11 @@ impl Engine {
                 Ok(TransactionResult::Boolean(true))
             }
             Command::MGet { keys } => Ok(TransactionResult::Strings(
-                keys.iter()
-                    .map(|key| state.data.get(key).cloned())
-                    .collect(),
+                keys.iter().map(|key| state.raw_value(key)).collect(),
             )),
             Command::MSet { entries } => {
                 for (key, value) in entries {
-                    state.data.insert(key.clone(), value.clone());
-                    state.expirations.remove(key);
+                    state.set_raw_value(key.clone(), value.clone());
                     operations.push(WalOperation::Set {
                         key: key.clone(),
                         value: value.clone(),
@@ -970,21 +1076,16 @@ impl Engine {
             Command::Delete { keys } => {
                 let mut removed = 0_u64;
                 for key in keys {
-                    if state.data.remove(key).is_some() {
+                    if state.remove_raw(key).is_some() {
                         removed += 1;
-                        state.expirations.remove(key);
                         operations.push(WalOperation::Delete { key: key.clone() });
                     }
                 }
                 Ok(TransactionResult::Count(removed))
             }
-            Command::Exists { key } => Ok(TransactionResult::Boolean(state.data.contains_key(key))),
+            Command::Exists { key } => Ok(TransactionResult::Boolean(state.raw_contains_key(key))),
             Command::Incr { key } => {
-                let current = state
-                    .data
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| "0".to_string());
+                let current = state.raw_value(key).unwrap_or_else(|| "0".to_string());
                 let parsed = current.parse::<i64>().map_err(|_| {
                     crate::EngineError::InvalidIntegerValue {
                         key: key.clone(),
@@ -994,8 +1095,7 @@ impl Engine {
                 let next = parsed
                     .checked_add(1)
                     .ok_or_else(|| crate::EngineError::NumericOverflow { key: key.clone() })?;
-                state.data.insert(key.clone(), next.to_string());
-                state.expirations.remove(key);
+                state.set_raw_value(key.clone(), next.to_string());
                 operations.push(WalOperation::CheckInteger {
                     key: key.clone(),
                     delta: 1,
@@ -1003,11 +1103,7 @@ impl Engine {
                 Ok(TransactionResult::Integer(next))
             }
             Command::Decr { key } => {
-                let current = state
-                    .data
-                    .get(key)
-                    .cloned()
-                    .unwrap_or_else(|| "0".to_string());
+                let current = state.raw_value(key).unwrap_or_else(|| "0".to_string());
                 let parsed = current.parse::<i64>().map_err(|_| {
                     crate::EngineError::InvalidIntegerValue {
                         key: key.clone(),
@@ -1017,8 +1113,7 @@ impl Engine {
                 let next = parsed
                     .checked_sub(1)
                     .ok_or_else(|| crate::EngineError::NumericOverflow { key: key.clone() })?;
-                state.data.insert(key.clone(), next.to_string());
-                state.expirations.remove(key);
+                state.set_raw_value(key.clone(), next.to_string());
                 operations.push(WalOperation::CheckInteger {
                     key: key.clone(),
                     delta: -1,
@@ -1026,17 +1121,16 @@ impl Engine {
                 Ok(TransactionResult::Integer(next))
             }
             Command::Expire { key, seconds } => {
-                if !state.data.contains_key(key) {
+                if !state.raw_contains_key(key) {
                     return Ok(TransactionResult::Boolean(false));
                 }
                 if *seconds == 0 {
-                    state.data.remove(key);
-                    state.expirations.remove(key);
+                    state.remove_raw(key);
                     operations.push(WalOperation::Delete { key: key.clone() });
                     return Ok(TransactionResult::Boolean(true));
                 }
                 let expires_at_ms = now_ms.saturating_add(seconds.saturating_mul(1_000));
-                state.expirations.insert(key.clone(), expires_at_ms);
+                state.set_expiration_if_present(key, expires_at_ms);
                 operations.push(WalOperation::Expire {
                     key: key.clone(),
                     expires_at_ms,
@@ -1045,8 +1139,7 @@ impl Engine {
             }
             Command::Ttl { key } => Ok(TransactionResult::Integer(state.ttl_for(key, now_ms))),
             Command::Persist { key } => {
-                let removed =
-                    state.expirations.remove(key).is_some() && state.data.contains_key(key);
+                let removed = state.raw_contains_key(key) && state.clear_expiration(key);
                 if removed {
                     operations.push(WalOperation::Persist { key: key.clone() });
                 }
@@ -1056,21 +1149,19 @@ impl Engine {
                 source,
                 destination,
             } => {
-                let Some(value) = state.data.remove(source) else {
+                let Some(entry) = state.remove_raw(source) else {
                     return Ok(TransactionResult::Boolean(false));
                 };
-                let source_ttl = state.expirations.remove(source);
-                state.data.insert(destination.clone(), value.clone());
-                state.expirations.remove(destination);
+                state.set_raw_value(destination.clone(), entry.value.clone());
                 operations.push(WalOperation::Delete {
                     key: source.clone(),
                 });
                 operations.push(WalOperation::Set {
                     key: destination.clone(),
-                    value,
+                    value: entry.value,
                 });
-                if let Some(expires_at_ms) = source_ttl {
-                    state.expirations.insert(destination.clone(), expires_at_ms);
+                if let Some(expires_at_ms) = entry.expires_at_ms {
+                    state.set_expiration_if_present(destination, expires_at_ms);
                     operations.push(WalOperation::Expire {
                         key: destination.clone(),
                         expires_at_ms,
@@ -1082,10 +1173,10 @@ impl Engine {
                 source,
                 destination,
             } => {
-                if state.data.contains_key(destination) {
+                if state.raw_contains_key(destination) {
                     return Ok(TransactionResult::Boolean(false));
                 }
-                self.evaluate_transaction_command(
+                Self::evaluate_transaction_command(
                     state,
                     now_ms,
                     operations,
@@ -1126,15 +1217,14 @@ impl Engine {
                 }))
             }
             Command::DbSize | Command::Count => {
-                Ok(TransactionResult::Count(state.data.len() as u64))
+                Ok(TransactionResult::Count(state.key_count() as u64))
             }
             Command::List => Ok(TransactionResult::Entries(state.live_entries(now_ms))),
             Command::Clear => {
-                if state.data.is_empty() && state.expirations.is_empty() {
+                if state.is_empty() {
                     return Ok(TransactionResult::Ok);
                 }
-                state.data.clear();
-                state.expirations.clear();
+                state.clear_all();
                 operations.push(WalOperation::Clear);
                 Ok(TransactionResult::Ok)
             }
@@ -1211,6 +1301,29 @@ fn push_unique_wal_entry(entries: &mut Vec<WalEntry>, entry: WalEntry) -> Result
     Ok(())
 }
 
+fn wal_entry_identity(entry: &WalEntry) -> Result<WalEntryIdentity> {
+    Ok(WalEntryIdentity {
+        term: entry.term,
+        checksum: entry.checksum()?,
+    })
+}
+
+fn build_wal_entry_identities(entries: &[WalEntry]) -> Result<BTreeMap<u64, WalEntryIdentity>> {
+    let mut identities = BTreeMap::new();
+    for entry in entries {
+        let identity = wal_entry_identity(entry)?;
+        if let Some(previous) = identities.insert(entry.sequence, identity)
+            && previous != identity
+        {
+            return Err(crate::EngineError::InvalidStorageOperation(format!(
+                "conflicting duplicate WAL identity at sequence {}",
+                entry.sequence
+            )));
+        }
+    }
+    Ok(identities)
+}
+
 impl StorageEngine for Engine {
     fn get(&mut self, key: &str) -> Result<Option<String>> {
         Ok(self.state.get_live(key, self.now()))
@@ -1225,8 +1338,9 @@ impl StorageEngine for Engine {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
-        let previous = self.state.data.get(&key).cloned();
-        let previous_expiration = self.state.expirations.get(&key).copied();
+        let previous_entry = self.state.raw_entry(&key);
+        let previous = previous_entry.as_ref().map(|entry| entry.value.clone());
+        let previous_expiration = previous_entry.and_then(|entry| entry.expires_at_ms);
 
         let allowed = match options.condition {
             Some(SetCondition::Nx) => previous.is_none(),
@@ -1292,7 +1406,7 @@ impl StorageEngine for Engine {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
-        let previous = self.state.data.get(key).cloned();
+        let previous = self.state.raw_value(key);
         if previous.is_none() {
             return Ok(None);
         }
@@ -1309,7 +1423,7 @@ impl StorageEngine for Engine {
                     expires_at_ms,
                 })
             }
-        } else if persist && self.state.expirations.contains_key(key) {
+        } else if persist && self.state.raw_expiration(key).is_some() {
             Some(WalOperation::Persist {
                 key: key.to_string(),
             })
@@ -1328,10 +1442,7 @@ impl StorageEngine for Engine {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
-        Ok(keys
-            .iter()
-            .map(|key| self.state.data.get(key).cloned())
-            .collect())
+        Ok(keys.iter().map(|key| self.state.raw_value(key)).collect())
     }
 
     fn mset(&mut self, entries: &[(String, String)]) -> Result<()> {
@@ -1356,7 +1467,7 @@ impl StorageEngine for Engine {
 
         let removed = keys
             .iter()
-            .filter(|key| self.state.data.contains_key(key.as_str()))
+            .filter(|key| self.state.raw_contains_key(key.as_str()))
             .count();
 
         if removed == 0 {
@@ -1379,12 +1490,7 @@ impl StorageEngine for Engine {
     fn incr(&mut self, key: &str) -> Result<i64> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let current = self
-            .state
-            .data
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| "0".to_string());
+        let current = self.state.raw_value(key).unwrap_or_else(|| "0".to_string());
         let parsed =
             current
                 .parse::<i64>()
@@ -1409,12 +1515,7 @@ impl StorageEngine for Engine {
     fn decr(&mut self, key: &str) -> Result<i64> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let current = self
-            .state
-            .data
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| "0".to_string());
+        let current = self.state.raw_value(key).unwrap_or_else(|| "0".to_string());
         let parsed =
             current
                 .parse::<i64>()
@@ -1440,7 +1541,7 @@ impl StorageEngine for Engine {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
-        if !self.state.data.contains_key(key) {
+        if !self.state.raw_contains_key(key) {
             return Ok(false);
         }
 
@@ -1467,7 +1568,7 @@ impl StorageEngine for Engine {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
-        if !self.state.data.contains_key(key) || !self.state.expirations.contains_key(key) {
+        if !self.state.raw_contains_key(key) || self.state.raw_expiration(key).is_none() {
             return Ok(false);
         }
 
@@ -1481,10 +1582,9 @@ impl StorageEngine for Engine {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
-        let Some(value) = self.state.data.get(source).cloned() else {
+        let Some(entry) = self.state.raw_entry(source) else {
             return Ok(false);
         };
-        let source_ttl = self.state.expirations.get(source).copied();
 
         let mut operations = vec![
             WalOperation::Delete {
@@ -1492,10 +1592,10 @@ impl StorageEngine for Engine {
             },
             WalOperation::Set {
                 key: destination.clone(),
-                value,
+                value: entry.value,
             },
         ];
-        if let Some(expires_at_ms) = source_ttl {
+        if let Some(expires_at_ms) = entry.expires_at_ms {
             operations.push(WalOperation::Expire {
                 key: destination,
                 expires_at_ms,
@@ -1508,7 +1608,7 @@ impl StorageEngine for Engine {
     fn rename_nx(&mut self, source: &str, destination: String) -> Result<bool> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        if self.state.data.contains_key(&destination) {
+        if self.state.raw_contains_key(&destination) {
             return Ok(false);
         }
         self.rename(source, destination)
@@ -1516,7 +1616,7 @@ impl StorageEngine for Engine {
 
     fn db_size(&mut self) -> Result<usize> {
         self.state.purge_expired(self.now());
-        Ok(self.state.data.len())
+        Ok(self.state.key_count())
     }
 
     fn scan(&mut self, cursor: u64, pattern: Option<&str>, count: Option<u16>) -> Result<ScanPage> {
@@ -1556,7 +1656,7 @@ impl StorageEngine for Engine {
 
     fn info(&mut self) -> Result<Vec<(String, String)>> {
         self.state.purge_expired(self.now());
-        Ok(self.info_entries(&self.state.metadata, self.state.data.len()))
+        Ok(self.info_entries(&self.state.metadata, self.state.key_count()))
     }
 
     fn sweep_expired(&mut self) -> Result<usize> {
@@ -1564,7 +1664,7 @@ impl StorageEngine for Engine {
     }
 
     fn clear(&mut self) -> Result<()> {
-        if self.state.data.is_empty() && self.state.expirations.is_empty() {
+        if self.state.is_empty() {
             return Ok(());
         }
 
@@ -1601,12 +1701,7 @@ impl StorageEngine for Engine {
         let _ = seal_active(&self.paths.wal_dir, self.options.keyring.as_ref())?;
         let active_wal_start_sequence = sequence.saturating_add(1);
         create_active_segment(&self.paths.wal_dir, active_wal_start_sequence)?;
-        self.wal_writer = WalWriter::open(
-            &self.paths.wal_dir,
-            self.options.wal_sync,
-            self.options.wal_segment_size_bytes,
-            active_wal_start_sequence,
-        )?;
+        self.wal_writer.reset(active_wal_start_sequence)?;
         let _ = prune_sealed_segments(&self.paths.wal_dir, self.options.wal_retain_segments)?;
         let wal_report = inspect_wal(&self.paths.wal_dir).ok();
         let oldest_retained_sequence = wal_report
@@ -1632,6 +1727,7 @@ impl StorageEngine for Engine {
 
         self.state = durable_state;
         self.wal_entries = replay(&self.paths.wal_dir, self.options.keyring.as_ref())?.entries;
+        self.wal_entry_identities = build_wal_entry_identities(&self.wal_entries)?;
         self.last_snapshot_duration_ms = Some(now_millis().saturating_sub(snapshot_started_at));
 
         Ok(())
@@ -1640,14 +1736,13 @@ impl StorageEngine for Engine {
     fn logical_backup(&mut self) -> Result<String> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let entries = self
-            .state
-            .data
-            .iter()
+        let (data, expirations) = self.state.to_persisted_parts();
+        let entries = data
+            .into_iter()
             .map(|(key, value)| LogicalBackupEntry {
-                key: key.clone(),
-                value: value.clone(),
-                expires_at_ms: self.state.expirations.get(key).copied(),
+                expires_at_ms: expirations.get(&key).copied(),
+                key,
+                value,
             })
             .collect();
         let backup = LogicalBackup {

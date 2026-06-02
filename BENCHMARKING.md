@@ -119,6 +119,10 @@ The load generator prints a JSON report with:
 - benchmark parameters used for the run
 - up to eight distinct error samples when operations fail
 
+For `0.7.0` and later, read-heavy profiles should be run against leader or standalone nodes when
+measuring the committed read fast path and sharded in-memory store. Followers intentionally keep
+stale/local read behavior and are not the baseline for leader read latency.
+
 ## Command Profiles
 
 The load generator also includes command-specific end-to-end profiles. These measure whole
@@ -170,7 +174,9 @@ cargo run -p bench -- quorum-write-cost \
 ```
 
 Run this against the current leader of a quorum cluster. It measures acknowledged `SET`
-latency under the server's configured write acknowledgement mode.
+latency under the server's configured write acknowledgement mode. On `0.7.0` and later, this
+profile exercises the HA write coordinator path that batches concurrent leader writes into one
+local WAL batch and one replicated frontier.
 
 Managed variants are available for local smoke and repeatable baselines:
 
