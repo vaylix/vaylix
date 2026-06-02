@@ -350,6 +350,7 @@ fn runtime_with_tls(
         tls_state: tls_config.map(server::tls::TlsState::from_server_config),
         transport: CodecOptions::default(),
         log_requests: false,
+        audit_commands: false,
         backup_dir,
         mtls_enabled: false,
         slow_command_threshold: Some(Duration::from_millis(100)),

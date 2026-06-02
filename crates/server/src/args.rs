@@ -156,6 +156,10 @@ pub struct Args {
     #[arg(long, env = "VAYLIX_AUDIT_LOG_PATH")]
     pub audit_log_path: Option<PathBuf>,
 
+    /// Record a generic audit line for every command. Security/operator semantic audit events stay enabled regardless.
+    #[arg(long, env = "VAYLIX_AUDIT_COMMANDS", default_value_t = false)]
+    pub audit_commands: bool,
+
     /// Record slow-command audit events at or above this latency in milliseconds. Use 0 to disable.
     #[arg(long, env = "VAYLIX_SLOW_COMMAND_THRESHOLD_MS", default_value_t = 100)]
     pub slow_command_threshold_ms: u64,

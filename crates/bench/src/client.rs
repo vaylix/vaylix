@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -9,14 +10,14 @@ use pin_project_lite::pin_project;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig as RustlsClientConfig, RootCertStore};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_rustls::TlsConnector;
 use transport::{
     ClientHello, CodecOptions, Request, Response, client_options_from_server_hello,
-    read_response_from_async_with_options, read_server_hello_from_async,
-    write_client_hello_to_async, write_request_to_async_with_options,
+    encode_request_with_options, read_response_from_async_with_options,
+    read_server_hello_from_async, write_client_hello_to_async, write_request_to_async_with_options,
 };
 use uuid::Uuid;
 
@@ -152,6 +153,49 @@ impl BenchmarkClient {
             )));
         }
         Ok(response)
+    }
+
+    /// Sends several independent commands over one connection before reading
+    /// responses. This exercises VTP2 request-id correlation and removes
+    /// client-side request/response round trips from load-generator profiles.
+    pub async fn send_pipeline(&self, commands: Vec<Command>) -> Result<Vec<Response>> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut requests = Vec::with_capacity(commands.len());
+        for command in commands {
+            let request_id = Uuid::now_v7();
+            requests.push(Request::from_command(request_id, command)?);
+        }
+
+        let mut state = self.inner.lock().await;
+        let transport = state.transport;
+        for request in &requests {
+            let encoded = encode_request_with_options(request, transport)?;
+            state.stream.write_all(&encoded).await?;
+        }
+        state.stream.flush().await?;
+
+        let mut responses = HashMap::with_capacity(requests.len());
+        for _ in 0..requests.len() {
+            let response =
+                read_response_from_async_with_options(&mut state.stream, transport).await?;
+            responses.insert(response.request_id, response);
+        }
+
+        let mut ordered = Vec::with_capacity(requests.len());
+        for request in requests {
+            let response = responses.remove(&request.request_id).ok_or_else(|| {
+                BenchError::InvalidConfiguration(format!(
+                    "missing pipelined response id {}",
+                    request.request_id
+                ))
+            })?;
+            ordered.push(response);
+        }
+
+        Ok(ordered)
     }
 
     pub async fn wait_until_ready(&self, timeout: Duration) -> Result<()> {

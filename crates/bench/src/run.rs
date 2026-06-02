@@ -82,6 +82,7 @@ fn example_certs(args: ExampleCertsArgs) -> Result<BenchmarkReport> {
         failed_operations: 0,
         operations_per_second: 0.0,
         latency_us: LatencySummary::zero(),
+        pipeline_depth: 0,
         error_samples: Vec::new(),
     })
 }
@@ -89,7 +90,11 @@ fn example_certs(args: ExampleCertsArgs) -> Result<BenchmarkReport> {
 async fn managed_single_node(args: ManagedArgs) -> Result<BenchmarkReport> {
     let cluster = ManagedCluster::single_node(&args).await?;
     tokio::time::sleep(Duration::from_secs(1)).await;
+    let workload = args.workload.unwrap_or(WorkloadKind::Mixed);
     let connections = args.connections.unwrap_or(64);
+    let pipeline_depth = args
+        .pipeline_depth
+        .unwrap_or_else(|| default_pipeline_depth(workload));
     let seed_keys = args.seed_keys.unwrap_or(8_192);
     let keyspace = args.keyspace.unwrap_or(25_000);
     let value_size = args.value_size.unwrap_or(512);
@@ -104,11 +109,12 @@ async fn managed_single_node(args: ManagedArgs) -> Result<BenchmarkReport> {
             tls_client_key: cluster.connection.tls.client_key.clone(),
         },
         connections,
+        pipeline_depth: Some(pipeline_depth),
         duration_seconds: args.duration_seconds,
         keyspace,
         value_size,
         seed_keys,
-        workload: args.workload.unwrap_or(WorkloadKind::Mixed),
+        workload,
     };
     run_profile("managed-single-node".to_string(), run_config(&run)).await
 }
@@ -118,6 +124,9 @@ async fn managed_quorum(args: ManagedArgs) -> Result<BenchmarkReport> {
     tokio::time::sleep(Duration::from_secs(3)).await;
     cluster.addr = select_writable_addr(&cluster).await?;
     let connections = args.connections.unwrap_or(32);
+    let pipeline_depth = args
+        .pipeline_depth
+        .unwrap_or_else(|| default_pipeline_depth(WorkloadKind::Set));
     let seed_keys = args.seed_keys.unwrap_or(4_096);
     let keyspace = args.keyspace.unwrap_or(10_000);
     let value_size = args.value_size.unwrap_or(256);
@@ -132,6 +141,7 @@ async fn managed_quorum(args: ManagedArgs) -> Result<BenchmarkReport> {
             tls_client_key: cluster.connection.tls.client_key.clone(),
         },
         connections,
+        pipeline_depth: Some(pipeline_depth),
         duration_seconds: args.duration_seconds,
         keyspace,
         value_size,
@@ -168,6 +178,7 @@ fn single_node_profile(args: BaselineArgs) -> RunArgs {
         password: args.password,
         tls: args.tls,
         connections: 64,
+        pipeline_depth: Some(default_pipeline_depth(WorkloadKind::Mixed)),
         duration_seconds: args.duration_seconds,
         keyspace: 25_000,
         value_size: 512,
@@ -183,6 +194,7 @@ fn quorum_profile(args: BaselineArgs) -> RunArgs {
         password: args.password,
         tls: args.tls,
         connections: 32,
+        pipeline_depth: Some(default_pipeline_depth(WorkloadKind::Set)),
         duration_seconds: args.duration_seconds,
         keyspace: 10_000,
         value_size: 256,
@@ -199,6 +211,7 @@ fn command_profile(args: ProfileArgs, workload: WorkloadKind) -> RunArgs {
         password: args.password,
         tls: args.tls,
         connections: args.connections.unwrap_or(defaults.connections),
+        pipeline_depth: Some(args.pipeline_depth.unwrap_or(defaults.pipeline_depth)),
         duration_seconds: args.duration_seconds,
         keyspace: args.keyspace.unwrap_or(defaults.keyspace),
         value_size: args.value_size.unwrap_or(defaults.value_size),
@@ -224,6 +237,7 @@ fn managed_profile_run_args(
             tls_client_key: cluster.connection.tls.client_key.clone(),
         },
         connections: args.connections.unwrap_or(defaults.connections),
+        pipeline_depth: Some(args.pipeline_depth.unwrap_or(defaults.pipeline_depth)),
         duration_seconds: args.duration_seconds,
         keyspace: args.keyspace.unwrap_or(defaults.keyspace),
         value_size: args.value_size.unwrap_or(defaults.value_size),
@@ -235,6 +249,7 @@ fn managed_profile_run_args(
 #[derive(Clone, Copy)]
 struct ProfileDefaults {
     connections: usize,
+    pipeline_depth: usize,
     keyspace: usize,
     value_size: usize,
     seed_keys: usize,
@@ -244,24 +259,28 @@ fn profile_defaults(workload: WorkloadKind) -> ProfileDefaults {
     match workload {
         WorkloadKind::TransactionFlow => ProfileDefaults {
             connections: 16,
+            pipeline_depth: 1,
             keyspace: 10_000,
             value_size: 256,
             seed_keys: 0,
         },
         WorkloadKind::BackupRestore => ProfileDefaults {
             connections: 1,
+            pipeline_depth: 1,
             keyspace: 1_000,
             value_size: 256,
             seed_keys: 128,
         },
         WorkloadKind::AuthRbacChurn => ProfileDefaults {
             connections: 4,
+            pipeline_depth: 1,
             keyspace: 10_000,
             value_size: 64,
             seed_keys: 0,
         },
         WorkloadKind::QuorumWriteCost => ProfileDefaults {
             connections: 32,
+            pipeline_depth: default_pipeline_depth(WorkloadKind::QuorumWriteCost),
             keyspace: 10_000,
             value_size: 256,
             seed_keys: 0,
@@ -269,11 +288,24 @@ fn profile_defaults(workload: WorkloadKind) -> ProfileDefaults {
         WorkloadKind::Get | WorkloadKind::Set | WorkloadKind::Mixed | WorkloadKind::Ping => {
             ProfileDefaults {
                 connections: 32,
+                pipeline_depth: default_pipeline_depth(workload),
                 keyspace: 10_000,
                 value_size: 256,
                 seed_keys: 2_048,
             }
         }
+    }
+}
+
+fn default_pipeline_depth(workload: WorkloadKind) -> usize {
+    match workload {
+        WorkloadKind::Get | WorkloadKind::Ping => 16,
+        WorkloadKind::Mixed => 4,
+        WorkloadKind::Set
+        | WorkloadKind::QuorumWriteCost
+        | WorkloadKind::TransactionFlow
+        | WorkloadKind::BackupRestore
+        | WorkloadKind::AuthRbacChurn => 1,
     }
 }
 
@@ -293,6 +325,10 @@ fn run_config(args: &RunArgs) -> RunConfig {
             },
         },
         connections: args.connections,
+        pipeline_depth: args
+            .pipeline_depth
+            .unwrap_or_else(|| default_pipeline_depth(args.workload))
+            .max(1),
         duration_seconds: args.duration_seconds,
         keyspace: args.keyspace,
         value_size: args.value_size,
@@ -306,6 +342,7 @@ struct RunConfig {
     profile_addr: String,
     connection: ConnectionConfig,
     connections: usize,
+    pipeline_depth: usize,
     duration_seconds: u64,
     keyspace: usize,
     value_size: usize,
@@ -345,10 +382,20 @@ async fn run_profile(profile: String, args: RunConfig) -> Result<BenchmarkReport
     let mut tasks = Vec::with_capacity(args.connections);
     for (worker_id, client) in clients.into_iter().enumerate() {
         let workload = args.workload;
+        let pipeline_depth = args.pipeline_depth;
         let keyspace = args.keyspace;
         let value_size = args.value_size;
         tasks.push(tokio::spawn(async move {
-            run_worker(worker_id, client, workload, deadline, keyspace, value_size).await
+            run_worker(
+                worker_id,
+                client,
+                workload,
+                deadline,
+                keyspace,
+                value_size,
+                pipeline_depth,
+            )
+            .await
         }));
     }
 
@@ -384,6 +431,7 @@ async fn run_profile(profile: String, args: RunConfig) -> Result<BenchmarkReport
         profile,
         addr: args.profile_addr,
         connections: args.connections,
+        pipeline_depth: args.pipeline_depth,
         duration_seconds: args.duration_seconds,
         keyspace: args.keyspace,
         value_size: args.value_size,
@@ -491,6 +539,7 @@ async fn run_worker(
     deadline: Instant,
     keyspace: usize,
     value_size: usize,
+    pipeline_depth: usize,
 ) -> Result<WorkerReport> {
     let mut rng = SmallRng::seed_from_u64(0x5eed_u64 + worker_id as u64);
     let mut completed = 0u64;
@@ -499,8 +548,57 @@ async fn run_worker(
     let mut operation_index = 0u64;
     let mut histogram = Histogram::<u64>::new(3).expect("histogram");
     let value = "v".repeat(value_size);
+    let pipeline_depth = pipeline_depth.max(1);
 
     while Instant::now() < deadline {
+        if pipeline_depth > 1 && is_pipelined_workload(workload) {
+            let mut commands = Vec::with_capacity(pipeline_depth);
+            let mut pending = Vec::with_capacity(pipeline_depth);
+            while commands.len() < pipeline_depth && Instant::now() < deadline {
+                let (command, accepted) =
+                    next_pipelined_operation(&mut rng, workload, keyspace, &value);
+                commands.push(command);
+                pending.push(PendingPipelineOperation {
+                    accepted,
+                    started: Instant::now(),
+                });
+                operation_index += 1;
+            }
+            if commands.is_empty() {
+                break;
+            }
+
+            match client.send_pipeline(commands).await {
+                Ok(responses) => {
+                    for (operation, response) in pending.into_iter().zip(responses) {
+                        let latency_us = operation.started.elapsed().as_micros() as u64;
+                        histogram.record(latency_us.max(1)).expect("record latency");
+                        if operation.accepted.contains(&response.status) {
+                            completed += 1;
+                        } else {
+                            failed += 1;
+                            push_error_sample(
+                                &mut error_samples,
+                                response.decode_error_message().unwrap_or_else(|_| {
+                                    "benchmark command returned non-OK status".to_string()
+                                }),
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    let error = err.to_string();
+                    for operation in pending {
+                        let latency_us = operation.started.elapsed().as_micros() as u64;
+                        histogram.record(latency_us.max(1)).expect("record latency");
+                        failed += 1;
+                        push_error_sample(&mut error_samples, error.clone());
+                    }
+                }
+            }
+            continue;
+        }
+
         let started = Instant::now();
         let response = run_operation(
             worker_id,
@@ -530,6 +628,58 @@ async fn run_worker(
         histogram,
         error_samples,
     })
+}
+
+struct PendingPipelineOperation {
+    accepted: &'static [transport::Status],
+    started: Instant,
+}
+
+fn is_pipelined_workload(workload: WorkloadKind) -> bool {
+    matches!(
+        workload,
+        WorkloadKind::Get
+            | WorkloadKind::Set
+            | WorkloadKind::Mixed
+            | WorkloadKind::Ping
+            | WorkloadKind::QuorumWriteCost
+    )
+}
+
+fn next_pipelined_operation(
+    rng: &mut SmallRng,
+    workload: WorkloadKind,
+    keyspace: usize,
+    value: &str,
+) -> (Command, &'static [transport::Status]) {
+    match workload {
+        WorkloadKind::QuorumWriteCost => (
+            next_command(rng, WorkloadKind::Set, keyspace, value),
+            &[transport::Status::Ok],
+        ),
+        WorkloadKind::Get => (
+            next_command(rng, workload, keyspace, value),
+            &[transport::Status::Ok, transport::Status::NotFound],
+        ),
+        WorkloadKind::Set | WorkloadKind::Ping => (
+            next_command(rng, workload, keyspace, value),
+            &[transport::Status::Ok],
+        ),
+        WorkloadKind::Mixed => {
+            let command = next_command(rng, workload, keyspace, value);
+            let accepted = if matches!(&command, Command::Get { .. }) {
+                &[transport::Status::Ok, transport::Status::NotFound][..]
+            } else {
+                &[transport::Status::Ok][..]
+            };
+            (command, accepted)
+        }
+        WorkloadKind::TransactionFlow
+        | WorkloadKind::BackupRestore
+        | WorkloadKind::AuthRbacChurn => {
+            unreachable!("stateful profiles are not pipelined")
+        }
+    }
 }
 
 fn extend_error_samples(samples: &mut Vec<String>, errors: Vec<String>) {

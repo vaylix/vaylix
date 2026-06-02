@@ -73,6 +73,7 @@ Useful runtime environment variables for containers:
 - `VAYLIX_REQUESTS_PER_SECOND`
 - `VAYLIX_REQUEST_BURST`
 - `VAYLIX_AUDIT_LOG_PATH`
+- `VAYLIX_AUDIT_COMMANDS`
 - `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`
 - `VAYLIX_AUTH_FAILURE_WINDOW_SECONDS`
 - `VAYLIX_AUTH_FAILURE_LIMIT`
@@ -216,6 +217,7 @@ cargo audit
 - When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the env-managed bootstrap admin on startup. Changing those startup credentials rotates that admin and retires the previous env-managed admin.
 - Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
 - Request-level server logging is disabled by default on the hot path. Enable `--log-requests` / `VAYLIX_LOG_REQUESTS=true` only when request tracing is needed.
+- Security/operator audit events remain enabled by default. Generic per-command audit lines are opt-in through `--audit-commands` / `VAYLIX_AUDIT_COMMANDS=true` because full command auditing is intentionally expensive on read-heavy in-memory workloads.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.
 - TLS certificates are validated at startup for basic expiry/loadability, and the server reloads configured TLS material on Unix `SIGHUP`.
 - `METRICS` uses an OpenTelemetry-aligned metric contract under the `vaylix.*` namespace, and `METRICS PROM` exposes Prometheus-safe names translated from that contract.

@@ -66,6 +66,7 @@ pub fn build_server_launch_config(args: &Args) -> Result<ServerLaunchConfig> {
         tls_state,
         transport,
         log_requests: args.log_requests,
+        audit_commands: args.audit_commands,
         audit_logger: Arc::new(audit_logger),
         backup_dir,
         mtls_enabled: args.tls_client_ca.is_some(),

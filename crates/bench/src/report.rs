@@ -5,6 +5,7 @@ pub struct BenchmarkReport {
     pub profile: String,
     pub addr: String,
     pub connections: usize,
+    pub pipeline_depth: usize,
     pub duration_seconds: u64,
     pub keyspace: usize,
     pub value_size: usize,

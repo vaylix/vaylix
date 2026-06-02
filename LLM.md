@@ -422,6 +422,7 @@ Audit logging is implemented as append-only JSON lines under the data directory 
 
 - default path: `<data-dir>/audit.log`
 - optional override: `--audit-log-path`
+- generic every-command audit is opt-in with `--audit-commands` / `VAYLIX_AUDIT_COMMANDS=true`
 
 Each event records:
 
@@ -444,7 +445,7 @@ Each event records:
 
 The audit chain uses a fixed zero genesis hash for the first event. On startup, the server verifies existing audit lines and fails closed if a line has malformed JSON, invalid sequence, mismatched previous hash, mismatched event hash, or an unsupported hash algorithm. This makes local tampering detectable, but it is not non-repudiation: a local attacker who can rewrite the entire log can recompute a fresh chain unless the latest hash is anchored externally.
 
-Passwords and payload contents are not written to the audit log. Semantic event types are recorded for authentication success/failure and RBAC/auth mutations such as create/drop user, password rotation, create/drop role, grant/revoke role, and grant/revoke permission. Slow command audit events are emitted when command latency is at or above `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`; the default is `100`, and `0` disables slow-command events.
+Passwords and payload contents are not written to the audit log. Semantic event types are recorded for authentication success/failure and RBAC/auth mutations such as create/drop user, password rotation, create/drop role, grant/revoke role, and grant/revoke permission. Generic command audit lines are disabled by default for the read/write hot path; enable `--audit-commands` when operators need every command represented in the hash chain. Slow command audit events are emitted when command latency is at or above `--slow-command-threshold-ms` / `VAYLIX_SLOW_COMMAND_THRESHOLD_MS`; the default is `100`, and `0` disables slow-command events.
 
 ## Scalability Direction
 

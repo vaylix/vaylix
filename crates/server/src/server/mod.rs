@@ -49,7 +49,8 @@ mod validation;
 pub(crate) use audit_events::log_event;
 use audit_events::{
     auth_lockout_key, current_time_millis, log_connection_event, opcode_name, record_audit_event,
-    record_runtime_event, record_semantic_audit_event, record_slow_command_event,
+    record_command_audit_event, record_runtime_event, record_semantic_audit_event,
+    record_slow_command_event,
 };
 use authorization::{authorize_command, is_allowed_during_maintenance};
 use commands::{
@@ -1679,8 +1680,8 @@ where
             None
         };
         write_response_to_async_with_options(&mut stream, &response, transport).await?;
-        record_audit_event(
-            &runtime.audit_logger,
+        record_command_audit_event(
+            &runtime,
             AuditContext {
                 connection_id,
                 peer_addr,
@@ -3312,6 +3313,7 @@ mod tests {
             tls_state: None,
             transport: CodecOptions::default(),
             log_requests: false,
+            audit_commands: false,
             backup_dir,
             mtls_enabled: false,
             slow_command_threshold: Some(Duration::from_millis(100)),

@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Added a dedicated HA write coordinator that batches concurrent leader writes into one ordered local WAL batch and one replicated frontier.
 - Added read fast-path and replication client diagnostics to `METRICS` / `INFO`.
 - Added cached in-memory WAL entry identities for replication term/checksum lookup.
+- Added bounded request pipelining support to `vaylix-bench` for independent single-command workloads.
+- Added `--audit-commands` / `VAYLIX_AUDIT_COMMANDS` for operators that need generic audit lines for every command.
 
 ### Changed
 
@@ -28,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Reduced ordered write-coordinator overhead by moving batched command payloads instead of cloning them before engine execution.
 - Reduced leader append fanout allocation by avoiding duplicate cached WAL entry clones during follower planning.
 - Reduced binary transport allocator churn by pre-sizing common request and response payload buffers.
+- Kept security/operator semantic audit events enabled by default while moving generic every-command audit off the read/write hot path unless explicitly enabled.
 
 ### Fixed
 
