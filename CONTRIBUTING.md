@@ -15,6 +15,7 @@ Vaylix is a systems project. Contributions are expected to be explicit, test-bac
 - keep wire compatibility changes intentional
 - keep error boundaries explicit and code-bearing
 - keep persistence format changes versioned and tested
+- keep server storage paths explicit and production-oriented; client-local state may use user-space project directories
 - update `LLM.md` whenever architecture or operational behavior changes
 - update `README.md` whenever user-facing setup or runtime behavior changes
 
@@ -60,6 +61,8 @@ These require extra care:
 - request/response compatibility changes
 - WAL, snapshot, manifest, or storage-encryption changes
 - transaction semantics
+- HA replication and quorum behavior
+- benchmark harness changes that can invalidate baseline comparisons
 - workflow and release automation changes
 
 ## Testing Expectations
@@ -82,6 +85,8 @@ If you change:
 - protocol behavior
 - persistence behavior
 - security behavior
+- container runtime behavior
+- benchmark methodology or baseline presets
 - release or CI workflows
 
 then update the relevant top-level docs in the same PR.
@@ -95,9 +100,8 @@ then update the relevant top-level docs in the same PR.
 ## Current Project Reality
 
 Contributors should not overstate current capability. The codebase is still:
-- single-node
 - string-value only
-- without replication or sharding
-- without distributed ACID guarantees
+- centered on single-region HA replication, not sharding
+- without MVCC, distributed ACID guarantees, or linearizable follower reads
 
 Work that improves those areas is welcome, but it should be described as implementation work toward the roadmap, not as already-delivered capability.

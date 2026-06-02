@@ -527,9 +527,27 @@ async fn run_operation(
             let command = next_command(rng, WorkloadKind::Set, keyspace, value);
             send_ok(client, command).await
         }
-        WorkloadKind::Get | WorkloadKind::Set | WorkloadKind::Mixed | WorkloadKind::Ping => {
+        WorkloadKind::Get => {
+            let command = next_command(rng, workload, keyspace, value);
+            send_accepting(
+                client,
+                command,
+                &[transport::Status::Ok, transport::Status::NotFound],
+            )
+            .await
+        }
+        WorkloadKind::Set | WorkloadKind::Ping => {
             let command = next_command(rng, workload, keyspace, value);
             send_ok(client, command).await
+        }
+        WorkloadKind::Mixed => {
+            let command = next_command(rng, workload, keyspace, value);
+            let accepted = if matches!(&command, Command::Get { .. }) {
+                &[transport::Status::Ok, transport::Status::NotFound][..]
+            } else {
+                &[transport::Status::Ok][..]
+            };
+            send_accepting(client, command, accepted).await
         }
     }
 }
@@ -641,8 +659,16 @@ async fn run_auth_rbac_churn(
 }
 
 async fn send_ok(client: &BenchmarkClient, command: Command) -> Result<()> {
+    send_accepting(client, command, &[transport::Status::Ok]).await
+}
+
+async fn send_accepting(
+    client: &BenchmarkClient,
+    command: Command,
+    accepted: &[transport::Status],
+) -> Result<()> {
     let response = client.send(command).await?;
-    if response.status == transport::Status::Ok {
+    if accepted.contains(&response.status) {
         return Ok(());
     }
     Err(BenchError::InvalidConfiguration(

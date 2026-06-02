@@ -30,10 +30,7 @@ pub struct ServerLaunchConfig {
 pub fn build_server_launch_config(args: &Args) -> Result<ServerLaunchConfig> {
     validate_tls_args(args)?;
 
-    let paths = match args.data_dir.as_ref() {
-        Some(data_dir) => engine::Paths::from_data_dir(data_dir)?,
-        None => engine::Paths::new()?,
-    };
+    let paths = engine::Paths::from_data_dir(&args.data_dir)?;
     let keyring = engine::load_or_create_keyring(&paths.keyring_path, &paths.keyring_tmp_path)?;
     let auth_config = build_auth_config(args, &paths, keyring.clone())?;
     let engine_options = engine_options(args, Some(keyring));

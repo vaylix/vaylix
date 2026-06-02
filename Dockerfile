@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM rust:1.95.0-bookworm AS chef
+FROM rust:1.95.0-trixie AS chef
 
 RUN cargo install cargo-chef --locked
 
@@ -32,18 +32,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/app/target \
     cargo build --release -p server \
     && mkdir -p /out \
-    && cp target/release/vaylix /out/vaylix
+    && cp target/release/vaylix /out/vaylix \
+    && cp target/release/vaylix-init /out/vaylix-init
 
 RUN mkdir -p /runtime/var/lib/vaylix/backups \
     && chown -R 65532:65532 /runtime/var/lib/vaylix \
     && chmod -R u+rwX,g+rwX /runtime/var/lib/vaylix
 
 
-FROM debian:bookworm-slim AS runtime
-
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends gosu \
-    && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/cc-debian13 AS runtime
 
 ENV VAYLIX_BIND=0.0.0.0
 ENV VAYLIX_PORT=9173
@@ -54,13 +51,9 @@ ENV VAYLIX_BACKUP_DIR=/var/lib/vaylix/backups
 ENV VAYLIX_USER=vaylix
 ENV VAYLIX_PASSWORD=vaylix
 
-COPY --from=builder /runtime/var/lib/vaylix /var/lib/vaylix
+COPY --from=builder --chown=65532:65532 /runtime/var/lib/vaylix /var/lib/vaylix
 COPY --from=builder /out/vaylix /usr/local/bin/vaylix
-COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
-
-RUN groupadd --gid 65532 vaylix \
-    && useradd --uid 65532 --gid 65532 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin vaylix \
-    && chmod 0755 /usr/local/bin/vaylix /usr/local/bin/docker-entrypoint.sh
+COPY --from=builder /out/vaylix-init /usr/local/bin/vaylix-init
 
 EXPOSE 9173
 
@@ -69,5 +62,6 @@ VOLUME ["/var/lib/vaylix"]
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/vaylix", "healthcheck", "--kind", "liveness"]
 
-ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+ENTRYPOINT ["/usr/local/bin/vaylix-init"]
+
 CMD ["/usr/local/bin/vaylix"]

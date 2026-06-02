@@ -1,7 +1,9 @@
-use crate::{EngineError, Result};
-use directories::ProjectDirs;
+use crate::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Default durable storage root for Vaylix server data.
+pub const DEFAULT_DATA_DIR: &str = "/var/lib/vaylix";
 
 /// Filesystem layout used by the engine, server, and client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,11 +41,13 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Builds the default project paths from the operating system data directory.
+    /// Builds the default server storage layout.
+    ///
+    /// Server data intentionally defaults to `/var/lib/vaylix` rather than an
+    /// OS-specific per-user app-data path. Local development should pass
+    /// `--data-dir <path>` when the process cannot write to `/var/lib/vaylix`.
     pub fn new() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "vaylix", "vaylix")
-            .ok_or(EngineError::ProjectDirsUnavailable)?;
-        Self::from_data_dir(dirs.data_dir())
+        Self::from_data_dir(DEFAULT_DATA_DIR)
     }
 
     /// Builds a full path layout rooted at a caller-provided data directory.

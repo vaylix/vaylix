@@ -14,7 +14,7 @@ pub use engine::{
     StorageEngine, StorageInspection, TransactionResult,
 };
 pub use error::{EngineError, Result};
-pub use paths::Paths;
+pub use paths::{DEFAULT_DATA_DIR, Paths};
 pub use store::crypto::{decrypt as storage_decrypt, encrypt as storage_encrypt};
 pub use store::{
     WalEntry, WalOperation, WalReplay, WalReplayTarget, WalSegmentReport, create_active_segment,
