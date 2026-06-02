@@ -30,7 +30,7 @@ COPY crates ./crates
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/app/target \
-    cargo build --release -p server \
+    cargo build --release -p server --bin vaylix --bin vaylix-init --features container-init \
     && mkdir -p /out \
     && cp target/release/vaylix /out/vaylix \
     && cp target/release/vaylix-init /out/vaylix-init
