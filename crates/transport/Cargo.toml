@@ -1,11 +1,11 @@
 [package]
 name = "transport"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 
 [dependencies]
 command = { path = "../command" }
-bytes = "1"
+bytes = "1.11.1"
 thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = [
     "io-util",
@@ -14,7 +14,7 @@ tokio = { version = "1.52.3", features = [
     "rt-multi-thread",
 ] }
 crc32fast = "1.5.0"
-uuid = { version = "1.18.1", features = ["serde", "v7"] }
+uuid = { version = "1.23.2", features = ["serde", "v7"] }
 zstd = "0.13.3"
 
 [dev-dependencies]
