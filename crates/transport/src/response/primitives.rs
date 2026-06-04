@@ -12,9 +12,13 @@ pub(super) fn put_string_u16(buf: &mut BytesMut, value: &str) -> Result<()> {
 
 pub(super) fn put_string_u32(buf: &mut BytesMut, value: &str) -> Result<()> {
     let bytes = value.as_bytes();
-    let length = u32::try_from(bytes.len()).map_err(|_| TransportError::CorruptedPayload)?;
+    put_bytes_u32(buf, bytes)
+}
+
+pub(super) fn put_bytes_u32(buf: &mut BytesMut, value: &[u8]) -> Result<()> {
+    let length = u32::try_from(value.len()).map_err(|_| TransportError::CorruptedPayload)?;
     buf.put_u32(length);
-    buf.extend_from_slice(bytes);
+    buf.extend_from_slice(value);
     Ok(())
 }
 
@@ -34,6 +38,19 @@ pub(super) fn read_string_u32(buf: &mut &[u8]) -> Result<String> {
 
     let length = buf.get_u32() as usize;
     read_string(buf, length)
+}
+
+pub(super) fn read_bytes_u32(buf: &mut &[u8]) -> Result<Vec<u8>> {
+    if buf.remaining() < 4 {
+        return Err(TransportError::UnexpectedEof);
+    }
+
+    let length = buf.get_u32() as usize;
+    if buf.remaining() < length {
+        return Err(TransportError::UnexpectedEof);
+    }
+
+    Ok(buf.copy_to_bytes(length).to_vec())
 }
 
 fn read_string(buf: &mut &[u8], length: usize) -> Result<String> {

@@ -5,10 +5,12 @@ use crate::error::{Result, TransportError};
 use crate::frame::FrameHeader;
 use crate::options::{CodecOptions, CompressionMode};
 
+pub(super) fn should_compress(body_len: usize, options: CodecOptions) -> bool {
+    options.compression == CompressionMode::Zstd && body_len >= options.compression_threshold_bytes
+}
+
 pub(super) fn maybe_compress(body: &[u8], options: CodecOptions) -> Result<(u8, Vec<u8>)> {
-    if options.compression != CompressionMode::Zstd
-        || body.len() < options.compression_threshold_bytes
-    {
+    if !should_compress(body.len(), options) {
         return Ok((FLAGS_NONE, body.to_vec()));
     }
 

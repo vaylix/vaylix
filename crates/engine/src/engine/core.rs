@@ -12,6 +12,8 @@ use crate::store::{
     save_manifest, seal_active, serialize,
 };
 use crate::{EngineMetadata, StorageKeyring};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use command::Command;
 use crc32fast::hash;
 use std::collections::BTreeMap;
@@ -19,6 +21,24 @@ use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SCAN_COUNT: usize = 10;
+
+fn next_value_version(previous: Option<&StoredValue>) -> u64 {
+    previous
+        .map(|entry| entry.version.saturating_add(1))
+        .unwrap_or(1)
+}
+
+fn parse_integer_value(key: &str, value: &[u8]) -> Result<i64> {
+    let text = std::str::from_utf8(value).map_err(|_| crate::EngineError::InvalidIntegerValue {
+        key: key.to_string(),
+        value: String::from_utf8_lossy(value).into_owned(),
+    })?;
+    text.parse::<i64>()
+        .map_err(|_| crate::EngineError::InvalidIntegerValue {
+            key: key.to_string(),
+            value: text.to_string(),
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReplicationSnapshot {
@@ -813,7 +833,7 @@ impl Engine {
         }
     }
 
-    fn maybe_get_existing_value(&mut self, key: &str) -> Option<String> {
+    fn maybe_get_existing_value(&mut self, key: &str) -> Option<Vec<u8>> {
         self.state.purge_expired(self.now());
         self.state.raw_value(key)
     }
@@ -833,6 +853,7 @@ impl Engine {
             }),
             expiration: Self::map_command_expiration(options.expiration),
             keep_ttl: options.keep_ttl,
+            if_version: options.if_version,
         }
     }
 
@@ -944,7 +965,10 @@ impl Engine {
 
         match command {
             Command::Ping { message } => Ok(TransactionResult::Value(
-                message.clone().unwrap_or_else(|| "PONG".to_string()),
+                message
+                    .clone()
+                    .unwrap_or_else(|| "PONG".to_string())
+                    .into_bytes(),
             )),
             Command::Get { key } => Ok(match state.raw_value(key) {
                 Some(value) => TransactionResult::Value(value),
@@ -992,29 +1016,37 @@ impl Engine {
             } => {
                 let previous_entry = state.raw_entry(key);
                 let previous = previous_entry.as_ref().map(|entry| entry.value.clone());
-                let previous_expiration = previous_entry.and_then(|entry| entry.expires_at_ms);
+                let previous_expiration = previous_entry
+                    .as_ref()
+                    .and_then(|entry| entry.expires_at_ms);
+                let previous_version = previous_entry.as_ref().map(|entry| entry.version);
                 let mapped = Self::map_command_set_options(options.clone());
                 let allowed = match mapped.condition {
                     Some(SetCondition::Nx) => previous.is_none(),
                     Some(SetCondition::Xx) => previous.is_some(),
                     None => true,
-                };
+                } && mapped
+                    .if_version
+                    .map(|expected| previous_version == Some(expected))
+                    .unwrap_or(true);
                 if !allowed {
                     return Ok(if options.return_previous {
                         previous
                             .map(TransactionResult::Value)
                             .unwrap_or(TransactionResult::NotFound)
-                    } else if options.condition.is_some() {
+                    } else if options.condition.is_some() || options.if_version.is_some() {
                         TransactionResult::Boolean(false)
                     } else {
                         TransactionResult::Ok
                     });
                 }
 
-                state.set_raw_value(key.clone(), value.clone());
+                let version = next_value_version(previous_entry.as_ref());
+                state.set_raw_value_with_version(key.clone(), value.clone(), version);
                 operations.push(WalOperation::Set {
                     key: key.clone(),
                     value: value.clone(),
+                    version,
                 });
 
                 if let Some(expiration) = mapped.expiration {
@@ -1043,7 +1075,7 @@ impl Engine {
                     previous
                         .map(TransactionResult::Value)
                         .unwrap_or(TransactionResult::NotFound)
-                } else if options.condition.is_some() {
+                } else if options.condition.is_some() || options.if_version.is_some() {
                     TransactionResult::Boolean(true)
                 } else {
                     TransactionResult::Ok
@@ -1053,10 +1085,12 @@ impl Engine {
                 if state.raw_contains_key(key) {
                     return Ok(TransactionResult::Boolean(false));
                 }
-                state.set_raw_value(key.clone(), value.clone());
+                let version = next_value_version(None);
+                state.set_raw_value_with_version(key.clone(), value.clone(), version);
                 operations.push(WalOperation::Set {
                     key: key.clone(),
                     value: value.clone(),
+                    version,
                 });
                 Ok(TransactionResult::Boolean(true))
             }
@@ -1065,10 +1099,13 @@ impl Engine {
             )),
             Command::MSet { entries } => {
                 for (key, value) in entries {
-                    state.set_raw_value(key.clone(), value.clone());
+                    let previous_entry = state.raw_entry(key);
+                    let version = next_value_version(previous_entry.as_ref());
+                    state.set_raw_value_with_version(key.clone(), value.clone(), version);
                     operations.push(WalOperation::Set {
                         key: key.clone(),
                         value: value.clone(),
+                        version,
                     });
                 }
                 Ok(TransactionResult::Ok)
@@ -1085,17 +1122,17 @@ impl Engine {
             }
             Command::Exists { key } => Ok(TransactionResult::Boolean(state.raw_contains_key(key))),
             Command::Incr { key } => {
-                let current = state.raw_value(key).unwrap_or_else(|| "0".to_string());
-                let parsed = current.parse::<i64>().map_err(|_| {
-                    crate::EngineError::InvalidIntegerValue {
-                        key: key.clone(),
-                        value: current.clone(),
-                    }
-                })?;
+                let current = state.raw_value(key).unwrap_or_else(|| b"0".to_vec());
+                let parsed = parse_integer_value(key, &current)?;
                 let next = parsed
                     .checked_add(1)
                     .ok_or_else(|| crate::EngineError::NumericOverflow { key: key.clone() })?;
-                state.set_raw_value(key.clone(), next.to_string());
+                let version = next_value_version(state.raw_entry(key).as_ref());
+                state.set_raw_value_with_version(
+                    key.clone(),
+                    next.to_string().into_bytes(),
+                    version,
+                );
                 operations.push(WalOperation::CheckInteger {
                     key: key.clone(),
                     delta: 1,
@@ -1103,17 +1140,17 @@ impl Engine {
                 Ok(TransactionResult::Integer(next))
             }
             Command::Decr { key } => {
-                let current = state.raw_value(key).unwrap_or_else(|| "0".to_string());
-                let parsed = current.parse::<i64>().map_err(|_| {
-                    crate::EngineError::InvalidIntegerValue {
-                        key: key.clone(),
-                        value: current.clone(),
-                    }
-                })?;
+                let current = state.raw_value(key).unwrap_or_else(|| b"0".to_vec());
+                let parsed = parse_integer_value(key, &current)?;
                 let next = parsed
                     .checked_sub(1)
                     .ok_or_else(|| crate::EngineError::NumericOverflow { key: key.clone() })?;
-                state.set_raw_value(key.clone(), next.to_string());
+                let version = next_value_version(state.raw_entry(key).as_ref());
+                state.set_raw_value_with_version(
+                    key.clone(),
+                    next.to_string().into_bytes(),
+                    version,
+                );
                 operations.push(WalOperation::CheckInteger {
                     key: key.clone(),
                     delta: -1,
@@ -1152,13 +1189,15 @@ impl Engine {
                 let Some(entry) = state.remove_raw(source) else {
                     return Ok(TransactionResult::Boolean(false));
                 };
-                state.set_raw_value(destination.clone(), entry.value.clone());
+                let version = next_value_version(state.raw_entry(destination).as_ref());
+                state.set_raw_value_with_version(destination.clone(), entry.value.clone(), version);
                 operations.push(WalOperation::Delete {
                     key: source.clone(),
                 });
                 operations.push(WalOperation::Set {
                     key: destination.clone(),
                     value: entry.value,
+                    version,
                 });
                 if let Some(expires_at_ms) = entry.expires_at_ms {
                     state.set_expiration_if_present(destination, expires_at_ms);
@@ -1325,14 +1364,14 @@ fn build_wal_entry_identities(entries: &[WalEntry]) -> Result<BTreeMap<u64, WalE
 }
 
 impl StorageEngine for Engine {
-    fn get(&mut self, key: &str) -> Result<Option<String>> {
+    fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.state.get_live(key, self.now()))
     }
 
     fn set_with_options(
         &mut self,
         key: String,
-        value: String,
+        value: Vec<u8>,
         options: SetOptions,
     ) -> Result<SetOutcome> {
         let now_ms = self.now();
@@ -1340,24 +1379,34 @@ impl StorageEngine for Engine {
 
         let previous_entry = self.state.raw_entry(&key);
         let previous = previous_entry.as_ref().map(|entry| entry.value.clone());
-        let previous_expiration = previous_entry.and_then(|entry| entry.expires_at_ms);
+        let previous_expiration = previous_entry
+            .as_ref()
+            .and_then(|entry| entry.expires_at_ms);
+        let previous_version = previous_entry.as_ref().map(|entry| entry.version);
 
         let allowed = match options.condition {
             Some(SetCondition::Nx) => previous.is_none(),
             Some(SetCondition::Xx) => previous.is_some(),
             None => true,
-        };
+        } && options
+            .if_version
+            .map(|expected| previous_version == Some(expected))
+            .unwrap_or(true);
 
         if !allowed {
             return Ok(SetOutcome {
                 applied: false,
                 previous,
+                version: previous_version,
             });
         }
+
+        let version = next_value_version(previous_entry.as_ref());
 
         let mut operations = vec![WalOperation::Set {
             key: key.clone(),
             value,
+            version,
         }];
 
         if let Some(expiration) = options.expiration {
@@ -1384,10 +1433,11 @@ impl StorageEngine for Engine {
         Ok(SetOutcome {
             applied: true,
             previous,
+            version: Some(version),
         })
     }
 
-    fn get_del(&mut self, key: &str) -> Result<Option<String>> {
+    fn get_del(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
         let previous = self.maybe_get_existing_value(key);
         if previous.is_some() {
             self.append_and_apply(vec![WalOperation::Delete {
@@ -1402,7 +1452,7 @@ impl StorageEngine for Engine {
         key: &str,
         expiration: Option<Expiration>,
         persist: bool,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<Vec<u8>>> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
@@ -1438,19 +1488,27 @@ impl StorageEngine for Engine {
         Ok(previous)
     }
 
-    fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<String>>> {
+    fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
 
         Ok(keys.iter().map(|key| self.state.raw_value(key)).collect())
     }
 
-    fn mset(&mut self, entries: &[(String, String)]) -> Result<()> {
+    fn mset(&mut self, entries: &[(String, Vec<u8>)]) -> Result<()> {
+        let mut next_versions = BTreeMap::<String, u64>::new();
         let operations = entries
             .iter()
-            .map(|(key, value)| WalOperation::Set {
-                key: key.clone(),
-                value: value.clone(),
+            .map(|(key, value)| {
+                let version = next_versions
+                    .remove(key)
+                    .unwrap_or_else(|| next_value_version(self.state.raw_entry(key).as_ref()));
+                next_versions.insert(key.clone(), version.saturating_add(1));
+                WalOperation::Set {
+                    key: key.clone(),
+                    value: value.clone(),
+                    version,
+                }
             })
             .collect();
 
@@ -1490,14 +1548,8 @@ impl StorageEngine for Engine {
     fn incr(&mut self, key: &str) -> Result<i64> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let current = self.state.raw_value(key).unwrap_or_else(|| "0".to_string());
-        let parsed =
-            current
-                .parse::<i64>()
-                .map_err(|_| crate::EngineError::InvalidIntegerValue {
-                    key: key.to_string(),
-                    value: current.clone(),
-                })?;
+        let current = self.state.raw_value(key).unwrap_or_else(|| b"0".to_vec());
+        let parsed = parse_integer_value(key, &current)?;
         let next = parsed
             .checked_add(1)
             .ok_or_else(|| crate::EngineError::NumericOverflow {
@@ -1515,14 +1567,8 @@ impl StorageEngine for Engine {
     fn decr(&mut self, key: &str) -> Result<i64> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let current = self.state.raw_value(key).unwrap_or_else(|| "0".to_string());
-        let parsed =
-            current
-                .parse::<i64>()
-                .map_err(|_| crate::EngineError::InvalidIntegerValue {
-                    key: key.to_string(),
-                    value: current.clone(),
-                })?;
+        let current = self.state.raw_value(key).unwrap_or_else(|| b"0".to_vec());
+        let parsed = parse_integer_value(key, &current)?;
         let next = parsed
             .checked_sub(1)
             .ok_or_else(|| crate::EngineError::NumericOverflow {
@@ -1593,6 +1639,7 @@ impl StorageEngine for Engine {
             WalOperation::Set {
                 key: destination.clone(),
                 value: entry.value,
+                version: next_value_version(self.state.raw_entry(&destination).as_ref()),
             },
         ];
         if let Some(expires_at_ms) = entry.expires_at_ms {
@@ -1650,7 +1697,7 @@ impl StorageEngine for Engine {
         })
     }
 
-    fn list(&mut self) -> Result<Vec<(String, String)>> {
+    fn list(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
         Ok(self.state.live_entries(self.now()))
     }
 
@@ -1736,17 +1783,20 @@ impl StorageEngine for Engine {
     fn logical_backup(&mut self) -> Result<String> {
         let now_ms = self.now();
         self.state.purge_expired(now_ms);
-        let (data, expirations) = self.state.to_persisted_parts();
-        let entries = data
+        let entries = self
+            .state
+            .store
+            .to_entries()
             .into_iter()
-            .map(|(key, value)| LogicalBackupEntry {
-                expires_at_ms: expirations.get(&key).copied(),
+            .map(|(key, entry)| LogicalBackupEntry {
+                expires_at_ms: entry.expires_at_ms,
                 key,
-                value,
+                value_base64: BASE64.encode(entry.value),
+                version: entry.version,
             })
             .collect();
         let backup = LogicalBackup {
-            version: 1,
+            version: 2,
             created_at_ms: now_ms,
             source_engine_version: self.state.metadata.version,
             source_sequence: self.state.metadata.last_applied_sequence,
@@ -1770,9 +1820,13 @@ impl StorageEngine for Engine {
             {
                 continue;
             }
+            let value = BASE64
+                .decode(entry.value_base64.as_bytes())
+                .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string()))?;
             operations.push(WalOperation::Set {
                 key: entry.key.clone(),
-                value: entry.value,
+                value,
+                version: entry.version.max(1),
             });
             if let Some(expires_at_ms) = entry.expires_at_ms {
                 operations.push(WalOperation::Expire {
@@ -1804,14 +1858,55 @@ impl StorageEngine for Engine {
 }
 
 fn parse_logical_backup(dump: &str) -> Result<LogicalBackup> {
-    let backup: LogicalBackup = serde_json::from_str(dump)
+    let header: LogicalBackupHeader = serde_json::from_str(dump)
         .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string()))?;
-    if backup.version != 1 {
-        return Err(crate::EngineError::UnsupportedStorageFormat {
+    match header.version {
+        2 => serde_json::from_str(dump)
+            .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string())),
+        1 => {
+            let legacy: LegacyLogicalBackup = serde_json::from_str(dump)
+                .map_err(|err| crate::EngineError::SnapshotDeserialize(err.to_string()))?;
+            Ok(LogicalBackup {
+                version: 2,
+                created_at_ms: legacy.created_at_ms,
+                source_engine_version: legacy.source_engine_version,
+                source_sequence: legacy.source_sequence,
+                entries: legacy
+                    .entries
+                    .into_iter()
+                    .map(|entry| LogicalBackupEntry {
+                        key: entry.key,
+                        value_base64: BASE64.encode(entry.value.as_bytes()),
+                        expires_at_ms: entry.expires_at_ms,
+                        version: 1,
+                    })
+                    .collect(),
+            })
+        }
+        _ => Err(crate::EngineError::UnsupportedStorageFormat {
             resource: "logical backup",
-        });
+        }),
     }
-    Ok(backup)
+}
+
+#[derive(serde::Deserialize)]
+struct LogicalBackupHeader {
+    version: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyLogicalBackup {
+    created_at_ms: u64,
+    source_engine_version: u32,
+    source_sequence: u64,
+    entries: Vec<LegacyLogicalBackupEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct LegacyLogicalBackupEntry {
+    key: String,
+    value: String,
+    expires_at_ms: Option<u64>,
 }
 
 fn build_storage_inspection(
@@ -1879,7 +1974,7 @@ mod tests {
     use crate::{
         EngineOptions, Expiration, Paths, SetCondition, SetOptions, StorageEngine, StorageKey,
         StorageKeyring, WalSyncPolicy,
-        store::{Manifest, save_manifest},
+        store::{Manifest, load_manifest, save_manifest},
     };
     use command::Command;
     use std::fs;
@@ -1931,30 +2026,29 @@ mod tests {
         )
     }
 
+    fn bytes(value: &str) -> Vec<u8> {
+        value.as_bytes().to_vec()
+    }
+
     #[test]
     fn supports_serious_v1_string_commands() {
         let (mut engine, root) = engine();
 
-        engine.set("name".to_string(), "alice".to_string()).unwrap();
-        assert_eq!(engine.get("name").unwrap(), Some("alice".to_string()));
-        assert!(
-            !engine
-                .set_nx("name".to_string(), "bob".to_string())
-                .unwrap()
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+        assert_eq!(
+            engine.get("name").unwrap().as_deref(),
+            Some(b"alice".as_slice())
         );
-        assert!(
-            engine
-                .set_nx("city".to_string(), "paris".to_string())
-                .unwrap()
-        );
+        assert!(!engine.set_nx("name".to_string(), bytes("bob")).unwrap());
+        assert!(engine.set_nx("city".to_string(), bytes("paris")).unwrap());
         assert_eq!(
             engine.mget(&["name".into(), "missing".into()]).unwrap(),
-            vec![Some("alice".into()), None]
+            vec![Some(bytes("alice")), None]
         );
         engine
             .mset(&[
-                ("one".to_string(), "1".to_string()),
-                ("two".to_string(), "2".to_string()),
+                ("one".to_string(), bytes("1")),
+                ("two".to_string(), bytes("2")),
             ])
             .unwrap();
         assert_eq!(engine.db_size().unwrap(), 4);
@@ -1973,45 +2067,65 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_mset_entries_advance_versions_in_order() {
+        let (mut engine, root) = engine();
+
+        engine.set("dup".to_string(), bytes("base")).unwrap();
+        let base_version = engine.state().raw_entry("dup").unwrap().version;
+        engine
+            .mset(&[
+                ("dup".to_string(), bytes("one")),
+                ("dup".to_string(), bytes("two")),
+            ])
+            .unwrap();
+
+        let entry = engine.state().raw_entry("dup").unwrap();
+        assert_eq!(entry.value, bytes("two"));
+        assert_eq!(entry.version, base_version + 2);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn supports_set_getdel_getex_and_scan_match() {
         let (mut engine, root) = engine();
 
-        engine
-            .set("user:1".to_string(), "alice".to_string())
-            .unwrap();
+        engine.set("user:1".to_string(), bytes("alice")).unwrap();
         let outcome = engine
             .set_with_options(
                 "user:1".to_string(),
-                "bob".to_string(),
+                bytes("bob"),
                 SetOptions {
                     condition: Some(SetCondition::Xx),
                     expiration: Some(Expiration::Seconds(60)),
                     keep_ttl: false,
+                    if_version: None,
                 },
             )
             .unwrap();
         assert!(outcome.applied);
-        assert_eq!(outcome.previous, Some("alice".to_string()));
+        assert_eq!(outcome.previous.as_deref(), Some(b"alice".as_slice()));
 
-        assert_eq!(engine.get_del("user:1").unwrap(), Some("bob".to_string()));
+        assert_eq!(
+            engine.get_del("user:1").unwrap().as_deref(),
+            Some(b"bob".as_slice())
+        );
         assert_eq!(engine.get("user:1").unwrap(), None);
 
-        engine
-            .set("user:2".to_string(), "carol".to_string())
-            .unwrap();
+        engine.set("user:2".to_string(), bytes("carol")).unwrap();
         assert_eq!(
             engine
                 .get_ex("user:2", Some(Expiration::Seconds(60)), false)
                 .unwrap(),
-            Some("carol".to_string())
+            Some(bytes("carol"))
         );
         assert!(engine.ttl("user:2").unwrap() > 0);
 
         engine
             .mset(&[
-                ("user:alpha".to_string(), "1".to_string()),
-                ("sys:beta".to_string(), "2".to_string()),
-                ("user:gamma".to_string(), "3".to_string()),
+                ("user:alpha".to_string(), bytes("1")),
+                ("sys:beta".to_string(), bytes("2")),
+                ("user:gamma".to_string(), bytes("3")),
             ])
             .unwrap();
 
@@ -2025,7 +2139,7 @@ mod tests {
     fn snapshot_persists_state_and_retains_segmented_wal_history() {
         let (mut engine, root) = engine();
 
-        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
         engine.snapshot().unwrap();
 
         let wal_dir = root.join("wal");
@@ -2052,7 +2166,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
+        assert_eq!(
+            reloaded.get("name").unwrap().as_deref(),
+            Some(b"alice".as_slice())
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -2062,7 +2179,7 @@ mod tests {
         let (mut engine, root) = engine();
 
         engine.snapshot().unwrap();
-        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
         engine.snapshot().unwrap();
 
         let wal_report = crate::inspect_wal(&root.join("wal")).unwrap();
@@ -2082,7 +2199,10 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(reloaded.get("name").unwrap(), Some("alice".to_string()));
+        assert_eq!(
+            reloaded.get("name").unwrap().as_deref(),
+            Some(b"alice".as_slice())
+        );
 
         fs::remove_dir_all(root).ok();
     }
@@ -2091,9 +2211,9 @@ mod tests {
     fn wal_entries_since_capped_hides_uncommitted_tail() {
         let (mut engine, root) = engine();
 
-        engine.set("a".to_string(), "1".to_string()).unwrap();
-        engine.set("b".to_string(), "2".to_string()).unwrap();
-        engine.set("c".to_string(), "3".to_string()).unwrap();
+        engine.set("a".to_string(), bytes("1")).unwrap();
+        engine.set("b".to_string(), bytes("2")).unwrap();
+        engine.set("c".to_string(), bytes("3")).unwrap();
 
         let committed = engine.wal_entries_since_capped(0, 32, Some(2)).unwrap();
         assert_eq!(
@@ -2120,7 +2240,7 @@ mod tests {
         let first = engine
             .execute_command_batch(&[Command::Set {
                 key: "batch:1".to_string(),
-                value: "one".to_string(),
+                value: bytes("one"),
                 options: command::SetOptions::default(),
             }])
             .unwrap();
@@ -2129,7 +2249,7 @@ mod tests {
         let second = engine
             .execute_command_batch(&[Command::Set {
                 key: "batch:2".to_string(),
-                value: "two".to_string(),
+                value: bytes("two"),
                 options: command::SetOptions::default(),
             }])
             .unwrap();
@@ -2160,9 +2280,9 @@ mod tests {
             },
         )
         .unwrap();
-        source.set("a".to_string(), "1".to_string()).unwrap();
+        source.set("a".to_string(), bytes("1")).unwrap();
         source.expire("a", 60).unwrap();
-        source.set("b".to_string(), "2".to_string()).unwrap();
+        source.set("b".to_string(), bytes("2")).unwrap();
 
         let dump = source.logical_backup().unwrap();
 
@@ -2177,13 +2297,11 @@ mod tests {
             },
         )
         .unwrap();
-        restored
-            .set("old".to_string(), "value".to_string())
-            .unwrap();
+        restored.set("old".to_string(), bytes("value")).unwrap();
 
         assert_eq!(restored.restore_logical_backup(&dump).unwrap(), 2);
-        assert_eq!(restored.get("a").unwrap().as_deref(), Some("1"));
-        assert_eq!(restored.get("b").unwrap().as_deref(), Some("2"));
+        assert_eq!(restored.get("a").unwrap().as_deref(), Some(b"1".as_slice()));
+        assert_eq!(restored.get("b").unwrap().as_deref(), Some(b"2".as_slice()));
         assert_eq!(restored.get("old").unwrap(), None);
         assert!(restored.ttl("a").unwrap() > 0);
 
@@ -2194,7 +2312,7 @@ mod tests {
     #[test]
     fn rejects_wrong_data_key_on_recovery() {
         let (mut engine, root) = engine();
-        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
         engine.snapshot().unwrap();
 
         let paths = Paths::from_data_dir(&root).unwrap();
@@ -2203,6 +2321,51 @@ mod tests {
             EngineOptions {
                 wal_sync: WalSyncPolicy::Flush,
                 keyring: Some(test_keyring("wrong-data-key")),
+                ..EngineOptions::default()
+            },
+        );
+
+        assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_corrupted_snapshot_on_recovery() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        fs::write(&paths.snapshot_path, b"corrupted snapshot").unwrap();
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        );
+
+        assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_snapshot_manifest_checksum_mismatch_on_recovery() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let mut manifest = load_manifest(&paths.manifest_path).unwrap().unwrap();
+        manifest.snapshot_checksum ^= 0xffff;
+        save_manifest(&manifest, &paths.manifest_path, &paths.manifest_tmp_path).unwrap();
+
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
                 ..EngineOptions::default()
             },
         );
@@ -2266,9 +2429,7 @@ mod tests {
     fn ttl_and_persist_behave_consistently() {
         let (mut engine, root) = engine();
 
-        engine
-            .set("session".to_string(), "abc".to_string())
-            .unwrap();
+        engine.set("session".to_string(), bytes("abc")).unwrap();
         assert_eq!(engine.ttl("session").unwrap(), -1);
         assert!(engine.expire("session", 60).unwrap());
         assert!(engine.ttl("session").unwrap() > 0);
@@ -2284,9 +2445,9 @@ mod tests {
 
         engine
             .mset(&[
-                ("a".to_string(), "1".to_string()),
-                ("b".to_string(), "2".to_string()),
-                ("c".to_string(), "3".to_string()),
+                ("a".to_string(), bytes("1")),
+                ("b".to_string(), bytes("2")),
+                ("c".to_string(), bytes("3")),
             ])
             .unwrap();
 
@@ -2307,7 +2468,7 @@ mod tests {
         let commands = vec![
             Command::Set {
                 key: "counter".to_string(),
-                value: "abc".to_string(),
+                value: bytes("abc"),
                 options: command::SetOptions::default(),
             },
             Command::Incr {
@@ -2319,5 +2480,136 @@ mod tests {
         assert_eq!(engine.get("counter").unwrap(), None);
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn stores_binary_values_across_snapshot_and_recovery() {
+        let (mut engine, root) = engine();
+        let payload = vec![0, 159, 146, 150, b'a', 0, 255];
+
+        engine.set("bin".to_string(), payload.clone()).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let mut reloaded = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(reloaded.get("bin").unwrap(), Some(payload));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn logical_backup_round_trips_binary_values_and_versions() {
+        let (mut source, root) = engine();
+        let payload = vec![0, 1, 2, 250, 255];
+        source.set("bin".to_string(), payload.clone()).unwrap();
+        let version = source.state().raw_entry("bin").unwrap().version;
+        let dump = source.logical_backup().unwrap();
+
+        let (mut restored, restore_root) = engine();
+        restored.restore_logical_backup(&dump).unwrap();
+
+        let restored_entry = restored.state().raw_entry("bin").unwrap();
+        assert_eq!(restored_entry.value, payload);
+        assert_eq!(restored_entry.version, version);
+
+        fs::remove_dir_all(root).ok();
+        fs::remove_dir_all(restore_root).ok();
+    }
+
+    #[test]
+    fn logical_backup_restore_accepts_legacy_v1_text_values() {
+        let (mut restored, root) = engine();
+        let dump = serde_json::json!({
+            "version": 1,
+            "created_at_ms": now_ms(),
+            "source_engine_version": 2,
+            "source_sequence": 7,
+            "entries": [
+                {
+                    "key": "legacy",
+                    "value": "text",
+                    "expires_at_ms": null
+                }
+            ]
+        })
+        .to_string();
+
+        assert_eq!(restored.restore_logical_backup(&dump).unwrap(), 1);
+        let entry = restored.state().raw_entry("legacy").unwrap();
+        assert_eq!(entry.value, bytes("text"));
+        assert_eq!(entry.version, 1);
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cas_succeeds_fails_and_preserves_versions() {
+        let (mut engine, root) = engine();
+
+        engine.set("item".to_string(), bytes("one")).unwrap();
+        let initial_version = engine.state().raw_entry("item").unwrap().version;
+
+        let success = engine
+            .set_with_options(
+                "item".to_string(),
+                bytes("two"),
+                SetOptions {
+                    if_version: Some(initial_version),
+                    ..SetOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(success.applied);
+        let next_version = engine.state().raw_entry("item").unwrap().version;
+        assert!(next_version > initial_version);
+
+        let failure = engine
+            .set_with_options(
+                "item".to_string(),
+                bytes("stale"),
+                SetOptions {
+                    if_version: Some(initial_version),
+                    ..SetOptions::default()
+                },
+            )
+            .unwrap();
+        assert!(!failure.applied);
+        assert_eq!(
+            engine.get("item").unwrap().as_deref(),
+            Some(b"two".as_slice())
+        );
+        assert_eq!(
+            engine.state().raw_entry("item").unwrap().version,
+            next_version
+        );
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn replicated_entries_preserve_binary_value_and_version() {
+        let (mut leader, leader_root) = engine();
+        let (mut follower, follower_root) = engine();
+        let payload = vec![0, 1, 2, 200, 255];
+
+        leader.set("bin".to_string(), payload.clone()).unwrap();
+        let entries = leader.wal_entries_since(0, 32).unwrap();
+        follower.apply_replication_entries(&entries).unwrap();
+
+        let follower_entry = follower.state().raw_entry("bin").unwrap();
+        let leader_entry = leader.state().raw_entry("bin").unwrap();
+        assert_eq!(follower_entry.value, payload);
+        assert_eq!(follower_entry.version, leader_entry.version);
+
+        fs::remove_dir_all(leader_root).ok();
+        fs::remove_dir_all(follower_root).ok();
     }
 }

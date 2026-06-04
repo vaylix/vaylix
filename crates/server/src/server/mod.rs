@@ -3394,34 +3394,39 @@ mod tests {
 
     #[derive(Default)]
     struct FakeEngine {
-        data: BTreeMap<String, String>,
+        data: BTreeMap<String, Vec<u8>>,
     }
 
     impl StorageEngine for FakeEngine {
-        fn get(&mut self, key: &str) -> Result<Option<String>> {
+        fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
             Ok(self.data.get(key).cloned())
         }
         fn set_with_options(
             &mut self,
             key: String,
-            value: String,
+            value: Vec<u8>,
             options: SetOptions,
         ) -> Result<SetOutcome> {
             let previous = self.data.get(&key).cloned();
+            let previous_version = previous.as_ref().map(|_| 1);
             let allowed = match options.condition {
                 Some(SetCondition::Nx) => previous.is_none(),
                 Some(SetCondition::Xx) => previous.is_some(),
                 None => true,
-            };
+            } && options
+                .if_version
+                .map(|expected| previous_version == Some(expected))
+                .unwrap_or(true);
             if allowed {
                 self.data.insert(key, value);
             }
             Ok(SetOutcome {
                 applied: allowed,
                 previous,
+                version: allowed.then_some(previous_version.unwrap_or_default() + 1),
             })
         }
-        fn get_del(&mut self, key: &str) -> Result<Option<String>> {
+        fn get_del(&mut self, key: &str) -> Result<Option<Vec<u8>>> {
             Ok(self.data.remove(key))
         }
         fn get_ex(
@@ -3429,13 +3434,13 @@ mod tests {
             key: &str,
             _expiration: Option<Expiration>,
             _persist: bool,
-        ) -> Result<Option<String>> {
+        ) -> Result<Option<Vec<u8>>> {
             Ok(self.data.get(key).cloned())
         }
-        fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<String>>> {
+        fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>> {
             Ok(keys.iter().map(|key| self.data.get(key).cloned()).collect())
         }
-        fn mset(&mut self, entries: &[(String, String)]) -> Result<()> {
+        fn mset(&mut self, entries: &[(String, Vec<u8>)]) -> Result<()> {
             for (key, value) in entries {
                 self.data.insert(key.clone(), value.clone());
             }
@@ -3454,27 +3459,17 @@ mod tests {
             Ok(self.data.contains_key(key))
         }
         fn incr(&mut self, key: &str) -> Result<i64> {
-            let value = self
-                .data
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| "0".to_string())
-                .parse::<i64>()
-                .unwrap()
-                + 1;
-            self.data.insert(key.to_string(), value.to_string());
+            let value = self.data.get(key).cloned().unwrap_or_else(|| b"0".to_vec());
+            let value = std::str::from_utf8(&value).unwrap().parse::<i64>().unwrap() + 1;
+            self.data
+                .insert(key.to_string(), value.to_string().into_bytes());
             Ok(value)
         }
         fn decr(&mut self, key: &str) -> Result<i64> {
-            let value = self
-                .data
-                .get(key)
-                .cloned()
-                .unwrap_or_else(|| "0".to_string())
-                .parse::<i64>()
-                .unwrap()
-                - 1;
-            self.data.insert(key.to_string(), value.to_string());
+            let value = self.data.get(key).cloned().unwrap_or_else(|| b"0".to_vec());
+            let value = std::str::from_utf8(&value).unwrap().parse::<i64>().unwrap() - 1;
+            self.data
+                .insert(key.to_string(), value.to_string().into_bytes());
             Ok(value)
         }
         fn expire(&mut self, key: &str, _seconds: u64) -> Result<bool> {
@@ -3522,7 +3517,7 @@ mod tests {
                 keys: keys[start..end].to_vec(),
             })
         }
-        fn list(&mut self) -> Result<Vec<(String, String)>> {
+        fn list(&mut self) -> Result<Vec<(String, Vec<u8>)>> {
             Ok(self
                 .data
                 .iter()
@@ -3540,7 +3535,7 @@ mod tests {
                     .iter()
                     .map(|(key, value)| serde_json::json!({
                         "key": key,
-                        "value": value,
+                        "value": String::from_utf8_lossy(value),
                         "expires_at_ms": null,
                     }))
                     .collect::<Vec<_>>(),
@@ -3557,7 +3552,7 @@ mod tests {
                         entry.get("key").and_then(|key| key.as_str()),
                         entry.get("value").and_then(|value| value.as_str()),
                     ) {
-                        self.data.insert(key.to_string(), value.to_string());
+                        self.data.insert(key.to_string(), value.as_bytes().to_vec());
                     }
                 }
             }
@@ -3587,7 +3582,7 @@ mod tests {
     #[test]
     fn routes_value_and_ok_commands() {
         let mut engine = FakeEngine::default();
-        engine.set("name".to_string(), "alice".to_string()).unwrap();
+        engine.set("name".to_string(), b"alice".to_vec()).unwrap();
         let get = execute_command(
             &mut engine,
             id(41),
@@ -3604,7 +3599,7 @@ mod tests {
             id(42),
             Command::Set {
                 key: "city".to_string(),
-                value: "paris".to_string(),
+                value: b"paris".to_vec(),
                 options: CommandSetOptions::default(),
             },
         )
@@ -3617,8 +3612,8 @@ mod tests {
         let mut engine = FakeEngine::default();
         engine
             .mset(&[
-                ("user:1".into(), "alice".into()),
-                ("other".into(), "x".into()),
+                ("user:1".into(), b"alice".to_vec()),
+                ("other".into(), b"x".to_vec()),
             ])
             .unwrap();
         let set = execute_command(
@@ -3626,9 +3621,10 @@ mod tests {
             id(1),
             Command::Set {
                 key: "user:1".to_string(),
-                value: "bob".to_string(),
+                value: b"bob".to_vec(),
                 options: CommandSetOptions {
                     condition: Some(CommandSetCondition::Xx),
+                    if_version: None,
                     expiration: Some(CommandExpiration::Ex(60)),
                     keep_ttl: false,
                     return_previous: true,
@@ -3720,7 +3716,7 @@ mod tests {
                 id(3),
                 Command::Set {
                     key: "key".to_string(),
-                    value: "value".to_string(),
+                    value: b"value".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -3763,7 +3759,7 @@ mod tests {
                 id(2),
                 Command::Set {
                     key: "hello".to_string(),
-                    value: "world".to_string(),
+                    value: b"world".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -3784,6 +3780,123 @@ mod tests {
         assert_eq!(response.decode_value().unwrap(), "world");
         assert_eq!(metrics.read_fast_path_hits.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.read_fast_path_fallbacks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unauthenticated_reads_do_not_reach_fast_path() {
+        let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
+        let mut session = SessionState::new(&guards());
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("read-fast-path-auth")).unwrap(),
+            engine::EngineOptions {
+                keyring: Some(test_keyring("read-fast-path-auth-key")),
+                ..engine::EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        let err = runtime_handle
+            .block_on(run_command(
+                handle,
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(4),
+                Command::Get {
+                    key: "hello".to_string(),
+                },
+            ))
+            .unwrap_err();
+
+        assert!(matches!(err, crate::ServerError::AuthenticationRequired));
+        assert_eq!(metrics.read_fast_path_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.read_fast_path_fallbacks.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn follower_reads_fall_back_to_engine_path() {
+        let metrics = Arc::new(Metrics::default());
+        let mut runtime = runtime();
+        let mut session = SessionState::new(&guards());
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        runtime_handle
+            .block_on(authenticate(
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(5),
+                "dbuser",
+                "secret",
+            ))
+            .unwrap();
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("read-fast-path-follower")).unwrap(),
+            engine::EngineOptions {
+                keyring: Some(test_keyring("read-fast-path-follower-key")),
+                ..engine::EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        runtime_handle
+            .block_on(run_command(
+                handle.clone(),
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(6),
+                Command::Set {
+                    key: "hello".to_string(),
+                    value: b"world".to_vec(),
+                    options: CommandSetOptions::default(),
+                },
+            ))
+            .unwrap();
+        let follower_state_root = temp_dir("follower-state");
+        runtime.replication = Arc::new(
+            ReplicationRuntime::new(ReplicationConfig {
+                node_id: "follower-node".to_string(),
+                group_id: "test-group".to_string(),
+                advertise_addr: Some("127.0.0.1:9173".to_string()),
+                role: ReplicationRole::Follower,
+                upstream: Some("127.0.0.1:9174".to_string()),
+                upstream_username: None,
+                upstream_password: None,
+                write_ack_mode: WriteAckMode::Replica,
+                ack_timeout: Duration::from_millis(100),
+                poll_interval: Duration::from_millis(100),
+                fetch_batch_size: 32,
+                stale_after: Duration::from_secs(5),
+                heartbeat_interval: Duration::from_millis(100),
+                election_timeout_min: Duration::from_millis(250),
+                election_timeout_max: Duration::from_millis(500),
+                state_path: follower_state_root.join("cluster-state.json"),
+                state_tmp_path: follower_state_root.join("cluster-state.json.tmp"),
+                initial_members: Vec::new(),
+            })
+            .unwrap(),
+        );
+
+        let response = runtime_handle
+            .block_on(run_command(
+                handle,
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                id(7),
+                Command::Get {
+                    key: "hello".to_string(),
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(response.decode_value().unwrap(), "world");
+        assert_eq!(metrics.read_fast_path_hits.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.read_fast_path_fallbacks.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -3851,7 +3964,7 @@ mod tests {
         session.transaction_queue.push(Command::Multi);
         session.transaction_queue.push(Command::Set {
             key: "candidate:key".to_string(),
-            value: "candidate:value".to_string(),
+            value: b"candidate:value".to_vec(),
             options: CommandSetOptions::default(),
         });
 
@@ -4050,7 +4163,7 @@ mod tests {
                 id(27),
                 Command::Set {
                     key: "key".to_string(),
-                    value: "value".to_string(),
+                    value: b"value".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -4150,7 +4263,7 @@ mod tests {
                 id(36),
                 Command::Set {
                     key: "app:1".to_string(),
-                    value: "ok".to_string(),
+                    value: b"ok".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -4166,7 +4279,7 @@ mod tests {
                 id(37),
                 Command::Set {
                     key: "other:1".to_string(),
-                    value: "denied".to_string(),
+                    value: b"denied".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -4182,8 +4295,8 @@ mod tests {
                 id(38),
                 Command::MSet {
                     entries: vec![
-                        ("app:2".to_string(), "ok".to_string()),
-                        ("other:2".to_string(), "denied".to_string()),
+                        ("app:2".to_string(), b"ok".to_vec()),
+                        ("other:2".to_string(), b"denied".to_vec()),
                     ],
                 },
             ))
@@ -4223,7 +4336,7 @@ mod tests {
     fn routes_logical_backup_and_restore_commands() {
         let mut engine = FakeEngine::default();
         engine
-            .set("app:mode".to_string(), "production".to_string())
+            .set("app:mode".to_string(), b"production".to_vec())
             .unwrap();
 
         let dump = execute_command(&mut engine, id(10), Command::Backup)
@@ -4232,15 +4345,15 @@ mod tests {
             .unwrap();
         assert!(dump.contains("app:mode"));
 
-        engine.set("old".to_string(), "value".to_string()).unwrap();
+        engine.set("old".to_string(), b"value".to_vec()).unwrap();
         let restored = execute_command(&mut engine, id(11), Command::Restore { dump })
             .unwrap()
             .decode_count()
             .unwrap();
         assert_eq!(restored, 1);
         assert_eq!(
-            engine.get("app:mode").unwrap(),
-            Some("production".to_string())
+            engine.get("app:mode").unwrap().as_deref(),
+            Some(b"production".as_slice())
         );
         assert_eq!(engine.get("old").unwrap(), None);
     }
@@ -4282,7 +4395,7 @@ mod tests {
                 id(51),
                 Command::Set {
                     key: "app:mode".to_string(),
-                    value: "production".to_string(),
+                    value: b"production".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -4381,7 +4494,7 @@ mod tests {
                 id(54),
                 Command::Set {
                     key: "other".to_string(),
-                    value: "temporary".to_string(),
+                    value: b"temporary".to_vec(),
                     options: CommandSetOptions::default(),
                 },
             ))
@@ -4644,7 +4757,7 @@ mod tests {
             validate_command(
                 &Command::Set {
                     key: "key".to_string(),
-                    value: "oversized".to_string(),
+                    value: b"oversized".to_vec(),
                     options: CommandSetOptions::default()
                 },
                 &limited

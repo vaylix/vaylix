@@ -8,7 +8,8 @@ use crate::opcode::Opcode;
 mod primitives;
 
 use primitives::{
-    ensure_empty, put_string_u16, put_string_u32, read_bool, read_string_u16, read_string_u32,
+    ensure_empty, put_bytes_u32, put_string_u16, put_string_u32, read_bool, read_bytes_u32,
+    read_string_u16, read_string_u32,
 };
 
 pub const REQUEST_META_DEADLINE_MS: u8 = 0x01;
@@ -85,12 +86,14 @@ impl Request {
             Command::SetNx { key, value } => Ok(Self::new(
                 request_id,
                 Opcode::SetNx,
-                encode_key_value(&key, &value)?,
+                encode_key_bytes(&key, &value)?,
             )),
             Command::MGet { keys } => Ok(Self::new(request_id, Opcode::MGet, encode_keys(&keys)?)),
-            Command::MSet { entries } => {
-                Ok(Self::new(request_id, Opcode::MSet, encode_pairs(&entries)?))
-            }
+            Command::MSet { entries } => Ok(Self::new(
+                request_id,
+                Opcode::MSet,
+                encode_byte_pairs(&entries)?,
+            )),
             Command::Delete { keys } => {
                 Ok(Self::new(request_id, Opcode::Delete, encode_keys(&keys)?))
             }
@@ -309,7 +312,7 @@ impl Request {
                 })
             }
             Opcode::SetNx => {
-                let (key, value) = decode_key_value(&self.payload)?;
+                let (key, value) = decode_key_bytes(&self.payload)?;
                 Ok(Command::SetNx { key, value })
             }
             Opcode::MGet => Ok(Command::MGet {
@@ -506,20 +509,28 @@ fn decode_dump(payload: &[u8]) -> Result<String> {
     Ok(dump)
 }
 
-fn encode_set(key: &str, value: &str, options: &SetOptions) -> Result<Vec<u8>> {
+fn encode_set(key: &str, value: &[u8], options: &SetOptions) -> Result<Vec<u8>> {
     let mut buf = BytesMut::with_capacity(
         string_u16_len(key)
-            + string_u32_len(value)
+            + bytes_u32_len(value)
             + 1
             + expiration_encoded_len(options.expiration)
-            + 2,
+            + 3
+            + options.if_version.map_or(0, |_| 8),
     );
     put_string_u16(&mut buf, key)?;
-    put_string_u32(&mut buf, value)?;
+    put_bytes_u32(&mut buf, value)?;
     buf.put_u8(encode_condition(options.condition));
     encode_expiration(&mut buf, options.expiration)?;
     buf.put_u8(u8::from(options.keep_ttl));
     buf.put_u8(u8::from(options.return_previous));
+    match options.if_version {
+        Some(version) => {
+            buf.put_u8(1);
+            buf.put_u64(version);
+        }
+        None => buf.put_u8(0),
+    }
     Ok(buf.to_vec())
 }
 
@@ -536,6 +547,13 @@ fn encode_key_value(key: &str, value: &str) -> Result<Vec<u8>> {
     let mut buf = BytesMut::with_capacity(string_u16_len(key) + string_u32_len(value));
     put_string_u16(&mut buf, key)?;
     put_string_u32(&mut buf, value)?;
+    Ok(buf.to_vec())
+}
+
+fn encode_key_bytes(key: &str, value: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = BytesMut::with_capacity(string_u16_len(key) + bytes_u32_len(value));
+    put_string_u16(&mut buf, key)?;
+    put_bytes_u32(&mut buf, value)?;
     Ok(buf.to_vec())
 }
 
@@ -568,14 +586,14 @@ fn encode_keys(keys: &[String]) -> Result<Vec<u8>> {
     Ok(buf.to_vec())
 }
 
-fn encode_pairs(entries: &[(String, String)]) -> Result<Vec<u8>> {
+fn encode_byte_pairs(entries: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
     let pair_count = u16::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
-    let mut buf = BytesMut::with_capacity(pairs_payload_len(entries));
+    let mut buf = BytesMut::with_capacity(byte_pairs_payload_len(entries));
     buf.put_u16(pair_count);
 
     for (key, value) in entries {
         put_string_u16(&mut buf, key)?;
-        put_string_u32(&mut buf, value)?;
+        put_bytes_u32(&mut buf, value)?;
     }
 
     Ok(buf.to_vec())
@@ -645,6 +663,10 @@ fn string_u32_len(value: &str) -> usize {
     4 + value.len()
 }
 
+fn bytes_u32_len(value: &[u8]) -> usize {
+    4 + value.len()
+}
+
 fn expiration_encoded_len(expiration: Option<Expiration>) -> usize {
     match expiration {
         None => 1,
@@ -656,10 +678,10 @@ fn keys_payload_len(keys: &[String]) -> usize {
     2 + keys.iter().map(|key| string_u16_len(key)).sum::<usize>()
 }
 
-fn pairs_payload_len(entries: &[(String, String)]) -> usize {
+fn byte_pairs_payload_len(entries: &[(String, Vec<u8>)]) -> usize {
     2 + entries
         .iter()
-        .map(|(key, value)| string_u16_len(key) + string_u32_len(value))
+        .map(|(key, value)| string_u16_len(key) + bytes_u32_len(value))
         .sum::<usize>()
 }
 
@@ -670,14 +692,28 @@ fn decode_single_key(payload: &[u8]) -> Result<String> {
     Ok(key)
 }
 
-fn decode_set(payload: &[u8]) -> Result<(String, String, SetOptions)> {
+fn decode_set(payload: &[u8]) -> Result<(String, Vec<u8>, SetOptions)> {
     let mut buf = payload;
     let key = read_string_u16(&mut buf)?;
-    let value = read_string_u32(&mut buf)?;
+    let value = read_bytes_u32(&mut buf)?;
     let condition = decode_condition(&mut buf)?;
     let expiration = decode_expiration(&mut buf)?;
     let keep_ttl = read_bool(&mut buf)?;
     let return_previous = read_bool(&mut buf)?;
+    let if_version = if buf.is_empty() {
+        None
+    } else {
+        match buf.get_u8() {
+            0 => None,
+            1 => {
+                if buf.remaining() < 8 {
+                    return Err(TransportError::UnexpectedEof);
+                }
+                Some(buf.get_u64())
+            }
+            _ => return Err(TransportError::CorruptedPayload),
+        }
+    };
     ensure_empty(buf)?;
 
     Ok((
@@ -685,6 +721,7 @@ fn decode_set(payload: &[u8]) -> Result<(String, String, SetOptions)> {
         value,
         SetOptions {
             condition,
+            if_version,
             expiration,
             keep_ttl,
             return_previous,
@@ -705,6 +742,14 @@ fn decode_key_value(payload: &[u8]) -> Result<(String, String)> {
     let mut buf = payload;
     let key = read_string_u16(&mut buf)?;
     let value = read_string_u32(&mut buf)?;
+    ensure_empty(buf)?;
+    Ok((key, value))
+}
+
+fn decode_key_bytes(payload: &[u8]) -> Result<(String, Vec<u8>)> {
+    let mut buf = payload;
+    let key = read_string_u16(&mut buf)?;
+    let value = read_bytes_u32(&mut buf)?;
     ensure_empty(buf)?;
     Ok((key, value))
 }
@@ -746,7 +791,7 @@ fn decode_keys(payload: &[u8]) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-fn decode_pairs(payload: &[u8]) -> Result<Vec<(String, String)>> {
+fn decode_pairs(payload: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     let mut buf = payload;
     if buf.remaining() < 2 {
         return Err(TransportError::UnexpectedEof);
@@ -756,7 +801,7 @@ fn decode_pairs(payload: &[u8]) -> Result<Vec<(String, String)>> {
     let mut entries = Vec::with_capacity(pair_count);
 
     for _ in 0..pair_count {
-        entries.push((read_string_u16(&mut buf)?, read_string_u32(&mut buf)?));
+        entries.push((read_string_u16(&mut buf)?, read_bytes_u32(&mut buf)?));
     }
 
     ensure_empty(buf)?;
@@ -884,9 +929,10 @@ mod tests {
             },
             Command::Set {
                 key: "name".to_string(),
-                value: "John Doe".to_string(),
+                value: b"John Doe".to_vec(),
                 options: SetOptions {
                     condition: Some(SetCondition::Nx),
+                    if_version: None,
                     expiration: Some(Expiration::Ex(60)),
                     keep_ttl: false,
                     return_previous: true,
@@ -894,13 +940,13 @@ mod tests {
             },
             Command::SetNx {
                 key: "name".to_string(),
-                value: "John Doe".to_string(),
+                value: b"John Doe".to_vec(),
             },
             Command::MGet {
                 keys: vec!["one".to_string(), "two".to_string()],
             },
             Command::MSet {
-                entries: vec![("one".to_string(), "1".to_string())],
+                entries: vec![("one".to_string(), b"1".to_vec())],
             },
             Command::Delete {
                 keys: vec!["one".to_string(), "two".to_string()],

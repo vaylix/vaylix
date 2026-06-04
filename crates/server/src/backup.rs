@@ -1,6 +1,5 @@
 use std::path::{Component, Path, PathBuf};
 
-use engine::LogicalBackup;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -21,6 +20,15 @@ pub(crate) struct BackupManifest {
     pub(crate) byte_len: u64,
     pub(crate) hash_algorithm: String,
     pub(crate) sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BackupDocumentHeader {
+    version: u32,
+    created_at_ms: u64,
+    source_engine_version: u32,
+    source_sequence: u64,
+    entries: Vec<serde_json::Value>,
 }
 
 /// Resolves a requested backup path under the configured backup directory.
@@ -81,7 +89,7 @@ pub(crate) fn load_backup_manifest(path: &Path) -> Result<BackupManifest> {
 }
 
 pub(crate) fn build_backup_manifest(dump: &str) -> Result<BackupManifest> {
-    let backup = parse_backup_document(dump)?;
+    let backup = parse_backup_document_header(dump)?;
     Ok(BackupManifest {
         manifest_version: BACKUP_MANIFEST_VERSION,
         backup_version: backup.version,
@@ -124,10 +132,10 @@ pub(crate) fn verify_backup_manifest(dump: &str, manifest: &BackupManifest) -> R
     Ok(())
 }
 
-fn parse_backup_document(dump: &str) -> Result<LogicalBackup> {
-    let backup: LogicalBackup = serde_json::from_str(dump)
+fn parse_backup_document_header(dump: &str) -> Result<BackupDocumentHeader> {
+    let backup: BackupDocumentHeader = serde_json::from_str(dump)
         .map_err(|err| ServerError::BackupVerification(err.to_string()))?;
-    if backup.version != 1 {
+    if !matches!(backup.version, 1 | 2) {
         return Err(ServerError::BackupVerification(format!(
             "unsupported backup version {}",
             backup.version
@@ -163,15 +171,16 @@ mod tests {
 
     fn backup_dump() -> String {
         serde_json::json!({
-            "version": 1,
+            "version": 2,
             "created_at_ms": 10,
             "source_engine_version": 1,
             "source_sequence": 2,
             "entries": [
                 {
                     "key": "alpha",
-                    "value": "one",
-                    "expires_at_ms": null
+                    "value_base64": "b25l",
+                    "expires_at_ms": null,
+                    "version": 1
                 }
             ]
         })

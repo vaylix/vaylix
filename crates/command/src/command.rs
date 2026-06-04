@@ -28,6 +28,8 @@ pub enum Expiration {
 pub struct SetOptions {
     /// Conditional write requirement.
     pub condition: Option<SetCondition>,
+    /// Required current value version for compare-and-set writes.
+    pub if_version: Option<u64>,
     /// TTL to attach to the value.
     pub expiration: Option<Expiration>,
     /// Preserve the current TTL on overwrite.
@@ -51,7 +53,7 @@ pub const COMMANDS: &[CommandInfo] = &[
     },
     CommandInfo {
         name: "set",
-        usage: "set <key> <value> [nx|xx] [ex <seconds>|px <millis>] [keepttl] [get]",
+        usage: "set <key> <value> [nx|xx] [if version <version>] [ex <seconds>|px <millis>] [keepttl] [get]",
     },
     CommandInfo {
         name: "setnx",
@@ -360,12 +362,12 @@ pub enum Command {
     },
     Set {
         key: String,
-        value: String,
+        value: Vec<u8>,
         options: SetOptions,
     },
     SetNx {
         key: String,
-        value: String,
+        value: Vec<u8>,
     },
     GetDel {
         key: String,
@@ -379,7 +381,7 @@ pub enum Command {
         keys: Vec<String>,
     },
     MSet {
-        entries: Vec<(String, String)>,
+        entries: Vec<(String, Vec<u8>)>,
     },
     Delete {
         keys: Vec<String>,

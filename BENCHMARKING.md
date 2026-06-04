@@ -51,6 +51,8 @@ The current Criterion suite covers:
   payloads for data, admin, backup, HA, and replication traffic
 - transport response encode/decode round-trips for representative payload shapes with and
   without zstd compression
+- transport frame parse latency, request encode latency, and in-memory pipelined request
+  throughput for hot request shapes
 
 Not every command belongs in the engine layer. `AUTH`, RBAC/admin, maintenance, cluster, and
 replication control paths are benchmarked at the transport/load-generator layers because the
@@ -120,7 +122,7 @@ The load generator prints a JSON report with:
 - benchmark parameters used for the run
 - up to eight distinct error samples when operations fail
 
-For `0.7.0` and later, read-heavy profiles should be run against leader or standalone nodes when
+For `0.8.0` and later, read-heavy profiles should be run against leader or standalone nodes when
 measuring the committed read fast path and sharded in-memory store. Followers intentionally keep
 stale/local read behavior and are not the baseline for leader read latency.
 
@@ -180,7 +182,7 @@ cargo run -p bench -- quorum-write-cost \
 ```
 
 Run this against the current leader of a quorum cluster. It measures acknowledged `SET`
-latency under the server's configured write acknowledgement mode. On `0.7.0` and later, this
+latency under the server's configured write acknowledgement mode. On `0.8.0` and later, this
 profile exercises the HA write coordinator path that batches concurrent leader writes into one
 local WAL batch and one replicated frontier.
 

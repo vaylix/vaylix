@@ -32,11 +32,11 @@ pub(super) fn render_response(
             | Command::GetDel { .. }
             | Command::GetEx { .. }
             | Command::Backup
-            | Command::MetricsProm => Ok(response.decode_value()?),
+            | Command::MetricsProm => Ok(render_value_bytes(response.decode_value_bytes()?)),
             Command::Set { options, .. } => {
                 if options.return_previous {
-                    Ok(response.decode_value()?)
-                } else if options.condition.is_some() {
+                    Ok(render_value_bytes(response.decode_value_bytes()?))
+                } else if options.condition.is_some() || options.if_version.is_some() {
                     Ok(response.decode_bool()?.to_string())
                 } else {
                     Ok("OK".to_string())
@@ -73,9 +73,13 @@ pub(super) fn render_response(
             | Command::Rename { .. }
             | Command::RenameNx { .. } => Ok(response.decode_bool()?.to_string()),
             Command::MGet { .. } => Ok(response
-                .decode_strings()?
+                .decode_byte_strings()?
                 .into_iter()
-                .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
+                .map(|value| {
+                    value
+                        .map(render_value_bytes)
+                        .unwrap_or_else(|| "(nil)".to_string())
+                })
                 .collect::<Vec<_>>()
                 .join(", ")),
             Command::Delete { .. }
@@ -130,18 +134,22 @@ fn render_exec_result(result: transport::ExecResultPayload) -> String {
     match result {
         transport::ExecResultPayload::Ok => "OK".to_string(),
         transport::ExecResultPayload::NotFound => "NOT_FOUND".to_string(),
-        transport::ExecResultPayload::Value(value) => value,
+        transport::ExecResultPayload::Value(value) => render_value_bytes(value),
         transport::ExecResultPayload::Boolean(value) => value.to_string(),
         transport::ExecResultPayload::Count(value) => value.to_string(),
         transport::ExecResultPayload::Integer(value) => value.to_string(),
         transport::ExecResultPayload::Entries(entries) => entries
             .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
+            .map(|(key, value)| format!("{key}={}", render_value_bytes(value)))
             .collect::<Vec<_>>()
             .join(", "),
         transport::ExecResultPayload::Strings(values) => values
             .into_iter()
-            .map(|value| value.unwrap_or_else(|| "(nil)".to_string()))
+            .map(|value| {
+                value
+                    .map(render_value_bytes)
+                    .unwrap_or_else(|| "(nil)".to_string())
+            })
             .collect::<Vec<_>>()
             .join(", "),
         transport::ExecResultPayload::Scan(scan) => {
@@ -150,6 +158,22 @@ fn render_exec_result(result: transport::ExecResultPayload) -> String {
                 scan.next_cursor,
                 scan.keys.join(", ")
             )
+        }
+    }
+}
+
+fn render_value_bytes(value: Vec<u8>) -> String {
+    match String::from_utf8(value) {
+        Ok(value) => value,
+        Err(err) => {
+            let bytes = err.into_bytes();
+            let mut rendered = String::with_capacity(2 + bytes.len() * 2);
+            rendered.push_str("0x");
+            for byte in bytes {
+                use std::fmt::Write as _;
+                let _ = write!(&mut rendered, "{byte:02x}");
+            }
+            rendered
         }
     }
 }

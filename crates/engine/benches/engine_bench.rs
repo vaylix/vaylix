@@ -9,18 +9,25 @@ fn temp_paths(label: &str) -> Paths {
         .expect("system time before unix epoch")
         .as_nanos();
     let root = std::env::temp_dir().join(format!("vaylix-bench-{label}-{unique}"));
-    Paths::from_data_dir(root).expect("create benchmark data dir")
+    Paths::from_data_dir(root).expect("create benchmark data dsir")
 }
 
 fn fresh_engine(label: &str) -> Engine {
     Engine::from_paths(temp_paths(label)).expect("create engine")
 }
 
+fn bytes(value: &str) -> Vec<u8> {
+    value.as_bytes().to_vec()
+}
+
 fn seeded_engine(label: &str, entries: usize) -> Engine {
     let mut engine = fresh_engine(label);
     for idx in 0..entries {
         engine
-            .set(format!("key-{idx:04}"), format!("value-{idx:04}"))
+            .set(
+                format!("key-{idx:04}"),
+                format!("value-{idx:04}").into_bytes(),
+            )
             .expect("seed key");
     }
     engine
@@ -28,7 +35,7 @@ fn seeded_engine(label: &str, entries: usize) -> Engine {
 
 fn seed_numeric(engine: &mut Engine, key: &str, value: &str) {
     engine
-        .set(key.to_string(), value.to_string())
+        .set(key.to_string(), bytes(value))
         .expect("seed numeric value");
 }
 
@@ -40,13 +47,13 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("get");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("set value");
                 engine
             },
             |mut engine| {
                 let value = engine.get("bench-key").expect("get value");
-                assert_eq!(value.as_deref(), Some("bench-value"));
+                assert_eq!(value.as_deref(), Some(b"bench-value".as_slice()));
             },
             BatchSize::SmallInput,
         );
@@ -57,7 +64,7 @@ fn core_command_benches(c: &mut Criterion) {
             || fresh_engine("set"),
             |mut engine| {
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("set value");
             },
             BatchSize::SmallInput,
@@ -69,7 +76,7 @@ fn core_command_benches(c: &mut Criterion) {
             || fresh_engine("setnx"),
             |mut engine| {
                 let applied = engine
-                    .set_nx("bench-key".to_string(), "bench-value".to_string())
+                    .set_nx("bench-key".to_string(), bytes("bench-value"))
                     .expect("setnx");
                 assert!(applied);
             },
@@ -82,7 +89,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("set-xx");
                 engine
-                    .set("bench-key".to_string(), "original".to_string())
+                    .set("bench-key".to_string(), bytes("original"))
                     .expect("seed");
                 engine
             },
@@ -90,7 +97,7 @@ fn core_command_benches(c: &mut Criterion) {
                 let outcome = engine
                     .set_with_options(
                         "bench-key".to_string(),
-                        "updated".to_string(),
+                        bytes("updated"),
                         SetOptions {
                             condition: Some(SetCondition::Xx),
                             ..SetOptions::default()
@@ -108,7 +115,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("getdel");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -125,7 +132,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("getex");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -158,7 +165,12 @@ fn core_command_benches(c: &mut Criterion) {
             || fresh_engine("mset"),
             |mut engine| {
                 let entries = (0..64usize)
-                    .map(|idx| (format!("key-{idx:04}"), format!("value-{idx:04}")))
+                    .map(|idx| {
+                        (
+                            format!("key-{idx:04}"),
+                            format!("value-{idx:04}").into_bytes(),
+                        )
+                    })
                     .collect::<Vec<_>>();
                 engine.mset(&entries).expect("mset");
             },
@@ -171,7 +183,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("delete");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -201,7 +213,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("exists");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -245,7 +257,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("expire");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -261,7 +273,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("ttl");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine.expire("bench-key", 60).expect("expire");
                 engine
@@ -279,7 +291,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("persist");
                 engine
-                    .set("bench-key".to_string(), "bench-value".to_string())
+                    .set("bench-key".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine.expire("bench-key", 60).expect("expire");
                 engine
@@ -296,7 +308,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("rename");
                 engine
-                    .set("source".to_string(), "bench-value".to_string())
+                    .set("source".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -312,7 +324,7 @@ fn core_command_benches(c: &mut Criterion) {
             || {
                 let mut engine = fresh_engine("renamenx");
                 engine
-                    .set("source".to_string(), "bench-value".to_string())
+                    .set("source".to_string(), bytes("bench-value"))
                     .expect("seed");
                 engine
             },
@@ -460,7 +472,7 @@ fn batch_shape_benches(c: &mut Criterion) {
                     || {
                         let engine = fresh_engine("mset-scan-shape");
                         let entries = (0..count)
-                            .map(|idx| (format!("key-{idx:04}"), "value".repeat(8)))
+                            .map(|idx| (format!("key-{idx:04}"), "value".repeat(8).into_bytes()))
                             .collect::<Vec<_>>();
                         (engine, entries)
                     },

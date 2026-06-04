@@ -6,7 +6,7 @@ Vaylix is a Rust key/value database built around a strict transport boundary:
 client -> transport -> TCP/TLS -> transport -> server -> engine
 ```
 
-The current server stores `String -> String` data with segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, hash-chained audit logging, and Raft-style HA replication with automatic leader election and quorum-backed writes.
+The current server stores UTF-8 keys with opaque byte values using segmented WAL plus encrypted snapshot persistence. It includes a shared framed binary transport, a Tokio multi-client server, authentication with RBAC, optional TLS/mTLS, default-on frame compression, logical backup/restore commands, offline PITR-oriented storage subcommands, maintenance mode, hash-chained audit logging, and Raft-style HA replication with automatic leader election and quorum-backed writes.
 
 Detailed architecture context lives in [LLM.md](LLM.md).
 Benchmark guidance lives in [BENCHMARKING.md](BENCHMARKING.md).
@@ -17,7 +17,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.7.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.8.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -96,9 +96,26 @@ Useful runtime environment variables for containers:
 - `VAYLIX_REPLICATION_ELECTION_TIMEOUT_MAX_MS`
 - `VAYLIX_CLUSTER_PEERS`
 
+## Data Model
+
+Keys are UTF-8 strings. Values are opaque bytes end-to-end across transport, WAL, snapshots,
+logical backups, and replication. The text CLI accepts textual values, but the storage layer does
+not assume UTF-8 and preserves null bytes and non-UTF8 payloads received through binary clients.
+
+Each stored value carries a `u64` version. Successful writes increment the version, and the version
+is persisted in WAL/snapshots and replicated with the value. Version-based compare-and-set is
+available through:
+
+```text
+SET <key> <value> IF VERSION <version>
+```
+
+The command succeeds only when the current stored version matches the expected version. Mismatches
+are deterministic non-mutating conditional-write failures.
+
 ## High Availability
 
-Vaylix 0.7.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
+Vaylix 0.8.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
 
 Recommended production shape:
 
@@ -129,9 +146,9 @@ Operational commands:
 - `show replication` returns replication progress, follower lag, and commit position.
 - `cluster join <node-id> <host:port>` and `cluster remove <node-id>` update membership from the leader.
 
-Followers may serve local stale reads; clients that require linearizable read-after-write behavior should route reads to the current leader reported by `show cluster` / `show replication`.
+Followers may serve local stale reads; clients that require read-after-write behavior should route reads to the current leader reported by `show cluster` / `show replication`.
 
-The engine uses a sharded in-memory store for live `String -> String` data while preserving deterministic snapshots, backups, and replication payloads. Leader and standalone nodes also maintain a committed read index for `GET`, `MGET`, `EXISTS`, and `TTL`. The index advances only after the configured WAL durability and HA acknowledgement boundary has completed, so fast-path reads do not expose an uncommitted local tail.
+The engine uses a sharded in-memory store for live byte values while preserving deterministic snapshots, backups, and replication payloads. Leader and standalone nodes also maintain a committed read index for `GET`, `MGET`, `EXISTS`, and `TTL`. The index advances only after the configured WAL durability and HA acknowledgement boundary has completed, so fast-path reads do not expose an uncommitted local tail.
 
 Leader writes are coordinated through a single HA write coordinator. Concurrent eligible writes share one ordered local WAL batch and one replicated frontier, but responses are still held until the configured local durability and quorum/all acknowledgement boundary completes.
 
@@ -215,7 +232,7 @@ cargo audit
 - Authentication and RBAC are enabled by default. `--disable-auth` is for trusted local testing only.
 - Development credentials default to `vaylix / vaylix`; production deployments should override them.
 - When a persisted auth store already exists, non-default `--user` / `--password` or `VAYLIX_USER` / `VAYLIX_PASSWORD` values are reconciled into the env-managed bootstrap admin on startup. Changing those startup credentials rotates that admin and retires the previous env-managed admin.
-- Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`.
+- Compression is enabled by default and can be disabled for diagnostics with `--disable-compression`. Small frames stay uncompressed by threshold, and large zstd compression/decompression is offloaded from async network tasks.
 - Request-level server logging is disabled by default on the hot path. Enable `--log-requests` / `VAYLIX_LOG_REQUESTS=true` only when request tracing is needed.
 - Security/operator audit events remain enabled by default. Generic per-command audit lines are opt-in through `--audit-commands` / `VAYLIX_AUDIT_COMMANDS=true` because full command auditing is intentionally expensive on read-heavy in-memory workloads.
 - TLS is opt-in with `--ssl`; production deployments should provide TLS certificates.

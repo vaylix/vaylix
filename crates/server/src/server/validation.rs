@@ -39,6 +39,13 @@ fn validate_value(value: &str, guards: &ServerGuards) -> Result<()> {
     Ok(())
 }
 
+fn validate_value_bytes(value: &[u8], guards: &ServerGuards) -> Result<()> {
+    if value.len() > guards.max_value_bytes {
+        return Err(ServerError::QuotaExceeded);
+    }
+    Ok(())
+}
+
 pub(super) fn validate_command(command: &Command, guards: &ServerGuards) -> Result<()> {
     match command {
         Command::Auth { username, password } => {
@@ -55,7 +62,7 @@ pub(super) fn validate_command(command: &Command, guards: &ServerGuards) -> Resu
         Command::GetEx { key, .. } => validate_key(key, guards)?,
         Command::Set { key, value, .. } | Command::SetNx { key, value } => {
             validate_key(key, guards)?;
-            validate_value(value, guards)?;
+            validate_value_bytes(value, guards)?;
         }
         Command::MGet { keys } | Command::Delete { keys } => {
             if keys.len() > guards.max_keys_per_batch {
@@ -71,7 +78,7 @@ pub(super) fn validate_command(command: &Command, guards: &ServerGuards) -> Resu
             }
             for (key, value) in entries {
                 validate_key(key, guards)?;
-                validate_value(value, guards)?;
+                validate_value_bytes(value, guards)?;
             }
         }
         Command::Expire { key, .. } => validate_key(key, guards)?,
