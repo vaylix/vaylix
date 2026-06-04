@@ -23,8 +23,9 @@ pub struct LogicalBackup {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogicalBackupEntry {
     pub key: String,
-    pub value: String,
+    pub value_base64: String,
     pub expires_at_ms: Option<u64>,
+    pub version: u64,
 }
 
 /// Result of evaluating one command inside an atomic transaction.
@@ -32,12 +33,12 @@ pub struct LogicalBackupEntry {
 pub enum TransactionResult {
     Ok,
     NotFound,
-    Value(String),
+    Value(Vec<u8>),
     Boolean(bool),
     Count(u64),
     Integer(i64),
-    Entries(Vec<(String, String)>),
-    Strings(Vec<Option<String>>),
+    Entries(Vec<(String, Vec<u8>)>),
+    Strings(Vec<Option<Vec<u8>>>),
     Scan(ScanPage),
 }
 
@@ -68,6 +69,8 @@ pub struct SetOptions {
     pub expiration: Option<Expiration>,
     /// Preserve the current TTL when overwriting.
     pub keep_ttl: bool,
+    /// Required current version for compare-and-set writes.
+    pub if_version: Option<u64>,
 }
 
 /// Outcome of a `SET`-family write.
@@ -76,16 +79,18 @@ pub struct SetOutcome {
     /// Whether the write was applied.
     pub applied: bool,
     /// The previous value stored at the key, if any.
-    pub previous: Option<String>,
+    pub previous: Option<Vec<u8>>,
+    /// Version assigned when the write was applied.
+    pub version: Option<u64>,
 }
 
 /// Synchronous storage operations supported by the engine layer.
 pub trait StorageEngine {
     /// Returns the value for a key when it exists and has not expired.
-    fn get(&mut self, key: &str) -> Result<Option<String>>;
+    fn get(&mut self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Inserts or replaces the value associated with a key.
-    fn set(&mut self, key: String, value: String) -> Result<()> {
+    fn set(&mut self, key: String, value: Vec<u8>) -> Result<()> {
         self.set_with_options(key, value, SetOptions::default())
             .map(|_| ())
     }
@@ -94,12 +99,12 @@ pub trait StorageEngine {
     fn set_with_options(
         &mut self,
         key: String,
-        value: String,
+        value: Vec<u8>,
         options: SetOptions,
     ) -> Result<SetOutcome>;
 
     /// Inserts a value only when the key does not already exist.
-    fn set_nx(&mut self, key: String, value: String) -> Result<bool> {
+    fn set_nx(&mut self, key: String, value: Vec<u8>) -> Result<bool> {
         self.set_with_options(
             key,
             value,
@@ -107,13 +112,14 @@ pub trait StorageEngine {
                 condition: Some(SetCondition::Nx),
                 expiration: None,
                 keep_ttl: false,
+                if_version: None,
             },
         )
         .map(|outcome| outcome.applied)
     }
 
     /// Returns the value for a key and then deletes it.
-    fn get_del(&mut self, key: &str) -> Result<Option<String>>;
+    fn get_del(&mut self, key: &str) -> Result<Option<Vec<u8>>>;
 
     /// Returns the value for a key and optionally updates its expiration.
     fn get_ex(
@@ -121,13 +127,13 @@ pub trait StorageEngine {
         key: &str,
         expiration: Option<Expiration>,
         persist: bool,
-    ) -> Result<Option<String>>;
+    ) -> Result<Option<Vec<u8>>>;
 
     /// Returns the values for a set of keys in order.
-    fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<String>>>;
+    fn mget(&mut self, keys: &[String]) -> Result<Vec<Option<Vec<u8>>>>;
 
     /// Inserts or replaces a batch of values atomically.
-    fn mset(&mut self, entries: &[(String, String)]) -> Result<()>;
+    fn mset(&mut self, entries: &[(String, Vec<u8>)]) -> Result<()>;
 
     /// Deletes a single key and returns whether it was removed.
     fn delete(&mut self, key: &str) -> Result<bool>;
@@ -175,7 +181,7 @@ pub trait StorageEngine {
     fn scan(&mut self, cursor: u64, pattern: Option<&str>, count: Option<u16>) -> Result<ScanPage>;
 
     /// Returns all live key/value pairs currently stored.
-    fn list(&mut self) -> Result<Vec<(String, String)>>;
+    fn list(&mut self) -> Result<Vec<(String, Vec<u8>)>>;
 
     /// Returns engine metadata useful for operational introspection.
     fn info(&mut self) -> Result<Vec<(String, String)>>;

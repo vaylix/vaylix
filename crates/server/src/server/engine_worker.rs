@@ -672,12 +672,12 @@ fn render_transaction_result(request_id: Uuid, result: TransactionResult) -> Res
     match result {
         TransactionResult::Ok => Ok(Response::ok(request_id)),
         TransactionResult::NotFound => Ok(Response::not_found(request_id)),
-        TransactionResult::Value(value) => Ok(Response::value(request_id, &value)?),
+        TransactionResult::Value(value) => Ok(Response::value_bytes(request_id, &value)?),
         TransactionResult::Boolean(value) => Ok(Response::boolean(request_id, value)),
         TransactionResult::Count(value) => Ok(Response::count(request_id, value)),
         TransactionResult::Integer(value) => Ok(Response::integer(request_id, value)),
-        TransactionResult::Entries(entries) => Ok(Response::entries(request_id, &entries)?),
-        TransactionResult::Strings(values) => Ok(Response::strings(request_id, &values)?),
+        TransactionResult::Entries(entries) => Ok(Response::byte_entries(request_id, &entries)?),
+        TransactionResult::Strings(values) => Ok(Response::byte_strings(request_id, &values)?),
         TransactionResult::Scan(scan) => {
             Ok(Response::scan(request_id, scan.next_cursor, &scan.keys)?)
         }

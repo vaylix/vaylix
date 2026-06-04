@@ -472,7 +472,7 @@ async fn select_writable_addr(cluster: &ManagedCluster) -> Result<String> {
                 Ok(client) => match client
                     .send(Command::Set {
                         key: "__bench-leader-probe__".to_string(),
-                        value: "1".to_string(),
+                        value: b"1".to_vec(),
                         options: Default::default(),
                     })
                     .await
@@ -512,7 +512,7 @@ async fn seed_dataset(client: &BenchmarkClient, seed_keys: usize, value_size: us
         let response = client
             .send(Command::Set {
                 key: format!("seed-{idx:06}"),
-                value: value.clone(),
+                value: value.as_bytes().to_vec(),
                 options: Default::default(),
             })
             .await?;
@@ -759,7 +759,7 @@ async fn run_transaction_flow(
             client,
             Command::Set {
                 key: format!("tx:{worker_id}:{key_index:06}:{operation_index}:{item}"),
-                value: value.to_string(),
+                value: value.as_bytes().to_vec(),
                 options: Default::default(),
             },
         )
@@ -778,7 +778,7 @@ async fn run_backup_restore(
         client,
         Command::Set {
             key: format!("backup:{worker_id}:stable"),
-            value: format!("{value}:{operation_index}"),
+            value: format!("{value}:{operation_index}").into_bytes(),
             options: Default::default(),
         },
     )
@@ -894,7 +894,7 @@ fn next_command(
         WorkloadKind::Get => Command::Get { key },
         WorkloadKind::Set => Command::Set {
             key,
-            value: value.to_string(),
+            value: value.as_bytes().to_vec(),
             options: Default::default(),
         },
         WorkloadKind::Ping => Command::Ping { message: None },
@@ -904,7 +904,7 @@ fn next_command(
             } else {
                 Command::Set {
                     key,
-                    value: value.to_string(),
+                    value: value.as_bytes().to_vec(),
                     options: Default::default(),
                 }
             }

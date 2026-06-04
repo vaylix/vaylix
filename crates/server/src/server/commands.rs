@@ -53,13 +53,13 @@ where
         } => render_set_response(
             request_id,
             options.return_previous,
-            options.condition.is_some(),
+            options.condition.is_some() || options.if_version.is_some(),
             engine.set_with_options(key, value, map_set_options(options))?,
         ),
         Command::SetNx { key, value } => {
             Ok(Response::boolean(request_id, engine.set_nx(key, value)?))
         }
-        Command::MGet { keys } => Ok(Response::strings(request_id, &engine.mget(&keys)?)?),
+        Command::MGet { keys } => Ok(Response::byte_strings(request_id, &engine.mget(&keys)?)?),
         Command::MSet { entries } => {
             engine.mset(&entries)?;
             Ok(Response::ok(request_id))
@@ -103,7 +103,7 @@ where
         }
         Command::Info => Ok(Response::entries(request_id, &engine.info()?)?),
         Command::Metrics | Command::MetricsProm => Err(ServerError::UnsupportedRemoteCommand),
-        Command::List => Ok(Response::entries(request_id, &engine.list()?)?),
+        Command::List => Ok(Response::byte_entries(request_id, &engine.list()?)?),
         Command::Clear => {
             engine.clear()?;
             Ok(Response::ok(request_id))
@@ -222,9 +222,9 @@ pub(super) fn validate_transaction_command(command: &Command) -> Result<()> {
     }
 }
 
-fn value_or_not_found(request_id: Uuid, value: Option<String>) -> Result<Response> {
+fn value_or_not_found(request_id: Uuid, value: Option<Vec<u8>>) -> Result<Response> {
     match value {
-        Some(value) => Ok(Response::value(request_id, &value)?),
+        Some(value) => Ok(Response::value_bytes(request_id, &value)?),
         None => Ok(Response::not_found(request_id)),
     }
 }
@@ -259,5 +259,6 @@ fn map_set_options(options: CommandSetOptions) -> SetOptions {
         }),
         expiration: map_expiration(options.expiration),
         keep_ttl: options.keep_ttl,
+        if_version: options.if_version,
     }
 }

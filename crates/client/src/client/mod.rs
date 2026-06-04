@@ -273,9 +273,10 @@ mod tests {
             render_response(
                 &Command::Set {
                     key: "cache".to_string(),
-                    value: "item".to_string(),
+                    value: b"item".to_vec(),
                     options: SetOptions {
                         condition: Some(SetCondition::Nx),
+                        if_version: None,
                         expiration: Some(Expiration::Px(100)),
                         keep_ttl: false,
                         return_previous: false,
@@ -314,7 +315,7 @@ mod tests {
             render_response(
                 &Command::Set {
                     key: "name".to_string(),
-                    value: "alice".to_string(),
+                    value: b"alice".to_vec(),
                     options: SetOptions::default(),
                 },
                 &Response::ok(id(1)),

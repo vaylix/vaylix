@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current on-disk state schema version.
-pub const ENGINE_VERSION: u32 = 2;
+pub const ENGINE_VERSION: u32 = 3;
 
 /// TTL return value used when a key exists without an expiration.
 pub const TTL_NO_EXPIRY: i64 = -1;
@@ -40,9 +40,22 @@ pub struct EngineState {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedEngineState {
-    data: BTreeMap<String, String>,
-    expirations: BTreeMap<String, u64>,
+    data: BTreeMap<String, StoredValue>,
     metadata: EngineMetadata,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedEngineStateWire {
+    V3 {
+        data: BTreeMap<String, StoredValue>,
+        metadata: EngineMetadata,
+    },
+    V2 {
+        data: BTreeMap<String, String>,
+        expirations: BTreeMap<String, u64>,
+        metadata: EngineMetadata,
+    },
 }
 
 impl Serialize for EngineState {
@@ -50,10 +63,9 @@ impl Serialize for EngineState {
     where
         S: Serializer,
     {
-        let (data, expirations) = self.store.to_parts();
+        let data = self.store.to_entries();
         PersistedEngineState {
             data,
-            expirations,
             metadata: self.metadata.clone(),
         }
         .serialize(serializer)
@@ -65,11 +77,26 @@ impl<'de> Deserialize<'de> for EngineState {
     where
         D: Deserializer<'de>,
     {
-        let persisted = PersistedEngineState::deserialize(deserializer)?;
-        Ok(Self {
-            store: EngineStore::from_parts(persisted.data, persisted.expirations),
-            metadata: persisted.metadata,
-        })
+        let persisted = PersistedEngineStateWire::deserialize(deserializer)?;
+        match persisted {
+            PersistedEngineStateWire::V3 { data, metadata } => Ok(Self {
+                store: EngineStore::from_entries(data),
+                metadata,
+            }),
+            PersistedEngineStateWire::V2 {
+                data,
+                expirations,
+                metadata,
+            } => Ok(Self {
+                store: EngineStore::from_parts(
+                    data.into_iter()
+                        .map(|(key, value)| (key, value.into_bytes()))
+                        .collect(),
+                    expirations,
+                ),
+                metadata,
+            }),
+        }
     }
 }
 
@@ -176,7 +203,7 @@ impl EngineState {
     }
 
     /// Returns the live value for a key after expiration cleanup.
-    pub fn get_live(&mut self, key: &str, now_ms: u64) -> Option<String> {
+    pub fn get_live(&mut self, key: &str, now_ms: u64) -> Option<Vec<u8>> {
         self.purge_expired(now_ms);
         self.store.get_value(key)
     }
@@ -212,12 +239,12 @@ impl EngineState {
     }
 
     /// Returns all live entries in deterministic order.
-    pub fn live_entries(&mut self, now_ms: u64) -> Vec<(String, String)> {
+    pub fn live_entries(&mut self, now_ms: u64) -> Vec<(String, Vec<u8>)> {
         self.store.live_entries_sorted(now_ms)
     }
 
     /// Returns all data and expiration entries in deterministic persisted form.
-    pub fn to_persisted_parts(&self) -> (BTreeMap<String, String>, BTreeMap<String, u64>) {
+    pub fn to_persisted_parts(&self) -> (BTreeMap<String, Vec<u8>>, BTreeMap<String, u64>) {
         self.store.to_parts()
     }
 
@@ -232,7 +259,7 @@ impl EngineState {
     }
 
     /// Returns the stored value without sweeping expirations.
-    pub fn raw_value(&self, key: &str) -> Option<String> {
+    pub fn raw_value(&self, key: &str) -> Option<Vec<u8>> {
         self.store.get_value(key)
     }
 
@@ -252,8 +279,13 @@ impl EngineState {
     }
 
     /// Inserts or replaces a value and removes any expiration.
-    pub fn set_raw_value(&mut self, key: String, value: String) {
+    pub fn set_raw_value(&mut self, key: String, value: Vec<u8>) {
         self.store.insert_value(key, value);
+    }
+
+    /// Inserts or replaces a value with a caller-assigned version.
+    pub fn set_raw_value_with_version(&mut self, key: String, value: Vec<u8>, version: u64) {
+        self.store.insert_value_with_version(key, value, version);
     }
 
     /// Inserts or replaces a complete stored entry.
@@ -294,9 +326,14 @@ impl EngineState {
         rollback: &mut EntryRollback,
     ) -> Result<()> {
         match operation {
-            WalOperation::Set { key, value } => {
+            WalOperation::Set {
+                key,
+                value,
+                version,
+            } => {
                 rollback.remember_key(self, key);
-                self.store.insert_value(key.clone(), value.clone());
+                self.store
+                    .insert_value_with_version(key.clone(), value.clone(), *version);
             }
             WalOperation::Delete { key } => {
                 rollback.remember_key(self, key);
@@ -316,18 +353,36 @@ impl EngineState {
             }
             WalOperation::CheckInteger { key, delta } => {
                 rollback.remember_key(self, key);
-                let current = self.store.get_value(key).unwrap_or_else(|| "0".to_string());
+                let current = self.store.get(key);
+                let current_value = current
+                    .as_ref()
+                    .map(|entry| entry.value.clone())
+                    .unwrap_or_else(|| b"0".to_vec());
+                let current_text = String::from_utf8(current_value.clone()).map_err(|_| {
+                    EngineError::InvalidIntegerValue {
+                        key: key.clone(),
+                        value: String::from_utf8_lossy(&current_value).into_owned(),
+                    }
+                })?;
                 let parsed =
-                    current
+                    current_text
                         .parse::<i64>()
                         .map_err(|_| EngineError::InvalidIntegerValue {
                             key: key.clone(),
-                            value: current.clone(),
+                            value: current_text.clone(),
                         })?;
                 let next = parsed
                     .checked_add(*delta)
                     .ok_or_else(|| EngineError::NumericOverflow { key: key.clone() })?;
-                self.store.insert_value(key.clone(), next.to_string());
+                let version = current
+                    .as_ref()
+                    .map(|entry| entry.version.saturating_add(1))
+                    .unwrap_or(1);
+                self.store.insert_value_with_version(
+                    key.clone(),
+                    next.to_string().into_bytes(),
+                    version,
+                );
             }
         }
 
@@ -380,11 +435,15 @@ mod tests {
                 1,
                 WalOperation::Set {
                     key: "name".to_string(),
-                    value: "alice".to_string(),
+                    value: b"alice".to_vec(),
+                    version: 1,
                 },
             ))
             .unwrap();
-        assert_eq!(state.raw_value("name").as_deref(), Some("alice"));
+        assert_eq!(
+            state.raw_value("name").as_deref(),
+            Some(b"alice".as_slice())
+        );
 
         state
             .apply_entry(&entry(
@@ -406,7 +465,8 @@ mod tests {
                 1,
                 WalOperation::Set {
                     key: "token".to_string(),
-                    value: "abc".to_string(),
+                    value: b"abc".to_vec(),
+                    version: 1,
                 },
             ))
             .unwrap();
@@ -436,7 +496,8 @@ mod tests {
                 1,
                 WalOperation::Set {
                     key: "counter".to_string(),
-                    value: "abc".to_string(),
+                    value: b"abc".to_vec(),
+                    version: 1,
                 },
             ))
             .unwrap();

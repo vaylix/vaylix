@@ -17,7 +17,16 @@ const MAX_WAL_ENTRY_SIZE: u32 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WalOperation {
     /// Insert or replace a key/value pair.
-    Set { key: String, value: String },
+    Set {
+        key: String,
+        #[serde(
+            serialize_with = "crate::value::serialize_bytes",
+            deserialize_with = "crate::value::deserialize_bytes"
+        )]
+        value: Vec<u8>,
+        #[serde(default = "default_value_version")]
+        version: u64,
+    },
     /// Delete a key and any associated expiration.
     Delete { key: String },
     /// Attach an absolute expiration timestamp to a key.
@@ -28,6 +37,10 @@ pub enum WalOperation {
     Clear,
     /// Validate and update a numeric string value atomically.
     CheckInteger { key: String, delta: i64 },
+}
+
+fn default_value_version() -> u64 {
+    1
 }
 
 /// A durable atomic batch of storage mutations.
@@ -861,7 +874,8 @@ mod tests {
             100 + sequence,
             vec![WalOperation::Set {
                 key: format!("name:{sequence}"),
-                value: "alice".to_string(),
+                value: b"alice".to_vec(),
+                version: 1,
             }],
         )
     }
@@ -1036,6 +1050,31 @@ mod tests {
         fs::write(&corrupt_path, [1, 2, 3, 4, 5]).unwrap();
 
         assert!(replay(&wal_dir, None).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_segment_payload_checksum_mismatch() {
+        let root = temp_dir("wal-checksum");
+        let wal_dir = root.join("wal");
+        let keyring = keyring("wal-key");
+
+        append(
+            &sample_entry(1),
+            &wal_dir,
+            WalSyncPolicy::Flush,
+            Some(&keyring),
+            1024,
+        )
+        .unwrap();
+        let active_path = wal_dir.join("active-1.wal");
+        let mut bytes = fs::read(&active_path).unwrap();
+        let last = bytes.last_mut().unwrap();
+        *last ^= 0xff;
+        fs::write(&active_path, bytes).unwrap();
+
+        assert!(replay(&wal_dir, Some(&keyring)).is_err());
 
         fs::remove_dir_all(root).ok();
     }

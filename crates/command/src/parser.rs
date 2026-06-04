@@ -106,13 +106,13 @@ impl Parser {
     fn parse_set(tokens: &[Token]) -> Result<Command> {
         if tokens.len() < 3 {
             return Err(CommandError::InvalidArity {
-                usage: "set <key> <value> [nx|xx] [ex <seconds>|px <millis>] [keepttl] [get]"
+                usage: "set <key> <value> [nx|xx] [if version <version>] [ex <seconds>|px <millis>] [keepttl] [get]"
                     .to_string(),
             });
         }
 
         let key = Self::token_text(&tokens[1]).to_string();
-        let value = Self::token_text(&tokens[2]).to_string();
+        let value = Self::token_text(&tokens[2]).as_bytes().to_vec();
         let mut options = SetOptions::default();
         let mut index = 3;
 
@@ -128,6 +128,32 @@ impl Parser {
                 "xx" => {
                     Self::set_condition("set", &mut options, SetCondition::Xx)?;
                     index += 1;
+                }
+                "if" => {
+                    if !tokens
+                        .get(index + 1)
+                        .map(Self::token_text)
+                        .is_some_and(|token| token.eq_ignore_ascii_case("version"))
+                    {
+                        return Err(CommandError::InvalidOption {
+                            command: "set",
+                            option: Self::token_text(&tokens[index]).to_string(),
+                        });
+                    }
+                    if options.condition.is_some() {
+                        return Err(CommandError::ConflictingOptions {
+                            command: "set",
+                            detail: "IF VERSION cannot be combined with NX or XX",
+                        });
+                    }
+                    let version = Self::parse_following_u64(tokens, index + 1, "version", "set")?;
+                    if options.if_version.replace(version).is_some() {
+                        return Err(CommandError::ConflictingOptions {
+                            command: "set",
+                            detail: "IF VERSION can only be specified once",
+                        });
+                    }
+                    index += 3;
                 }
                 "ex" => {
                     let seconds = Self::parse_following_u64(tokens, index, "seconds", "set")?;
@@ -186,7 +212,7 @@ impl Parser {
 
         Ok(Command::SetNx {
             key: Self::token_text(&tokens[1]).to_string(),
-            value: Self::token_text(&tokens[2]).to_string(),
+            value: Self::token_text(&tokens[2]).as_bytes().to_vec(),
         })
     }
 
@@ -303,7 +329,7 @@ impl Parser {
         while index < tokens.len() {
             entries.push((
                 Self::token_text(&tokens[index]).to_string(),
-                Self::token_text(&tokens[index + 1]).to_string(),
+                Self::token_text(&tokens[index + 1]).as_bytes().to_vec(),
             ));
             index += 2;
         }
@@ -818,7 +844,7 @@ impl Parser {
         let Some(token) = tokens.get(index + 1) else {
             return Err(CommandError::InvalidArity {
                 usage: match usage_command {
-                    "set" => "set <key> <value> [nx|xx] [ex <seconds>|px <millis>] [keepttl] [get]",
+                    "set" => "set <key> <value> [nx|xx] [if version <version>] [ex <seconds>|px <millis>] [keepttl] [get]",
                     "getex" => "getex <key> [ex <seconds>|px <millis>|persist]",
                     _ => usage_command,
                 }
@@ -857,6 +883,12 @@ impl Parser {
             return Err(CommandError::ConflictingOptions {
                 command,
                 detail: "only one of NX or XX may be specified",
+            });
+        }
+        if options.if_version.is_some() {
+            return Err(CommandError::ConflictingOptions {
+                command,
+                detail: "NX or XX cannot be combined with IF VERSION",
             });
         }
 
@@ -920,8 +952,8 @@ mod tests {
             Parser::parse("mset one 1 two 2").unwrap(),
             Command::MSet {
                 entries: vec![
-                    ("one".to_string(), "1".to_string()),
-                    ("two".to_string(), "2".to_string())
+                    ("one".to_string(), b"1".to_vec()),
+                    ("two".to_string(), b"2".to_vec())
                 ]
             }
         );
@@ -929,7 +961,7 @@ mod tests {
             Parser::parse("setnx name alice").unwrap(),
             Command::SetNx {
                 key: "name".to_string(),
-                value: "alice".to_string()
+                value: b"alice".to_vec()
             }
         );
         assert_eq!(
@@ -1134,7 +1166,7 @@ mod tests {
             Parser::parse(r#"set name "John Doe""#).unwrap(),
             Command::Set {
                 key: "name".to_string(),
-                value: "John Doe".to_string(),
+                value: b"John Doe".to_vec(),
                 options: SetOptions::default(),
             }
         );
@@ -1186,7 +1218,7 @@ mod tests {
             Parser::parse(r#"set UserName "Alice Smith""#).unwrap(),
             Command::Set {
                 key: "UserName".to_string(),
-                value: "Alice Smith".to_string(),
+                value: b"Alice Smith".to_vec(),
                 options: SetOptions::default(),
             }
         );
@@ -1198,9 +1230,10 @@ mod tests {
             Parser::parse("set cache item nx px 1500 get").unwrap(),
             Command::Set {
                 key: "cache".to_string(),
-                value: "item".to_string(),
+                value: b"item".to_vec(),
                 options: SetOptions {
                     condition: Some(SetCondition::Nx),
+                    if_version: None,
                     expiration: Some(Expiration::Px(1500)),
                     keep_ttl: false,
                     return_previous: true,
@@ -1208,8 +1241,25 @@ mod tests {
             }
         );
 
+        assert_eq!(
+            Parser::parse("set cache item if version 7").unwrap(),
+            Command::Set {
+                key: "cache".to_string(),
+                value: b"item".to_vec(),
+                options: SetOptions {
+                    condition: None,
+                    if_version: Some(7),
+                    expiration: None,
+                    keep_ttl: false,
+                    return_previous: false,
+                },
+            }
+        );
+
         assert!(Parser::parse("set key value ex 10 keepttl").is_err());
         assert!(Parser::parse("set key value nx xx").is_err());
+        assert!(Parser::parse("set key value nx if version 1").is_err());
+        assert!(Parser::parse("set key value if version 1 xx").is_err());
         assert!(Parser::parse("scan 0 count 2 count 3").is_err());
     }
 }

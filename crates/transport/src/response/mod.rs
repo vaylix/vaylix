@@ -6,7 +6,8 @@ use crate::error::{Result, TransportError};
 mod primitives;
 
 use primitives::{
-    ensure_empty, put_string_u16, put_string_u32, read_bool, read_string_u16, read_string_u32,
+    ensure_empty, put_bytes_u32, put_string_u16, put_string_u32, read_bool, read_bytes_u32,
+    read_string_u16, read_string_u32,
 };
 
 /// Structured remote error metadata returned for failed requests.
@@ -29,12 +30,12 @@ pub struct ScanPayload {
 pub enum ExecResultPayload {
     Ok,
     NotFound,
-    Value(String),
+    Value(Vec<u8>),
     Boolean(bool),
     Count(u64),
     Integer(i64),
-    Entries(Vec<(String, String)>),
-    Strings(Vec<Option<String>>),
+    Entries(Vec<(String, Vec<u8>)>),
+    Strings(Vec<Option<Vec<u8>>>),
     Scan(ScanPayload),
 }
 
@@ -105,7 +106,12 @@ impl Response {
 
     /// Builds a response containing a single string value.
     pub fn value(request_id: Uuid, value: &str) -> Result<Self> {
-        Ok(Self::new(request_id, Status::Ok, encode_string_u32(value)?))
+        Self::value_bytes(request_id, value.as_bytes())
+    }
+
+    /// Builds a response containing one opaque byte value.
+    pub fn value_bytes(request_id: Uuid, value: &[u8]) -> Result<Self> {
+        Ok(Self::new(request_id, Status::Ok, encode_bytes_u32(value)?))
     }
 
     /// Builds a response containing a boolean value.
@@ -125,14 +131,23 @@ impl Response {
 
     /// Builds a response containing a list of key/value pairs.
     pub fn entries(request_id: Uuid, entries: &[(String, String)]) -> Result<Self> {
+        let byte_entries = entries
+            .iter()
+            .map(|(key, value)| (key.clone(), value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        Self::byte_entries(request_id, &byte_entries)
+    }
+
+    /// Builds a response containing key/value entries with opaque byte values.
+    pub fn byte_entries(request_id: Uuid, entries: &[(String, Vec<u8>)]) -> Result<Self> {
         let entry_count =
             u32::try_from(entries.len()).map_err(|_| TransportError::CorruptedPayload)?;
-        let mut buf = BytesMut::with_capacity(entries_payload_len(entries));
+        let mut buf = BytesMut::with_capacity(byte_entries_payload_len(entries));
         buf.put_u32(entry_count);
 
         for (key, value) in entries {
             put_string_u16(&mut buf, key)?;
-            put_string_u32(&mut buf, value)?;
+            put_bytes_u32(&mut buf, value)?;
         }
 
         Ok(Self::new(request_id, Status::Ok, buf.to_vec()))
@@ -140,16 +155,25 @@ impl Response {
 
     /// Builds a response containing a list of optional string values.
     pub fn strings(request_id: Uuid, values: &[Option<String>]) -> Result<Self> {
+        let byte_values = values
+            .iter()
+            .map(|value| value.as_ref().map(|value| value.as_bytes().to_vec()))
+            .collect::<Vec<_>>();
+        Self::byte_strings(request_id, &byte_values)
+    }
+
+    /// Builds a response containing optional opaque byte values.
+    pub fn byte_strings(request_id: Uuid, values: &[Option<Vec<u8>>]) -> Result<Self> {
         let value_count =
             u32::try_from(values.len()).map_err(|_| TransportError::CorruptedPayload)?;
-        let mut buf = BytesMut::with_capacity(strings_payload_len(values));
+        let mut buf = BytesMut::with_capacity(byte_strings_payload_len(values));
         buf.put_u32(value_count);
 
         for value in values {
             match value {
                 Some(value) => {
                     buf.put_u8(1);
-                    put_string_u32(&mut buf, value)?;
+                    put_bytes_u32(&mut buf, value)?;
                 }
                 None => buf.put_u8(0),
             }
@@ -187,7 +211,11 @@ impl Response {
     }
 
     pub fn decode_value(&self) -> Result<String> {
-        decode_string_u32(&self.payload)
+        Ok(String::from_utf8(self.decode_value_bytes()?)?)
+    }
+
+    pub fn decode_value_bytes(&self) -> Result<Vec<u8>> {
+        decode_bytes_u32(&self.payload)
     }
 
     pub fn decode_error(&self) -> Result<ErrorPayload> {
@@ -231,6 +259,13 @@ impl Response {
     }
 
     pub fn decode_entries(&self) -> Result<Vec<(String, String)>> {
+        self.decode_byte_entries()?
+            .into_iter()
+            .map(|(key, value)| Ok((key, String::from_utf8(value)?)))
+            .collect()
+    }
+
+    pub fn decode_byte_entries(&self) -> Result<Vec<(String, Vec<u8>)>> {
         let mut buf = self.payload.as_slice();
 
         if buf.remaining() < 4 {
@@ -242,7 +277,7 @@ impl Response {
 
         for _ in 0..entry_count {
             let key = read_string_u16(&mut buf)?;
-            let value = read_string_u32(&mut buf)?;
+            let value = read_bytes_u32(&mut buf)?;
             entries.push((key, value));
         }
 
@@ -251,6 +286,13 @@ impl Response {
     }
 
     pub fn decode_strings(&self) -> Result<Vec<Option<String>>> {
+        self.decode_byte_strings()?
+            .into_iter()
+            .map(|value| value.map(String::from_utf8).transpose().map_err(Into::into))
+            .collect()
+    }
+
+    pub fn decode_byte_strings(&self) -> Result<Vec<Option<Vec<u8>>>> {
         let mut buf = self.payload.as_slice();
 
         if buf.remaining() < 4 {
@@ -267,7 +309,7 @@ impl Response {
 
             match buf.get_u8() {
                 0 => values.push(None),
-                1 => values.push(Some(read_string_u32(&mut buf)?)),
+                1 => values.push(Some(read_bytes_u32(&mut buf)?)),
                 _ => return Err(TransportError::CorruptedPayload),
             }
         }
@@ -315,15 +357,15 @@ impl Response {
     }
 }
 
-fn encode_string_u32(value: &str) -> Result<Vec<u8>> {
-    let mut buf = BytesMut::with_capacity(string_u32_len(value));
-    put_string_u32(&mut buf, value)?;
+fn encode_bytes_u32(value: &[u8]) -> Result<Vec<u8>> {
+    let mut buf = BytesMut::with_capacity(bytes_u32_len(value));
+    put_bytes_u32(&mut buf, value)?;
     Ok(buf.to_vec())
 }
 
-fn decode_string_u32(payload: &[u8]) -> Result<String> {
+fn decode_bytes_u32(payload: &[u8]) -> Result<Vec<u8>> {
     let mut buf = payload;
-    let value = read_string_u32(&mut buf)?;
+    let value = read_bytes_u32(&mut buf)?;
     ensure_empty(buf)?;
     Ok(value)
 }
@@ -346,17 +388,21 @@ fn string_u32_len(value: &str) -> usize {
     4 + value.len()
 }
 
-fn entries_payload_len(entries: &[(String, String)]) -> usize {
+fn bytes_u32_len(value: &[u8]) -> usize {
+    4 + value.len()
+}
+
+fn byte_entries_payload_len(entries: &[(String, Vec<u8>)]) -> usize {
     4 + entries
         .iter()
-        .map(|(key, value)| string_u16_len(key) + string_u32_len(value))
+        .map(|(key, value)| string_u16_len(key) + bytes_u32_len(value))
         .sum::<usize>()
 }
 
-fn strings_payload_len(values: &[Option<String>]) -> usize {
+fn byte_strings_payload_len(values: &[Option<Vec<u8>>]) -> usize {
     4 + values
         .iter()
-        .map(|value| 1 + value.as_ref().map_or(0, |value| string_u32_len(value)))
+        .map(|value| 1 + value.as_ref().map_or(0, |value| bytes_u32_len(value)))
         .sum::<usize>()
 }
 
@@ -371,19 +417,19 @@ fn exec_results_payload_len(results: &[ExecResultPayload]) -> usize {
 fn exec_result_payload_len(result: &ExecResultPayload) -> usize {
     match result {
         ExecResultPayload::Ok | ExecResultPayload::NotFound => 1,
-        ExecResultPayload::Value(value) => 1 + string_u32_len(value),
+        ExecResultPayload::Value(value) => 1 + bytes_u32_len(value),
         ExecResultPayload::Boolean(_) => 2,
         ExecResultPayload::Count(_) | ExecResultPayload::Integer(_) => 9,
         ExecResultPayload::Entries(entries) => {
             5 + entries
                 .iter()
-                .map(|(key, value)| string_u16_len(key) + string_u32_len(value))
+                .map(|(key, value)| string_u16_len(key) + bytes_u32_len(value))
                 .sum::<usize>()
         }
         ExecResultPayload::Strings(values) => {
             5 + values
                 .iter()
-                .map(|value| 1 + value.as_ref().map_or(0, |value| string_u32_len(value)))
+                .map(|value| 1 + value.as_ref().map_or(0, |value| bytes_u32_len(value)))
                 .sum::<usize>()
         }
         ExecResultPayload::Scan(scan) => {
@@ -402,7 +448,7 @@ fn encode_exec_result(buf: &mut BytesMut, result: &ExecResultPayload) -> Result<
         ExecResultPayload::NotFound => buf.put_u8(0x01),
         ExecResultPayload::Value(value) => {
             buf.put_u8(0x02);
-            put_string_u32(buf, value)?;
+            put_bytes_u32(buf, value)?;
         }
         ExecResultPayload::Boolean(value) => {
             buf.put_u8(0x03);
@@ -423,7 +469,7 @@ fn encode_exec_result(buf: &mut BytesMut, result: &ExecResultPayload) -> Result<
             buf.put_u32(count);
             for (key, value) in entries {
                 put_string_u16(buf, key)?;
-                put_string_u32(buf, value)?;
+                put_bytes_u32(buf, value)?;
             }
         }
         ExecResultPayload::Strings(values) => {
@@ -435,7 +481,7 @@ fn encode_exec_result(buf: &mut BytesMut, result: &ExecResultPayload) -> Result<
                 match value {
                     Some(value) => {
                         buf.put_u8(1);
-                        put_string_u32(buf, value)?;
+                        put_bytes_u32(buf, value)?;
                     }
                     None => buf.put_u8(0),
                 }
@@ -463,7 +509,7 @@ fn decode_exec_result(buf: &mut &[u8]) -> Result<ExecResultPayload> {
     match buf.get_u8() {
         0x00 => Ok(ExecResultPayload::Ok),
         0x01 => Ok(ExecResultPayload::NotFound),
-        0x02 => Ok(ExecResultPayload::Value(read_string_u32(buf)?)),
+        0x02 => Ok(ExecResultPayload::Value(read_bytes_u32(buf)?)),
         0x03 => Ok(ExecResultPayload::Boolean(read_bool(buf)?)),
         0x04 => {
             if buf.remaining() < 8 {
@@ -484,7 +530,7 @@ fn decode_exec_result(buf: &mut &[u8]) -> Result<ExecResultPayload> {
             let entry_count = buf.get_u32() as usize;
             let mut entries = Vec::with_capacity(entry_count);
             for _ in 0..entry_count {
-                entries.push((read_string_u16(buf)?, read_string_u32(buf)?));
+                entries.push((read_string_u16(buf)?, read_bytes_u32(buf)?));
             }
             Ok(ExecResultPayload::Entries(entries))
         }
@@ -500,7 +546,7 @@ fn decode_exec_result(buf: &mut &[u8]) -> Result<ExecResultPayload> {
                 }
                 match buf.get_u8() {
                     0 => values.push(None),
-                    1 => values.push(Some(read_string_u32(buf)?)),
+                    1 => values.push(Some(read_bytes_u32(buf)?)),
                     _ => return Err(TransportError::CorruptedPayload),
                 }
             }
@@ -594,12 +640,12 @@ mod tests {
             id(8),
             &[
                 ExecResultPayload::Ok,
-                ExecResultPayload::Value("alpha".to_string()),
+                ExecResultPayload::Value(b"alpha".to_vec()),
                 ExecResultPayload::Boolean(true),
                 ExecResultPayload::Count(7),
                 ExecResultPayload::Integer(-2),
-                ExecResultPayload::Entries(vec![("name".to_string(), "alice".to_string())]),
-                ExecResultPayload::Strings(vec![Some("one".to_string()), None]),
+                ExecResultPayload::Entries(vec![("name".to_string(), b"alice".to_vec())]),
+                ExecResultPayload::Strings(vec![Some(b"one".to_vec()), None]),
                 ExecResultPayload::Scan(ScanPayload {
                     next_cursor: 22,
                     keys: vec!["k1".to_string(), "k2".to_string()],
@@ -611,12 +657,12 @@ mod tests {
             exec.decode_exec_results().unwrap(),
             vec![
                 ExecResultPayload::Ok,
-                ExecResultPayload::Value("alpha".to_string()),
+                ExecResultPayload::Value(b"alpha".to_vec()),
                 ExecResultPayload::Boolean(true),
                 ExecResultPayload::Count(7),
                 ExecResultPayload::Integer(-2),
-                ExecResultPayload::Entries(vec![("name".to_string(), "alice".to_string())]),
-                ExecResultPayload::Strings(vec![Some("one".to_string()), None]),
+                ExecResultPayload::Entries(vec![("name".to_string(), b"alice".to_vec())]),
+                ExecResultPayload::Strings(vec![Some(b"one".to_vec()), None]),
                 ExecResultPayload::Scan(ScanPayload {
                     next_cursor: 22,
                     keys: vec!["k1".to_string(), "k2".to_string()],

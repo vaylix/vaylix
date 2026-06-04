@@ -1,7 +1,10 @@
+use std::io::Cursor;
+
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use transport::{
     CodecOptions, CompressionMode, Opcode, Request, Response, Status, decode_request,
     decode_response, encode_request_with_options, encode_response_with_options,
+    read_request_from_with_options,
 };
 use uuid::Uuid;
 
@@ -543,5 +546,94 @@ fn response_round_trip(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(transport_benches, request_round_trip, response_round_trip);
+fn frame_parse_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transport/frame_parse_latency");
+    for case in request_cases()
+        .into_iter()
+        .filter(|case| matches!(case.opcode, Opcode::Get | Opcode::Set | Opcode::MGet))
+    {
+        let request = Request::new(Uuid::from_u128(42), case.opcode, case.payload);
+        let encoded =
+            encode_request_with_options(&request, CodecOptions::default()).expect("encode request");
+        group.bench_with_input(
+            BenchmarkId::from_parameter(case.name),
+            &encoded,
+            |b, bytes| {
+                b.iter(|| {
+                    let decoded = decode_request(bytes).expect("decode request");
+                    assert_eq!(decoded.request_id, request.request_id);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn encode_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transport/encode_latency");
+    for case in request_cases()
+        .into_iter()
+        .filter(|case| matches!(case.opcode, Opcode::Get | Opcode::Set | Opcode::MSet))
+    {
+        let request = Request::new(Uuid::from_u128(7), case.opcode, case.payload);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(case.name),
+            &request,
+            |b, request| {
+                b.iter(|| {
+                    let encoded = encode_request_with_options(request, CodecOptions::default())
+                        .expect("encode");
+                    assert!(!encoded.is_empty());
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+fn pipelined_request_throughput(c: &mut Criterion) {
+    let mut group = c.benchmark_group("transport/pipelined_request_throughput");
+    let options = CodecOptions {
+        compression: CompressionMode::None,
+        ..CodecOptions::default()
+    };
+    let request = Request::new(
+        Uuid::from_u128(99),
+        Opcode::Get,
+        br#"{"key":"bench-key"}"#.to_vec(),
+    );
+    let encoded = encode_request_with_options(&request, options).expect("encode request");
+
+    for pipeline_depth in [16_usize, 64, 256] {
+        let mut stream = Vec::with_capacity(encoded.len() * pipeline_depth);
+        for _ in 0..pipeline_depth {
+            stream.extend_from_slice(&encoded);
+        }
+
+        group.bench_with_input(
+            BenchmarkId::from_parameter(pipeline_depth),
+            &stream,
+            |b, stream| {
+                b.iter(|| {
+                    let mut cursor = Cursor::new(stream.as_slice());
+                    for _ in 0..pipeline_depth {
+                        let decoded =
+                            read_request_from_with_options(&mut cursor, options).expect("decode");
+                        assert_eq!(decoded.opcode, Opcode::Get);
+                    }
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    transport_benches,
+    request_round_trip,
+    response_round_trip,
+    frame_parse_latency,
+    encode_latency,
+    pipelined_request_throughput
+);
 criterion_main!(transport_benches);

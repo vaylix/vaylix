@@ -14,7 +14,7 @@ const TTL_KEY_MISSING: i64 = -2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReadEntry {
-    value: String,
+    value: Vec<u8>,
     expires_at_ms: Option<u64>,
 }
 
@@ -81,7 +81,7 @@ impl CommittedReadIndex {
         let state = self.state.read();
         match command {
             Command::Get { key } => match live_entry(&state.entries, key) {
-                Some(entry) => Ok(Response::value(request_id, &entry.value)?),
+                Some(entry) => Ok(Response::value_bytes(request_id, &entry.value)?),
                 None => Ok(Response::not_found(request_id)),
             },
             Command::MGet { keys } => {
@@ -93,7 +93,7 @@ impl CommittedReadIndex {
                             .map(|entry| entry.value.clone())
                     })
                     .collect::<Vec<_>>();
-                Ok(Response::strings(request_id, &values)?)
+                Ok(Response::byte_strings(request_id, &values)?)
             }
             Command::Exists { key } => Ok(Response::boolean(
                 request_id,
@@ -130,7 +130,7 @@ fn apply_operation(
     operation: &WalOperation,
 ) -> Result<()> {
     match operation {
-        WalOperation::Set { key, value } => {
+        WalOperation::Set { key, value, .. } => {
             entries.insert(
                 key.clone(),
                 ReadEntry {
@@ -159,21 +159,26 @@ fn apply_operation(
             let current = entries
                 .get(key)
                 .map(|entry| entry.value.clone())
-                .unwrap_or_else(|| "0".to_string());
-            let parsed =
-                current
-                    .parse::<i64>()
-                    .map_err(|_| engine::EngineError::InvalidIntegerValue {
-                        key: key.clone(),
-                        value: current.clone(),
-                    })?;
+                .unwrap_or_else(|| b"0".to_vec());
+            let current_text = String::from_utf8(current.clone()).map_err(|_| {
+                engine::EngineError::InvalidIntegerValue {
+                    key: key.clone(),
+                    value: String::from_utf8_lossy(&current).into_owned(),
+                }
+            })?;
+            let parsed = current_text.parse::<i64>().map_err(|_| {
+                engine::EngineError::InvalidIntegerValue {
+                    key: key.clone(),
+                    value: current_text.clone(),
+                }
+            })?;
             let next = parsed
                 .checked_add(*delta)
                 .ok_or_else(|| engine::EngineError::NumericOverflow { key: key.clone() })?;
             entries.insert(
                 key.clone(),
                 ReadEntry {
-                    value: next.to_string(),
+                    value: next.to_string().into_bytes(),
                     expires_at_ms: None,
                 },
             );
@@ -242,7 +247,8 @@ mod tests {
                 vec![
                     WalOperation::Set {
                         key: "token".to_string(),
-                        value: "abc".to_string(),
+                        value: b"abc".to_vec(),
+                        version: 1,
                     },
                     WalOperation::Expire {
                         key: "token".to_string(),
@@ -303,7 +309,8 @@ mod tests {
                 vec![
                     WalOperation::Set {
                         key: "token".to_string(),
-                        value: "abc".to_string(),
+                        value: b"abc".to_vec(),
+                        version: 1,
                     },
                     WalOperation::Expire {
                         key: "token".to_string(),

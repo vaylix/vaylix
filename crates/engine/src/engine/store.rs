@@ -8,8 +8,14 @@ use std::collections::BTreeMap;
 /// `GET`/`TTL`/write-overwrite paths and keeps shard ownership localized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredValue {
-    pub value: String,
+    #[serde(
+        serialize_with = "crate::value::serialize_bytes",
+        deserialize_with = "crate::value::deserialize_bytes"
+    )]
+    pub value: Vec<u8>,
     pub expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Sharded concurrent live key/value store used by the engine.
@@ -28,7 +34,7 @@ impl EngineStore {
         }
     }
 
-    pub fn from_parts(data: BTreeMap<String, String>, expirations: BTreeMap<String, u64>) -> Self {
+    pub fn from_parts(data: BTreeMap<String, Vec<u8>>, expirations: BTreeMap<String, u64>) -> Self {
         let store = Self::new();
         for (key, value) in data {
             store.entries.insert(
@@ -36,13 +42,30 @@ impl EngineStore {
                 StoredValue {
                     value,
                     expires_at_ms: expirations.get(&key).copied(),
+                    version: 1,
                 },
             );
         }
         store
     }
 
-    pub fn to_parts(&self) -> (BTreeMap<String, String>, BTreeMap<String, u64>) {
+    pub fn from_entries(entries: BTreeMap<String, StoredValue>) -> Self {
+        let store = Self::new();
+        for (key, value) in entries {
+            store.entries.insert(key, value);
+        }
+        store
+    }
+
+    pub fn to_entries(&self) -> BTreeMap<String, StoredValue> {
+        let mut entries = BTreeMap::new();
+        for entry in self.entries.iter() {
+            entries.insert(entry.key().clone(), entry.value().clone());
+        }
+        entries
+    }
+
+    pub fn to_parts(&self) -> (BTreeMap<String, Vec<u8>>, BTreeMap<String, u64>) {
         let mut data = BTreeMap::new();
         let mut expirations = BTreeMap::new();
         for entry in self.entries.iter() {
@@ -70,7 +93,7 @@ impl EngineStore {
         self.entries.get(key).map(|entry| entry.value().clone())
     }
 
-    pub fn get_value(&self, key: &str) -> Option<String> {
+    pub fn get_value(&self, key: &str) -> Option<Vec<u8>> {
         self.entries
             .get(key)
             .map(|entry| entry.value().value.clone())
@@ -86,12 +109,27 @@ impl EngineStore {
             .and_then(|entry| entry.value().expires_at_ms)
     }
 
-    pub fn insert_value(&self, key: String, value: String) -> Option<StoredValue> {
+    pub fn insert_value(&self, key: String, value: Vec<u8>) -> Option<StoredValue> {
+        let version = self
+            .entries
+            .get(&key)
+            .map(|entry| entry.value().version.saturating_add(1))
+            .unwrap_or(1);
+        self.insert_value_with_version(key, value, version)
+    }
+
+    pub fn insert_value_with_version(
+        &self,
+        key: String,
+        value: Vec<u8>,
+        version: u64,
+    ) -> Option<StoredValue> {
         self.entries.insert(
             key,
             StoredValue {
                 value,
                 expires_at_ms: None,
+                version,
             },
         )
     }
@@ -157,7 +195,7 @@ impl EngineStore {
         self.keys_sorted()
     }
 
-    pub fn live_entries_sorted(&self, now_ms: u64) -> Vec<(String, String)> {
+    pub fn live_entries_sorted(&self, now_ms: u64) -> Vec<(String, Vec<u8>)> {
         self.purge_expired(now_ms);
         let mut entries = self
             .entries

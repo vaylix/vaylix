@@ -45,9 +45,11 @@ The long-term target is broader:
 
 ## Current Data Model
 
-- User-visible model: `String -> String`
+- User-visible model: UTF-8 keys with opaque byte values
 - In-memory map: sharded `DashMap<String, StoredValue>`
+- Stored value fields: byte payload, absolute expiration timestamp, and monotonic `u64` version
 - Expirations: per-key absolute timestamps in milliseconds stored beside the value
+- CAS: `SET <key> <value> IF VERSION <version>` performs a deterministic non-mutating failure on version mismatch
 - Leader writes: eligible standalone commands are batched by a dedicated HA write coordinator into one local WAL batch and one replicated frontier before acknowledgement
 - Supported command families:
   - auth
@@ -476,6 +478,7 @@ Transport compression is enabled by default for outbound frames in the current c
 - compression is selected during startup negotiation
 - readers decompress automatically based on the frame flag
 - frame checksums validate the on-wire compressed payload
+- large async zstd compression/decompression is offloaded from network tasks
 - `--disable-compression` disables outbound compression on that process
 
 Still missing:
@@ -598,7 +601,7 @@ Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.7.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.8.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 

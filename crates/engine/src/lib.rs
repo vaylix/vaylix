@@ -3,6 +3,7 @@ mod engine;
 mod error;
 mod paths;
 mod store;
+mod value;
 
 pub use config::{
     DEFAULT_WAL_RETAIN_SEGMENTS, DEFAULT_WAL_SEGMENT_SIZE_BYTES, EngineOptions, StorageKey,

@@ -454,7 +454,7 @@ async fn wait_for_writable_leader(
                 request_id_base + 1_000 + idx as u128,
                 Command::Set {
                     key: probe_key.to_string(),
-                    value: format!("leader-{idx}"),
+                    value: format!("leader-{idx}").into_bytes(),
                     options: SetOptions::default(),
                 },
             )
@@ -782,9 +782,10 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
         id(1),
         Command::Set {
             key: "user:1".to_string(),
-            value: "alice".to_string(),
+            value: b"alice".to_vec(),
             options: SetOptions {
                 condition: Some(SetCondition::Nx),
+                if_version: None,
                 expiration: Some(Expiration::Ex(60)),
                 keep_ttl: false,
                 return_previous: false,
@@ -943,6 +944,117 @@ async fn handles_real_tcp_round_trip_for_extended_commands() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preserves_binary_values_and_cas_over_tcp() {
+    let root = temp_dir("tcp-binary-cas");
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-binary-cas-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime(None))
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let mut stream = connect_tcp(addr).await;
+    authenticate(&mut stream).await;
+
+    let binary_value = vec![0x00, 0x66, 0x80, 0xff];
+    let set = Request::from_command(
+        id(9_001),
+        Command::Set {
+            key: "bin".to_string(),
+            value: binary_value.clone(),
+            options: SetOptions::default(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &set).await.unwrap();
+    assert_eq!(
+        read_response_from_async(&mut stream).await.unwrap().status,
+        Status::Ok
+    );
+
+    let get = Request::from_command(
+        id(9_002),
+        Command::Get {
+            key: "bin".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &get).await.unwrap();
+    let get_response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(get_response.decode_value_bytes().unwrap(), binary_value);
+
+    let cas_success = Request::from_command(
+        id(9_003),
+        Command::Set {
+            key: "bin".to_string(),
+            value: vec![1, 2, 3],
+            options: SetOptions {
+                if_version: Some(1),
+                ..SetOptions::default()
+            },
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &cas_success)
+        .await
+        .unwrap();
+    assert!(
+        read_response_from_async(&mut stream)
+            .await
+            .unwrap()
+            .decode_bool()
+            .unwrap()
+    );
+
+    let cas_failure = Request::from_command(
+        id(9_004),
+        Command::Set {
+            key: "bin".to_string(),
+            value: vec![9, 9, 9],
+            options: SetOptions {
+                if_version: Some(1),
+                ..SetOptions::default()
+            },
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &cas_failure)
+        .await
+        .unwrap();
+    assert!(
+        !read_response_from_async(&mut stream)
+            .await
+            .unwrap()
+            .decode_bool()
+            .unwrap()
+    );
+
+    let get = Request::from_command(
+        id(9_005),
+        Command::Get {
+            key: "bin".to_string(),
+        },
+    )
+    .unwrap();
+    write_request_to_async(&mut stream, &get).await.unwrap();
+    let get_response = read_response_from_async(&mut stream).await.unwrap();
+    assert_eq!(get_response.decode_value_bytes().unwrap(), vec![1, 2, 3]);
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn enforces_rbac_over_tcp() {
     let root = temp_dir("tcp-rbac");
     let paths = Paths::from_data_dir(&root).unwrap();
@@ -1059,7 +1171,7 @@ async fn enforces_rbac_over_tcp() {
         id(47),
         Command::Set {
             key: "locked".to_string(),
-            value: "value".to_string(),
+            value: b"value".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -1183,7 +1295,7 @@ async fn preserves_request_ids_for_pipelined_commands() {
         set_id,
         Command::Set {
             key: "pipe:key".to_string(),
-            value: "value".to_string(),
+            value: b"value".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -1255,7 +1367,7 @@ async fn rejects_sequence_marked_requests_inside_transactions() {
         id(22),
         Command::Set {
             key: "tx:key".to_string(),
-            value: "value".to_string(),
+            value: b"value".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -1307,7 +1419,7 @@ async fn periodic_snapshotter_writes_snapshot_and_flushes_wal() {
         id(1),
         Command::Set {
             key: "snapshot:key".to_string(),
-            value: "value".to_string(),
+            value: b"value".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -1637,7 +1749,7 @@ async fn handles_concurrent_clients_against_serialized_engine() {
                 Uuid::now_v7(),
                 Command::Set {
                     key: format!("client:{index}"),
-                    value: format!("value:{index}"),
+                    value: format!("value:{index}").into_bytes(),
                     options: SetOptions::default(),
                 },
             )
@@ -1787,7 +1899,7 @@ async fn replicates_wal_to_follower_and_requires_replica_ack() {
         40_001,
         Command::Set {
             key: "repl:key".to_string(),
-            value: "value".to_string(),
+            value: b"value".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -1943,7 +2055,7 @@ async fn elects_leader_fails_over_and_keeps_replicating() {
         50_001,
         Command::Set {
             key: "ha:key:1".to_string(),
-            value: "value-1".to_string(),
+            value: b"value-1".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -2003,7 +2115,7 @@ async fn elects_leader_fails_over_and_keeps_replicating() {
                 50_100 + *idx as u128,
                 Command::Set {
                     key: "ha:key:2".to_string(),
-                    value: "value-2".to_string(),
+                    value: b"value-2".to_vec(),
                     options: SetOptions::default(),
                 },
             )
@@ -2207,7 +2319,7 @@ async fn old_leader_rejoins_as_follower_and_catches_up() {
             60_010,
             Command::Set {
                 key: "ha:rejoin:key:1".to_string(),
-                value: "value-1".to_string(),
+                value: b"value-1".to_vec(),
                 options: SetOptions::default(),
             },
         )
@@ -2287,7 +2399,7 @@ async fn old_leader_rejoins_as_follower_and_catches_up() {
         60_200,
         Command::Set {
             key: "ha:rejoin:key:stale".to_string(),
-            value: "bad".to_string(),
+            value: b"bad".to_vec(),
             options: SetOptions::default(),
         },
     )
@@ -2339,7 +2451,7 @@ async fn old_leader_rejoins_as_follower_and_catches_up() {
             60_300,
             Command::Set {
                 key: "ha:rejoin:key:3".to_string(),
-                value: "value-3".to_string(),
+                value: b"value-3".to_vec(),
                 options: SetOptions::default(),
             },
         )

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Default durable storage root for Vaylix server data.
-pub const DEFAULT_DATA_DIR: &str = "/var/lib/vaylix";
+pub const DEFAULT_DATA_DIR: &str = "./default.vaylix";
 
 /// Filesystem layout used by the engine, server, and client.
 #[derive(Debug, Clone, PartialEq, Eq)]

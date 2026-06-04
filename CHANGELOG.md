@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-04
+
+### Added
+
+- Added binary-safe byte values end-to-end across engine state, WAL, snapshots, logical backups, transport responses, and replication.
+- Added persisted per-value `u64` versions and version-based compare-and-set through `SET <key> <value> IF VERSION <version>`.
+- Added deterministic tests for binary payloads with null/non-UTF8 bytes, snapshot recovery, logical backup/restore, WAL replay, and replication.
+- Added transport microbenchmarks for frame parse latency, request encode latency, and pipelined request throughput.
+- Added fail-closed recovery tests for corrupted snapshots, manifest checksum mismatch, partial WAL segments, and WAL checksum mismatch.
+- Added explicit read-consistency tests proving fast-path reads occur only after auth/RBAC gates and only on standalone/leader nodes.
+
+### Changed
+
+- Changed logical backup format to v2 with base64-encoded values and stored value versions; legacy v1 text backups remain restorable as version `1` byte values.
+- Reduced VTP hot-path allocations by parsing fixed 16-byte request IDs from slices and avoiding a second payload copy for socket-read request/response bodies.
+- Offloaded large async zstd compression/decompression from network tasks while preserving frame checksum validation over compressed payload bytes.
+- Updated documentation from `String -> String` to UTF-8 keys with opaque byte values and explicit CAS/read consistency semantics.
+
+### Fixed
+
+- Fixed duplicate-key `MSET` version assignment so repeated writes to the same key in one command advance versions in order.
+- Fixed backup manifest verification to validate v1/v2 backup headers without depending on the current full value schema.
+
 ## [0.7.0] - 2026-06-02
 
 ### Added
