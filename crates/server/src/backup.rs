@@ -1,4 +1,7 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    io::Write,
+    path::{Component, Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,6 +75,7 @@ pub(crate) fn resolve_backup_path(
     if !canonical_parent.starts_with(&base) {
         return Err(ServerError::BackupPathRejected(requested.to_string()));
     }
+    reject_final_symlink(&candidate, requested)?;
     Ok(candidate)
 }
 
@@ -81,6 +85,52 @@ pub(crate) fn backup_manifest_path(path: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("backup");
     path.with_file_name(format!("{file_name}.manifest.json"))
+}
+
+pub(crate) fn reject_final_symlink(path: &Path, requested: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err(ServerError::BackupPathRejected(requested.to_string()))
+        }
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Writes a backup-owned file without following a final-path symlink.
+///
+/// `resolve_backup_path` already verifies the parent directory boundary. This
+/// helper closes the final-component symlink race for backup and manifest
+/// creation on Unix by opening with `O_NOFOLLOW`.
+pub(crate) fn write_backup_file(path: &Path, requested: &str, bytes: &[u8]) -> Result<()> {
+    reject_final_symlink(path, requested)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|err| {
+                if err.raw_os_error() == Some(libc::ELOOP) {
+                    ServerError::BackupPathRejected(requested.to_string())
+                } else {
+                    err.into()
+                }
+            })?;
+        file.write_all(bytes)?;
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)?;
+        Ok(())
+    }
 }
 
 pub(crate) fn load_backup_manifest(path: &Path) -> Result<BackupManifest> {
@@ -158,6 +208,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         backup_manifest_path, build_backup_manifest, resolve_backup_path, verify_backup_manifest,
+        write_backup_file,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -202,6 +253,46 @@ mod tests {
         let err = resolve_backup_path(&base, "../escape.json", false).unwrap_err();
         assert_eq!(err.code(), "SRV-027");
         std::fs::remove_dir_all(base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_output_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("symlink");
+        let outside = temp_dir("outside");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, base.join("backup.json")).unwrap();
+
+        let err = write_backup_file(&base.join("backup.json"), "backup.json", b"new").unwrap_err();
+        assert_eq!(err.code(), "SRV-027");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_file(outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_manifest_sidecar_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_dir("manifest-symlink");
+        let outside = temp_dir("manifest-outside");
+        std::fs::create_dir_all(&base).unwrap();
+        let backup = base.join("backup.json");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, backup_manifest_path(&backup)).unwrap();
+
+        let manifest = backup_manifest_path(&backup);
+        let err = write_backup_file(&manifest, &manifest.display().to_string(), b"{}").unwrap_err();
+        assert_eq!(err.code(), "SRV-027");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+
+        std::fs::remove_dir_all(base).ok();
+        std::fs::remove_file(outside).ok();
     }
 
     #[test]

@@ -1,13 +1,16 @@
 use crate::{EngineError, Result};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
+use std::fs;
 use std::io::ErrorKind;
-use std::io::Write;
 use std::path::Path;
 
-use super::binary;
+use super::{binary, durable};
 
 /// Current durable storage serialization format.
+///
+/// Bump this when WAL, snapshot, manifest, keyring, or value-version
+/// encoding changes in a way an older binary cannot safely read. Add an
+/// explicit migration path rather than silently accepting unknown formats.
 pub const STORAGE_FORMAT_VERSION: u32 = 3;
 
 /// Metadata persisted alongside snapshots to describe the durable baseline.
@@ -35,12 +38,7 @@ pub struct Manifest {
 pub fn save(manifest: &Manifest, path: &Path, temp_path: &Path) -> Result<()> {
     let bytes =
         binary::encode(manifest).map_err(|err| EngineError::ManifestSerialize(err.to_string()))?;
-    let mut file = File::create(temp_path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temp_path, path)?;
-    File::open(path)?.sync_all()?;
-    Ok(())
+    durable::atomic_replace(path, temp_path, &bytes)
 }
 
 /// Loads the manifest when one exists.

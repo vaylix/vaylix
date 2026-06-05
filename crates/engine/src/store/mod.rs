@@ -1,4 +1,5 @@
 mod binary;
+mod durable;
 
 pub mod crypto;
 pub mod keyring;

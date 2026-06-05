@@ -346,4 +346,31 @@ mod tests {
         assert!(body.contains("# TYPE vaylix_server_connection_active gauge"));
         assert!(!body.contains("_total"));
     }
+
+    #[test]
+    fn prometheus_export_has_valid_line_groups() {
+        let metrics = Metrics::default();
+        let body = metrics.prometheus();
+        let lines = body.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), METRIC_DESCRIPTORS.len() * 3);
+
+        for chunk in lines.chunks_exact(3) {
+            let help = chunk[0];
+            let metric_type = chunk[1];
+            let sample = chunk[2];
+
+            assert!(help.starts_with("# HELP vaylix_"));
+            assert!(metric_type.starts_with("# TYPE vaylix_"));
+
+            let sample_parts = sample.split_ascii_whitespace().collect::<Vec<_>>();
+            assert_eq!(sample_parts.len(), 2);
+            assert!(sample_parts[0].starts_with("vaylix_"));
+            assert!(sample_parts[1].parse::<u64>().is_ok());
+
+            let help_name = help.split_ascii_whitespace().nth(2).unwrap();
+            let type_name = metric_type.split_ascii_whitespace().nth(2).unwrap();
+            assert_eq!(help_name, type_name);
+            assert_eq!(help_name, sample_parts[0]);
+        }
+    }
 }

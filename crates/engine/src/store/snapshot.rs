@@ -1,11 +1,9 @@
 use crate::Result;
 use crate::config::StorageKeyring;
 use crate::store::crypto::{decrypt, encrypt};
-use std::{
-    fs::{self, File},
-    io::{ErrorKind, Write},
-    path::Path,
-};
+use std::{fs, io::ErrorKind, path::Path};
+
+use super::durable;
 
 /// Saves snapshot bytes atomically using a temporary file and rename.
 pub fn save(
@@ -18,12 +16,7 @@ pub fn save(
         Some(keyring) => encrypt(keyring.active(), "snapshot", data)?,
         None => data.to_vec(),
     };
-    let mut file = File::create(temp_path)?;
-    file.write_all(&durable_bytes)?;
-    file.sync_all()?;
-    fs::rename(temp_path, path)?;
-    File::open(path)?.sync_all()?;
-    Ok(())
+    durable::atomic_replace(path, temp_path, &durable_bytes)
 }
 
 /// Loads raw snapshot bytes when a snapshot exists.

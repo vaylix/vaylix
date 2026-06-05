@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::auth::{Identity, Permission};
 use crate::backup::{
     backup_manifest_path, build_backup_manifest, load_backup_manifest, resolve_backup_path,
-    verify_backup_manifest,
+    verify_backup_manifest, write_backup_file,
 };
 use crate::error::{Result, ServerError};
 use crate::metrics::Metrics;
@@ -48,9 +48,9 @@ mod validation;
 
 pub(crate) use audit_events::log_event;
 use audit_events::{
-    auth_lockout_key, current_time_millis, log_connection_event, opcode_name, record_audit_event,
-    record_command_audit_event, record_runtime_event, record_semantic_audit_event,
-    record_slow_command_event,
+    auth_lockout_key, auth_lockout_username_key, current_time_millis, log_connection_event,
+    opcode_name, record_audit_event, record_command_audit_event, record_runtime_event,
+    record_semantic_audit_event, record_slow_command_event,
 };
 use authorization::{authorize_command, is_allowed_during_maintenance};
 use commands::{
@@ -2116,6 +2116,10 @@ async fn process_internal_replication_request(
                                 applied_checksum,
                             )
                             .await;
+                        runtime
+                            .replication
+                            .observe_leader_commit(payload.commit_sequence)
+                            .await;
                         let committed_sequence = runtime
                             .replication
                             .commit_sequence()
@@ -2175,6 +2179,10 @@ async fn process_internal_replication_request(
                 .replication
                 .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
                 .await;
+            runtime
+                .replication
+                .observe_leader_commit(payload.commit_sequence)
+                .await;
             let committed_sequence = runtime
                 .replication
                 .commit_sequence()
@@ -2224,6 +2232,10 @@ async fn process_internal_replication_request(
             runtime
                 .replication
                 .set_local_last_applied_state(applied_sequence, applied_term, applied_checksum)
+                .await;
+            runtime
+                .replication
+                .observe_leader_commit(payload.commit_sequence)
                 .await;
             runtime
                 .read_index
@@ -2435,10 +2447,12 @@ async fn process_command(
             let dump = response.response.decode_value()?;
             let path = resolve_backup_path(&runtime.backup_dir, &path, false)?;
             let manifest = build_backup_manifest(&dump)?;
-            std::fs::write(&path, dump)?;
-            std::fs::write(
-                backup_manifest_path(&path),
-                serde_json::to_vec_pretty(&manifest).map_err(std::io::Error::other)?,
+            let manifest_path = backup_manifest_path(&path);
+            write_backup_file(&path, &path.display().to_string(), dump.as_bytes())?;
+            write_backup_file(
+                &manifest_path,
+                &manifest_path.display().to_string(),
+                &serde_json::to_vec_pretty(&manifest).map_err(std::io::Error::other)?,
             )?;
             Ok(Response::ok(request_id))
         }
@@ -2835,6 +2849,10 @@ async fn structured_info(
             env!("CARGO_PKG_VERSION").to_string(),
         ),
         (
+            "server.git_sha".to_string(),
+            env!("VAYLIX_GIT_SHA").to_string(),
+        ),
+        (
             "server.mode".to_string(),
             if replication.role == "standalone" {
                 "single-node".to_string()
@@ -3171,11 +3189,14 @@ async fn handle_auth(
     };
 
     let lockout_key = auth_lockout_key(&username, peer_addr);
+    let username_lockout_key = auth_lockout_username_key(&username);
     {
         let mut lockouts = runtime.auth_lockouts.lock().await;
-        if let Some(remaining_seconds) =
-            lockouts.remaining_lockout_seconds(&lockout_key, current_time_millis())
-        {
+        let now_ms = current_time_millis();
+        let remaining = lockouts
+            .remaining_lockout_seconds(&lockout_key, now_ms)
+            .or_else(|| lockouts.remaining_lockout_seconds(&username_lockout_key, now_ms));
+        if let Some(remaining_seconds) = remaining {
             metrics
                 .locked_auth_attempts_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -3188,24 +3209,31 @@ async fn handle_auth(
 
     if let Some(identity) = auth_config.verify(&username, &password).await? {
         session.identity = Some(identity);
-        runtime
-            .auth_lockouts
-            .lock()
-            .await
-            .clear_success(&lockout_key);
+        let mut lockouts = runtime.auth_lockouts.lock().await;
+        lockouts.clear_success(&lockout_key);
+        lockouts.clear_success(&username_lockout_key);
         metrics.auth_successes.fetch_add(1, Ordering::Relaxed);
         return Ok(Response::ok(request_id));
     }
 
-    let locked = runtime.auth_lockouts.lock().await.record_failure(
+    let now_ms = current_time_millis();
+    let mut lockouts = runtime.auth_lockouts.lock().await;
+    let peer_locked = lockouts.record_failure(
         &lockout_key,
-        current_time_millis(),
+        now_ms,
         runtime.auth_failure_window,
         runtime.auth_failure_limit,
         runtime.auth_lockout,
     );
+    let username_locked = lockouts.record_failure(
+        &username_lockout_key,
+        now_ms,
+        runtime.auth_failure_window,
+        runtime.auth_failure_limit.saturating_mul(3).max(1),
+        runtime.auth_lockout,
+    );
     metrics.auth_failures.fetch_add(1, Ordering::Relaxed);
-    if locked {
+    if peer_locked || username_locked {
         metrics
             .locked_auth_attempts_total
             .fetch_add(1, Ordering::Relaxed);
@@ -3215,8 +3243,9 @@ async fn handle_auth(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -3229,7 +3258,7 @@ mod tests {
         validate_command,
     };
     use crate::audit::AuditLogger;
-    use crate::auth::{AuthConfig, Permission, PermissionGrant};
+    use crate::auth::{AuthConfig, Identity, Permission, PermissionGrant};
     use crate::metrics::Metrics;
     use crate::replication::{
         ClusterMember, ReplicationConfig, ReplicationRole, ReplicationRuntime, WriteAckMode,
@@ -3372,6 +3401,29 @@ mod tests {
             runtime,
             session,
             None,
+            request_id,
+            Command::Auth {
+                username: username.to_string(),
+                password: password.to_string(),
+            },
+        )
+        .await
+    }
+
+    async fn authenticate_from_peer(
+        metrics: Arc<Metrics>,
+        runtime: &ServerRuntimeConfig,
+        session: &mut SessionState,
+        peer_addr: SocketAddr,
+        request_id: Uuid,
+        username: &str,
+        password: &str,
+    ) -> crate::Result<Response> {
+        handle_auth(
+            metrics,
+            runtime,
+            session,
+            Some(peer_addr),
             request_id,
             Command::Auth {
                 username: username.to_string(),
@@ -3722,6 +3774,49 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(queued.decode_value().unwrap(), "QUEUED");
+    }
+
+    #[test]
+    fn auth_lockout_uses_username_fallback_across_peer_rotation() {
+        let metrics = Arc::new(Metrics::default());
+        let mut runtime = runtime();
+        runtime.auth_failure_limit = 1;
+        runtime.auth_lockout = Duration::from_secs(60);
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+
+        for index in 1..=3 {
+            let mut session = SessionState::new(&guards());
+            let peer = format!("127.0.0.{index}:9000").parse().unwrap();
+            let err = runtime_handle
+                .block_on(authenticate_from_peer(
+                    Arc::clone(&metrics),
+                    &runtime,
+                    &mut session,
+                    peer,
+                    id(index),
+                    "dbuser",
+                    "wrong",
+                ))
+                .unwrap_err();
+            assert!(matches!(err, crate::ServerError::AuthenticationFailed));
+        }
+
+        let mut session = SessionState::new(&guards());
+        let err = runtime_handle
+            .block_on(authenticate_from_peer(
+                Arc::clone(&metrics),
+                &runtime,
+                &mut session,
+                "127.0.0.4:9000".parse().unwrap(),
+                id(4),
+                "dbuser",
+                "secret",
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::ServerError::AuthenticationLocked { .. }
+        ));
     }
 
     #[test]
@@ -4320,6 +4415,57 @@ mod tests {
     }
 
     #[test]
+    fn restore_commands_require_restore_permission() {
+        let runtime_handle = tokio::runtime::Runtime::new().unwrap();
+        let metrics = Arc::new(Metrics::default());
+        let runtime = runtime();
+        let mut session = SessionState::new(&guards());
+        session.identity = Some(Identity {
+            username: "backup-only".to_string(),
+            permissions: BTreeSet::from([Permission::Backup]),
+            grants: BTreeSet::new(),
+        });
+
+        let engine = Engine::from_paths_with_options(
+            Paths::from_data_dir(temp_dir("restore-rbac")).unwrap(),
+            engine::EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("restore-rbac-key")),
+                ..engine::EngineOptions::default()
+            },
+        )
+        .unwrap();
+        let handle = EngineHandle::new(engine);
+
+        for (request_id, command) in [
+            (
+                id(391),
+                Command::Restore {
+                    dump: "{}".to_string(),
+                },
+            ),
+            (
+                id(392),
+                Command::RestoreCheck {
+                    dump: "{}".to_string(),
+                },
+            ),
+        ] {
+            let err = runtime_handle
+                .block_on(run_command(
+                    handle.clone(),
+                    Arc::clone(&metrics),
+                    &runtime,
+                    &mut session,
+                    request_id,
+                    command,
+                ))
+                .unwrap_err();
+            assert!(matches!(err, crate::ServerError::PermissionDenied));
+        }
+    }
+
+    #[test]
     fn rejects_local_only_commands_and_builds_error_payloads() {
         let mut engine = FakeEngine::default();
         assert!(execute_command(&mut engine, id(7), Command::Help).is_err());
@@ -4682,6 +4828,39 @@ mod tests {
         assert!(body.contains(r#""threshold_ms":"100""#));
         assert!(!body.contains("password"));
         assert!(!body.contains("secret"));
+    }
+
+    #[test]
+    fn slow_command_events_fire_at_threshold_not_below_it() {
+        let runtime = runtime();
+        let mut session = SessionState::new(&guards());
+        session.identity = Some(crate::auth::Identity {
+            username: "dbuser".to_string(),
+            permissions: Permission::all(),
+            grants: BTreeSet::new(),
+        });
+
+        for (request_id, latency_ms) in [(id(82), 99), (id(83), 100)] {
+            record_slow_command_event(
+                &runtime.audit_logger,
+                &runtime,
+                AuditContext {
+                    connection_id: 1,
+                    peer_addr: None,
+                    session: &session,
+                    request_id,
+                    opcode: "GET",
+                    status: Status::Ok,
+                    error_code: None,
+                    latency_ms,
+                },
+            );
+        }
+
+        let body = fs::read_to_string(runtime.audit_logger.path()).unwrap();
+        assert_eq!(body.matches(r#""event_type":"slow_command""#).count(), 1);
+        assert!(body.contains(r#""latency_ms":100"#));
+        assert!(body.contains(r#""threshold_ms":"100""#));
     }
 
     #[test]

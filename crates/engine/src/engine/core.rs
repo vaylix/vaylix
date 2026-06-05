@@ -213,18 +213,7 @@ impl Engine {
         };
 
         if let Some(manifest) = load_manifest(&paths.manifest_path)? {
-            if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
-                return Err(crate::EngineError::UnsupportedStorageFormat {
-                    resource: "manifest",
-                });
-            }
-            if let Some(snapshot) = &loaded
-                && hash(snapshot) != manifest.snapshot_checksum
-            {
-                return Err(crate::EngineError::ChecksumMismatch {
-                    resource: "snapshot",
-                });
-            }
+            validate_manifest_snapshot(loaded.as_deref(), &state, &manifest)?;
             state.metadata.last_snapshot_at_ms = Some(manifest.last_snapshot_at_ms);
             state.metadata.last_applied_sequence = state
                 .metadata
@@ -570,18 +559,7 @@ impl Engine {
             .unwrap_or(0);
 
         if let Some(manifest) = &manifest {
-            if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
-                return Err(crate::EngineError::UnsupportedStorageFormat {
-                    resource: "manifest",
-                });
-            }
-            if let Some(snapshot) = &loaded
-                && hash(snapshot) != manifest.snapshot_checksum
-            {
-                return Err(crate::EngineError::ChecksumMismatch {
-                    resource: "snapshot",
-                });
-            }
+            validate_manifest_snapshot(loaded.as_deref(), &state, manifest)?;
             state.metadata.last_snapshot_at_ms = Some(manifest.last_snapshot_at_ms);
             state.metadata.last_applied_sequence = state
                 .metadata
@@ -1361,6 +1339,40 @@ fn build_wal_entry_identities(entries: &[WalEntry]) -> Result<BTreeMap<u64, WalE
         }
     }
     Ok(identities)
+}
+
+fn validate_manifest_snapshot(
+    snapshot: Option<&[u8]>,
+    state: &EngineState,
+    manifest: &Manifest,
+) -> Result<()> {
+    if manifest.storage_format_version != STORAGE_FORMAT_VERSION {
+        return Err(crate::EngineError::UnsupportedStorageFormat {
+            resource: "manifest",
+        });
+    }
+    let Some(snapshot) = snapshot else {
+        return Err(crate::EngineError::ChecksumMismatch {
+            resource: "snapshot",
+        });
+    };
+    if manifest.snapshot_size_bytes != snapshot.len() as u64 {
+        return Err(crate::EngineError::ChecksumMismatch {
+            resource: "snapshot",
+        });
+    }
+    if hash(snapshot) != manifest.snapshot_checksum {
+        return Err(crate::EngineError::ChecksumMismatch {
+            resource: "snapshot",
+        });
+    }
+    if state.metadata.last_applied_sequence != manifest.last_snapshot_sequence {
+        return Err(crate::EngineError::ManifestDeserialize(format!(
+            "snapshot sequence {} does not match manifest sequence {}",
+            state.metadata.last_applied_sequence, manifest.last_snapshot_sequence
+        )));
+    }
+    Ok(())
 }
 
 impl StorageEngine for Engine {
@@ -2371,6 +2383,102 @@ mod tests {
         );
 
         assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_missing_snapshot_when_manifest_exists_on_recovery() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        fs::remove_file(&paths.snapshot_path).unwrap();
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        );
+
+        assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_snapshot_manifest_sequence_mismatch_on_recovery() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let mut manifest = load_manifest(&paths.manifest_path).unwrap().unwrap();
+        manifest.last_snapshot_sequence = manifest.last_snapshot_sequence.saturating_add(10);
+        save_manifest(&manifest, &paths.manifest_path, &paths.manifest_tmp_path).unwrap();
+
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        );
+
+        assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_truncated_wal_payload_on_recovery() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        let active_path = paths.wal_dir.join("active-1.wal");
+        let mut bytes = fs::read(&active_path).unwrap();
+        bytes.truncate(bytes.len().saturating_sub(1));
+        fs::write(&active_path, bytes).unwrap();
+
+        let reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        );
+
+        assert!(reopened.is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ignores_interrupted_snapshot_temp_files_after_successful_rename() {
+        let (mut engine, root) = engine();
+        engine.set("name".to_string(), bytes("alice")).unwrap();
+        engine.snapshot().unwrap();
+
+        let paths = Paths::from_data_dir(&root).unwrap();
+        fs::write(&paths.snapshot_tmp_path, b"stale partial snapshot").unwrap();
+        fs::write(&paths.manifest_tmp_path, b"{\"storage_format_version\":999").unwrap();
+
+        let mut reopened = Engine::from_paths_with_options(
+            paths,
+            EngineOptions {
+                wal_sync: WalSyncPolicy::Flush,
+                keyring: Some(test_keyring("test-data-key")),
+                ..EngineOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            reopened.get("name").unwrap().as_deref(),
+            Some(b"alice".as_slice())
+        );
         fs::remove_dir_all(root).ok();
     }
 

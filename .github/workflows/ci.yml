@@ -25,10 +25,26 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint workspace
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
+
+      - name: Install nightly toolchain for fuzz smoke
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Run bounded fuzz smokes
+        run: |
+          cd fuzz
+          cargo +nightly fuzz run vtp_frame -- -runs=2048
+          cargo +nightly fuzz run command_text -- -runs=2048
+          cargo +nightly fuzz run storage_recovery -- -runs=1024
+          cargo +nightly fuzz run replication_json -- -runs=2048
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
@@ -36,9 +52,9 @@ jobs:
           tool: cargo-audit
 
       - name: Audit dependencies
-        run: cargo audit
+        run: cargo audit --file Cargo.lock
 
       - name: Smoke build release binaries
         run: |
-          cargo build --release -p server
-          cargo build --release -p client
+          cargo build --locked --release -p server
+          cargo build --locked --release -p client

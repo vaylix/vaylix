@@ -360,6 +360,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_malformed_json_lines() {
+        let path = temp_path();
+        fs::write(&path, "{not-json}\n").unwrap();
+
+        let err = match AuditLogger::open(&path) {
+            Ok(_) => panic!("malformed audit log must fail chain verification"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), "SRV-028");
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
     fn rejects_removed_or_reordered_lines() {
         let path = temp_path();
         let logger = AuditLogger::open(&path).unwrap();
@@ -376,6 +389,31 @@ mod tests {
         assert!(AuditLogger::open(&path).is_err());
 
         fs::write(&path, format!("{}\n{}\n", lines[1], lines[0])).unwrap();
+        assert!(AuditLogger::open(&path).is_err());
+        fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn rejects_modified_final_line_in_chain() {
+        let path = temp_path();
+        let logger = AuditLogger::open(&path).unwrap();
+        logger.record(&event("GET")).unwrap();
+        logger.record(&event("SET")).unwrap();
+        drop(logger);
+
+        let mut lines = read_lines(&path);
+        lines[1]["status"] = Value::String("error".to_string());
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| serde_json::to_string(line).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
         assert!(AuditLogger::open(&path).is_err());
         fs::remove_file(path).ok();
     }

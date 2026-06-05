@@ -172,4 +172,36 @@ mod tests {
         );
         assert_eq!(lockouts.active_lockout_count(31_200), 0);
     }
+
+    #[test]
+    fn auth_lockout_expires_and_failure_window_resets() {
+        let mut lockouts = AuthLockoutState::default();
+        let key = "alice@127.0.0.1";
+
+        assert!(!lockouts.record_failure(
+            key,
+            1_000,
+            Duration::from_secs(1),
+            2,
+            Duration::from_secs(5),
+        ));
+        assert!(!lockouts.record_failure(
+            key,
+            3_000,
+            Duration::from_secs(1),
+            2,
+            Duration::from_secs(5),
+        ));
+        assert_eq!(lockouts.remaining_lockout_seconds(key, 3_000), None);
+
+        assert!(lockouts.record_failure(
+            key,
+            3_100,
+            Duration::from_secs(1),
+            2,
+            Duration::from_secs(5),
+        ));
+        assert_eq!(lockouts.remaining_lockout_seconds(key, 8_200), None);
+        assert_eq!(lockouts.active_lockout_count(8_200), 0);
+    }
 }

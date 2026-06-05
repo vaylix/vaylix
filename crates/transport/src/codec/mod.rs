@@ -265,8 +265,12 @@ fn decode_frame_borrowing(frame: &[u8], options: CodecOptions) -> Result<Decoded
     }
 
     let payload = &buf[..payload_length];
-    if hash(payload) != header.checksum {
-        return Err(TransportError::ChecksumMismatch);
+    let actual_checksum = hash(payload);
+    if actual_checksum != header.checksum {
+        return Err(TransportError::ChecksumMismatch {
+            expected: header.checksum,
+            actual: actual_checksum,
+        });
     }
 
     if header.flags == crate::constants::FLAGS_NONE {
@@ -330,8 +334,12 @@ fn read_frame_from_with_options<R: Read>(reader: &mut R, options: CodecOptions) 
         read_exact_or_eof(reader, &mut payload)?;
     }
 
-    if hash(&payload) != header.checksum {
-        return Err(TransportError::ChecksumMismatch);
+    let actual_checksum = hash(&payload);
+    if actual_checksum != header.checksum {
+        return Err(TransportError::ChecksumMismatch {
+            expected: header.checksum,
+            actual: actual_checksum,
+        });
     }
 
     maybe_decompress(&header, payload, options)
@@ -353,8 +361,12 @@ async fn read_frame_from_async_with_options<R: AsyncRead + Unpin>(
         read_exact_or_eof_async(reader, &mut payload).await?;
     }
 
-    if hash(&payload) != header.checksum {
-        return Err(TransportError::ChecksumMismatch);
+    let actual_checksum = hash(&payload);
+    if actual_checksum != header.checksum {
+        return Err(TransportError::ChecksumMismatch {
+            expected: header.checksum,
+            actual: actual_checksum,
+        });
     }
 
     decompress_frame_payload_maybe_blocking(header, payload, options).await
@@ -548,6 +560,11 @@ mod tests {
 
     fn id(value: u128) -> Uuid {
         Uuid::from_u128(value)
+    }
+
+    fn next_fuzz_value(seed: &mut u64) -> usize {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*seed >> 32) as usize
     }
 
     struct FailingWriter;
@@ -1001,6 +1018,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_body_checksum_mismatch_with_context() {
+        let request = Request::from_command(
+            id(1),
+            Command::Get {
+                key: "name".to_string(),
+            },
+        )
+        .unwrap();
+        let mut encoded = encode_request(&request).unwrap();
+        let expected = u32::from_be_bytes(encoded[10..14].try_into().unwrap());
+        encoded[HEADER_LEN] ^= 0xff;
+        let actual = hash(&encoded[HEADER_LEN..]);
+
+        assert!(matches!(
+            decode_request(&encoded),
+            Err(TransportError::ChecksumMismatch {
+                expected: err_expected,
+                actual: err_actual,
+            }) if err_expected == expected && err_actual == actual
+        ));
+    }
+
+    #[test]
     fn propagates_reader_and_writer_io_errors() {
         let request = Request::from_command(
             id(1),
@@ -1112,5 +1152,87 @@ mod tests {
             ),
             Err(TransportError::DecompressedFrameTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn adversarial_frame_inputs_fail_without_panicking() {
+        let mut invalid_flags = Vec::from(MAGIC_BYTES);
+        invalid_flags.push(VERSION);
+        invalid_flags.push(0b1111_0000);
+        invalid_flags.extend_from_slice(&0_u32.to_be_bytes());
+        invalid_flags.extend_from_slice(&0_u32.to_be_bytes());
+
+        let mut length_overflow = Vec::from(MAGIC_BYTES);
+        length_overflow.push(VERSION);
+        length_overflow.push(0);
+        length_overflow.extend_from_slice(&u32::MAX.to_be_bytes());
+        length_overflow.extend_from_slice(&0_u32.to_be_bytes());
+
+        let payload = vec![0xff; 18];
+        let mut bad_body = Vec::from(MAGIC_BYTES);
+        bad_body.push(VERSION);
+        bad_body.push(0);
+        bad_body.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bad_body.extend_from_slice(&hash(&payload).to_be_bytes());
+        bad_body.extend_from_slice(&payload);
+
+        let cases = vec![
+            Vec::new(),
+            vec![0; HEADER_LEN - 1],
+            b"NOPE".to_vec(),
+            invalid_flags,
+            length_overflow,
+            bad_body,
+        ];
+
+        for case in cases {
+            let decoded = std::panic::catch_unwind(|| decode_request(&case));
+            assert!(decoded.is_ok(), "decode_request panicked for {case:?}");
+            assert!(decoded.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn deterministic_mutated_frames_do_not_panic_or_desynchronize() {
+        let request = Request::from_command(
+            id(77),
+            Command::Set {
+                key: "binary".to_string(),
+                value: vec![0, 159, 146, 150, 255],
+                options: SetOptions::default(),
+            },
+        )
+        .unwrap();
+        let response = Response::value_bytes(id(77), &[0, 159, 146, 150, 255]).unwrap();
+        let request_frame = encode_request(&request).unwrap();
+        let response_frame = encode_response(&response).unwrap();
+
+        fn mutate_and_decode<T>(
+            case_name: &str,
+            frame: &[u8],
+            seed: &mut u64,
+            decode: fn(&[u8]) -> Result<T, TransportError>,
+        ) {
+            for _ in 0..512 {
+                let mut mutated = frame.to_vec();
+                let mutations = 1 + (next_fuzz_value(seed) % 4);
+                for _ in 0..mutations {
+                    let index = next_fuzz_value(seed) % mutated.len();
+                    let bit = 1_u8 << (next_fuzz_value(seed) % 8);
+                    mutated[index] ^= bit;
+                }
+                if next_fuzz_value(seed).is_multiple_of(8) {
+                    let new_len = next_fuzz_value(seed) % (mutated.len() + HEADER_LEN);
+                    mutated.truncate(new_len);
+                }
+
+                let decoded = std::panic::catch_unwind(|| decode(&mutated));
+                assert!(decoded.is_ok(), "{case_name} decoder panicked");
+            }
+        }
+
+        let mut seed = 0x5754_5032_4655_5a5a_u64;
+        mutate_and_decode("request", &request_frame, &mut seed, decode_request);
+        mutate_and_decode("response", &response_frame, &mut seed, decode_response);
     }
 }

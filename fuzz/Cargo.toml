@@ -1,0 +1,46 @@
+[package]
+name = "vaylix-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+command = { path = "../crates/command" }
+engine = { path = "../crates/engine" }
+server = { path = "../crates/server" }
+transport = { path = "../crates/transport" }
+libfuzzer-sys = "0.4"
+serde_json = "1"
+
+[[bin]]
+name = "vtp_frame"
+path = "fuzz_targets/vtp_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "command_text"
+path = "fuzz_targets/command_text.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_recovery"
+path = "fuzz_targets/storage_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "replication_json"
+path = "fuzz_targets/replication_json.rs"
+test = false
+doc = false
+bench = false

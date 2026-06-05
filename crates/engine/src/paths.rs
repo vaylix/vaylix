@@ -2,7 +2,12 @@ use crate::Result;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Default durable storage root for Vaylix server data.
+/// Default durable storage root for Vaylix server data outside containers.
+///
+/// Docker images override this with `/var/lib/vaylix` through runtime
+/// environment defaults. Native and local development runs default to a
+/// project-local directory so the server remains writable without elevated
+/// privileges.
 pub const DEFAULT_DATA_DIR: &str = "./default.vaylix";
 
 /// Filesystem layout used by the engine, server, and client.
@@ -43,9 +48,9 @@ pub struct Paths {
 impl Paths {
     /// Builds the default server storage layout.
     ///
-    /// Server data intentionally defaults to `/var/lib/vaylix` rather than an
-    /// OS-specific per-user app-data path. Local development should pass
-    /// `--data-dir <path>` when the process cannot write to `/var/lib/vaylix`.
+    /// Native and local development runs intentionally default to
+    /// `./default.vaylix`. Container runtimes override this to
+    /// `/var/lib/vaylix` through environment defaults.
     pub fn new() -> Result<Self> {
         Self::from_data_dir(DEFAULT_DATA_DIR)
     }
@@ -77,7 +82,7 @@ impl Paths {
 
 #[cfg(test)]
 mod tests {
-    use super::Paths;
+    use super::{DEFAULT_DATA_DIR, Paths};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -107,5 +112,10 @@ mod tests {
                 .cluster_state_tmp_path
                 .ends_with("cluster-state.json.tmp")
         );
+    }
+
+    #[test]
+    fn server_default_data_dir_is_stable() {
+        assert_eq!(DEFAULT_DATA_DIR, "./default.vaylix");
     }
 }

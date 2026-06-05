@@ -20,8 +20,8 @@ pub enum TransportError {
     UnexpectedEof,
     #[error("corrupted payload")]
     CorruptedPayload,
-    #[error("frame checksum mismatch")]
-    ChecksumMismatch,
+    #[error("frame checksum mismatch: expected 0x{expected:08X}, got 0x{actual:08X}")]
+    ChecksumMismatch { expected: u32, actual: u32 },
     #[error("unsupported frame flags: 0x{0:02x}")]
     UnsupportedFlags(u8),
     #[error("frame compression failure")]
@@ -53,7 +53,7 @@ impl TransportError {
             Self::FrameTooLarge { .. } => "TRN-006",
             Self::UnexpectedEof => "TRN-007",
             Self::CorruptedPayload => "TRN-008",
-            Self::ChecksumMismatch => "TRN-009",
+            Self::ChecksumMismatch { .. } => "TRN-009",
             Self::UnsupportedFlags(_) => "TRN-010",
             Self::CompressionFailure => "TRN-011",
             Self::InvalidUtf8(_) => "TRN-012",
@@ -76,7 +76,7 @@ impl TransportError {
             Self::FrameTooLarge { .. } => "Frame Too Large",
             Self::UnexpectedEof => "Unexpected End Of Frame",
             Self::CorruptedPayload => "Corrupted Payload",
-            Self::ChecksumMismatch => "Checksum Mismatch",
+            Self::ChecksumMismatch { .. } => "Checksum Mismatch",
             Self::UnsupportedFlags(_) => "Unsupported Frame Flags",
             Self::CompressionFailure => "Compression Failure",
             Self::InvalidUtf8(_) => "Invalid UTF-8 Payload",

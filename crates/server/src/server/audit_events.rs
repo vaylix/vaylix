@@ -41,6 +41,10 @@ pub(super) fn auth_lockout_key(username: &str, peer_addr: Option<SocketAddr>) ->
     )
 }
 
+pub(super) fn auth_lockout_username_key(username: &str) -> String {
+    format!("{username}|*")
+}
+
 pub(super) fn opcode_name(command: &Command) -> &'static str {
     match command {
         Command::Auth { .. } => "AUTH",

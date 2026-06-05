@@ -8,7 +8,7 @@ Vaylix is a Rust database workspace centered on a transport-first architecture:
 
 `client -> transport -> TCP/TLS -> transport -> server -> engine`
 
-The current implementation is a string-to-string key/value database with:
+The current implementation is a UTF-8-key / opaque-byte-value key/value database with:
 
 - a custom framed binary protocol v2 with startup capability negotiation
 - a shared transport crate used by both client and server
@@ -137,6 +137,7 @@ Current negotiated capabilities:
 
 Protocol `0.2.x`, `0.3.x`, and `0.4.x` intentionally reject pre-v2 frames. `0.1.0` clients and servers are not wire-compatible with `0.2.0+`.
 Within protocol v2, `0.3.0` changes successful `EXEC` responses from a lossy string list to a structured typed result payload. `0.2.x` clients are therefore not transaction-wire-compatible with `0.3.0+` servers.
+Parser hardening is covered by deterministic malformed-frame tests and a bounded `cargo-fuzz` target under `fuzz/`.
 
 ### Request IDs
 
@@ -330,6 +331,9 @@ WAL management:
 - the write path keeps the active segment open through a stateful writer instead of reopening and rediscovering the active segment for every append
 - WAL append/flush/sync work runs behind a dedicated WAL I/O worker while sequence assignment remains in the engine coordinator
 - in-memory WAL entry term/checksum identities are cached for replication metadata lookups
+- WAL recovery rejects ambiguous layouts with multiple active segment files
+- Snapshot, manifest, and keyring replacement share a private durable engine-store helper
+- Unix snapshot, manifest, keyring, WAL segment, and cluster-state rename/create paths sync the parent directory after atomic replacement
 - eligible standalone writes may be appended as bounded batches; `flush` and `sync` modes must not acknowledge a write before the configured batch durability boundary completes
 - runtime controls:
   - `--wal-segment-size-bytes`
@@ -350,7 +354,7 @@ Vaylix also supports logical backups through database commands:
 - `RESTORE CHECK <logical-dump-json>`
 - `RESTORE CHECK FROM <path>`
 
-`BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live string key/value entries, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
+`BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live key/byte-value entries, stored value versions, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
 
 `RESTORE` accepts the logical JSON dump and replaces the current keyspace with live dump entries through one WAL-backed atomic engine batch. Entries whose absolute expiration timestamp is already in the past are skipped. This is separate from physical `SAVE` / `SNAPSHOT`, which persist the local node’s encrypted snapshot and flush/rotate the WAL.
 
@@ -391,7 +395,7 @@ Vaylix also supports logical backups through database commands:
 - `RESTORE CHECK <logical-dump-json>`
 - `RESTORE CHECK FROM <path>`
 
-`BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live string key/value entries, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
+`BACKUP` returns a JSON dump containing format version, creation timestamp, source engine metadata, live key/byte-value entries, stored value versions, and absolute expiration timestamps. It is online: the server remains available, but the engine worker serializes the backup against one consistent purged in-memory view, so later engine requests wait in queue until the dump is produced.
 
 `RESTORE` accepts the logical JSON dump and replaces the current keyspace with live dump entries through one WAL-backed atomic engine batch. Entries whose absolute expiration timestamp is already in the past are skipped. This is separate from physical `SAVE` / `SNAPSHOT`, which persist the local node’s encrypted snapshot and flush/rotate the WAL.
 
@@ -458,6 +462,7 @@ Current state:
 - pre-vote, majority election, heartbeats, append entries, snapshot install, and automatic leader failover
 - quorum-backed write acknowledgement by default through the `replica` / `majority` mode
 - follower-side catch-up through append entries, retained WAL history, and snapshot bootstrap fallback
+- consensus vote and heartbeat RPCs from unknown non-voter node IDs are rejected before term or membership mutation
 - leader commit waiters are notified on commit-index advancement rather than relying only on fixed polling sleeps
 - no sharding
 
@@ -567,8 +572,8 @@ The local `help` command is formatted as a readable command reference with gramm
 
 ## Packaging, Docker, and Data Directory
 
-- default container/server data directory: `/var/lib/vaylix`
-- default server data directory in all runtimes: `/var/lib/vaylix`
+- default native/local server data directory: `./default.vaylix`
+- default container data directory: `/var/lib/vaylix`
 - intended Docker volume mount:
   - `-v vaylix-data:/var/lib/vaylix`
 - runtime container base: Debian 13 distroless `gcr.io/distroless/cc-debian13`
@@ -586,22 +591,22 @@ This path is the durable storage root for:
 
 The image starts `vaylix-init` as root only to create `VAYLIX_DATA_DIR` / `VAYLIX_BACKUP_DIR`, recursively repair data-directory ownership for Linux bind mounts, then call `setgid`, `setuid`, and `exec` the real `vaylix` server command. Do not replace this with a shell entrypoint; the runtime image is distroless and intentionally has no shell or package manager.
 
-Do not reintroduce a server default based on per-user OS project directories. Server storage is durable database state and must default to `/var/lib/vaylix`; local development should pass `--data-dir ./vaylix-data` or another explicit writable path. Client-local state such as REPL history may continue to use user-space project directories.
+Do not reintroduce per-user OS project directories for server storage. Native/local server runs default to `./default.vaylix`; Docker images override `VAYLIX_DATA_DIR` to `/var/lib/vaylix`. Client-local state such as REPL history may continue to use user-space project directories.
 
 ## CI and Release
 
 Pull request CI runs:
 
 - `cargo fmt --check`
-- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `cargo test --workspace`
-- `cargo audit`
+- `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
+- `cargo test --locked --workspace`
+- `cargo audit --file Cargo.lock`
 
 Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.8.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.9.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 
@@ -622,3 +627,6 @@ Release workflow goal:
 - do not reintroduce a user-facing raw `data_key` CLI argument
 - prefer UUID-based request tracking consistently
 - add tests for any protocol, persistence, auth, TLS, or workflow change
+- Native and local server runs default to `./default.vaylix`.
+- Docker images override the server data root to `/var/lib/vaylix`.
+- `--data-dir` and `VAYLIX_DATA_DIR` remain the authoritative overrides in both environments.

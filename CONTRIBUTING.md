@@ -6,6 +6,7 @@ Vaylix is a systems project. Contributions are expected to be explicit, test-bac
 
 - read [README.md](README.md)
 - read [LLM.md](LLM.md)
+- read [STABILITY.md](STABILITY.md), [COMPATIBILITY_1_0.md](COMPATIBILITY_1_0.md), [NON_GOALS.md](NON_GOALS.md), and [DEPLOYMENT.md](DEPLOYMENT.md)
 - search for existing issues or open discussions
 - open a design discussion first for protocol, persistence-format, auth, TLS, or architectural changes
 
@@ -24,7 +25,7 @@ Vaylix is a systems project. Contributions are expected to be explicit, test-bac
 Build:
 
 ```bash
-cargo build --workspace
+cargo build --locked --workspace
 ```
 
 Format:
@@ -36,13 +37,24 @@ cargo fmt --check
 Lint:
 
 ```bash
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
 Test:
 
 ```bash
-cargo test --workspace
+cargo test --locked --workspace
+```
+
+Fuzz smoke:
+
+```bash
+cargo check --manifest-path fuzz/Cargo.toml
+cd fuzz
+cargo +nightly fuzz run vtp_frame -- -runs=4096
+cargo +nightly fuzz run command_text -- -runs=4096
+cargo +nightly fuzz run storage_recovery -- -runs=2048
+cargo +nightly fuzz run replication_json -- -runs=4096
 ```
 
 ## What Reviewers Expect
@@ -71,6 +83,7 @@ At minimum, relevant changes should include:
 - unit tests for the changed logic
 - integration tests when networking, auth, or TLS behavior changes
 - corruption or recovery tests when persistence changes
+- fuzz or adversarial parser/recovery coverage when transport, command parsing, replication payloads, or storage recovery paths change
 
 If test coverage is intentionally incomplete, state that clearly in the PR description.
 
@@ -102,7 +115,7 @@ Keep local benchmark measurements out of committed docs unless a release explici
 ## Current Project Reality
 
 Contributors should not overstate current capability. The codebase is still:
-- string-value only
+- UTF-8-key / opaque-byte-value only
 - centered on single-region HA replication, not sharding
 - without MVCC, distributed ACID guarantees, or linearizable follower reads
 

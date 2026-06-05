@@ -371,6 +371,7 @@ impl WalWriter {
             sealed_segment_path(&self.wal_dir, self.active.start_sequence, last_sequence);
         drop(self.file.take());
         fs::rename(active_path, sealed_path)?;
+        sync_dir(&self.wal_dir)?;
 
         let next_start = last_sequence.saturating_add(1);
         let next_path = self.wal_dir.join(format!("active-{next_start}.wal"));
@@ -378,6 +379,8 @@ impl WalWriter {
             .create(true)
             .append(true)
             .open(&next_path)?;
+        file.sync_all()?;
+        sync_dir(&self.wal_dir)?;
         self.active = SegmentFile {
             path: next_path,
             start_sequence: next_start,
@@ -408,7 +411,8 @@ pub fn create_active_segment(wal_dir: &Path, start_sequence: u64) -> Result<()> 
     fs::create_dir_all(wal_dir)?;
     let path = wal_dir.join(format!("active-{start_sequence}.wal"));
     if !path.exists() {
-        File::create(path)?;
+        File::create(path)?.sync_all()?;
+        sync_dir(wal_dir)?;
     }
     Ok(())
 }
@@ -502,6 +506,7 @@ pub fn seal_active(wal_dir: &Path, keyring: Option<&StorageKeyring>) -> Result<O
         .unwrap_or(active.start_sequence);
     let sealed_path = sealed_segment_path(wal_dir, active.start_sequence, end_sequence);
     fs::rename(&active.path, sealed_path)?;
+    sync_dir(wal_dir)?;
     Ok(Some((active.start_sequence, end_sequence)))
 }
 
@@ -619,6 +624,17 @@ fn sealed_segment_path(wal_dir: &Path, start_sequence: u64, end_sequence: u64) -
     wal_dir.join(format!("{start_sequence}-{end_sequence}.wal"))
 }
 
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn active_segment_file(wal_dir: &Path) -> Result<Option<SegmentFile>> {
     let mut active = list_segments(wal_dir)?
         .into_iter()
@@ -682,6 +698,13 @@ fn replay_segments(
     segments: &[SegmentFile],
     keyring: Option<&StorageKeyring>,
 ) -> Result<WalReplay> {
+    let active_count = segments.iter().filter(|segment| segment.active).count();
+    if active_count > 1 {
+        return Err(EngineError::WalDeserialize(format!(
+            "ambiguous WAL layout: found {active_count} active segments"
+        )));
+    }
+
     let mut entries = Vec::new();
     let mut expected_sequence = None;
 
@@ -839,8 +862,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        WalEntry, WalOperation, WalReplayTarget, WalWriter, append, inspect, migrate_legacy,
-        replay, replay_until, seal_active, sealed_segment_path,
+        WalEntry, WalOperation, WalReplayTarget, WalWriter, append, append_encoded_entry, inspect,
+        migrate_legacy, replay, replay_until, seal_active, sealed_segment_path,
     };
     use crate::WalSyncPolicy;
 
@@ -1075,6 +1098,34 @@ mod tests {
         fs::write(&active_path, bytes).unwrap();
 
         assert!(replay(&wal_dir, Some(&keyring)).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn rejects_multiple_active_segments_as_ambiguous_recovery_state() {
+        let root = temp_dir("wal-multiple-active");
+        let wal_dir = root.join("wal");
+        let keyring = keyring("wal-key");
+        fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut first = WalWriter::open(&wal_dir, WalSyncPolicy::Flush, 1024, 1).unwrap();
+        first.append(&sample_entry(1), Some(&keyring)).unwrap();
+        drop(first);
+
+        let mut second = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(wal_dir.join("active-2.wal"))
+            .unwrap();
+        append_encoded_entry(&mut second, &sample_entry(2), Some(&keyring)).unwrap();
+        second.flush().unwrap();
+
+        let err = replay(&wal_dir, Some(&keyring)).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous WAL layout"),
+            "unexpected error: {err}"
+        );
 
         fs::remove_dir_all(root).ok();
     }

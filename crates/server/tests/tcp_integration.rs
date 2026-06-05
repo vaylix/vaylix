@@ -24,7 +24,7 @@ use server::replication::{
 use server::server::{
     CommittedReadIndex, ReplicationClientPool, ServerGuards, ServerRuntimeConfig,
 };
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 use tokio::time::{sleep, timeout};
@@ -610,6 +610,45 @@ async fn rejects_old_v1_protocol_frames_before_handshake() {
     )
     .await;
     assert!(response.is_err() || response.unwrap().is_err());
+
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn closes_idle_connections_after_negotiation_timeout() {
+    let root = temp_dir("idle-timeout");
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-test-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut runtime = runtime(None);
+    runtime.idle_timeout = Some(Duration::from_millis(50));
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime)
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let mut stream = timeout(Duration::from_secs(2), TcpStream::connect(addr))
+        .await
+        .unwrap()
+        .unwrap();
+    negotiate(&mut stream).await;
+
+    let mut byte = [0_u8; 1];
+    let read = timeout(Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0);
 
     server_task.abort();
     fs::remove_dir_all(root).ok();
@@ -1329,6 +1368,53 @@ async fn preserves_request_ids_for_pipelined_commands() {
     assert_eq!(get_response.request_id, get_id);
     assert_eq!(get_response.decode_value().unwrap(), "value");
 
+    server_task.abort();
+    fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn handles_ten_thousand_pipelined_ping_requests_without_stall() {
+    let root = temp_dir("pipelined-stress");
+    let paths = Paths::from_data_dir(&root).unwrap();
+    let engine = Engine::from_paths_with_options(
+        paths,
+        EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            keyring: Some(test_keyring("tcp-pipeline-stress-key")),
+            ..EngineOptions::default()
+        },
+    )
+    .unwrap();
+
+    let mut runtime = runtime_without_auth(None);
+    runtime.guards.requests_per_second = 20_000;
+    runtime.guards.request_burst = 20_000;
+    let server = Server::with_engine("127.0.0.1".to_string(), 0, 16, engine, runtime)
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let server_task = tokio::spawn(async move { server.start().await });
+
+    let test_result = timeout(Duration::from_secs(20), async {
+        let mut stream = connect_tcp(addr).await;
+        let mut bytes = Vec::new();
+        for index in 0..10_000_u128 {
+            let request =
+                Request::from_command(id(index), Command::Ping { message: None }).unwrap();
+            bytes.extend_from_slice(&transport::encode_request(&request).unwrap());
+        }
+        stream.write_all(&bytes).await.unwrap();
+        stream.flush().await.unwrap();
+
+        for index in 0..10_000_u128 {
+            let response = read_response_from_async(&mut stream).await.unwrap();
+            assert_eq!(response.request_id, id(index));
+            assert_eq!(response.status, Status::Ok);
+        }
+    })
+    .await;
+
+    assert!(test_result.is_ok(), "pipelined request stress timed out");
     server_task.abort();
     fs::remove_dir_all(root).ok();
 }

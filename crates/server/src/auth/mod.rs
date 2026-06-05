@@ -875,6 +875,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn wildcard_grants_do_not_cover_unmatched_prefixes() {
+        let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
+        auth.create_user("alice".to_string(), "password1234".to_string())
+            .await
+            .unwrap();
+        auth.create_role("app_reader".to_string()).await.unwrap();
+        auth.grant_permission(Permission::Read, "app:*:prod".to_string(), "app_reader")
+            .await
+            .unwrap();
+        auth.grant_role("app_reader", "alice").await.unwrap();
+
+        let identity = auth.verify("alice", "password1234").await.unwrap().unwrap();
+        assert!(identity.allows_key(Permission::Read, "app:one:prod"));
+        assert!(!identity.allows_key(Permission::Read, "app:one:dev"));
+        assert!(!identity.allows_key(Permission::Read, "platform:one:prod"));
+        assert!(!identity.allows_pattern(Permission::Read, "*"));
+    }
+
+    #[tokio::test]
+    async fn unicode_distinct_usernames_do_not_alias() {
+        let composed = "é".to_string();
+        let decomposed = "e\u{301}".to_string();
+        let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
+        auth.create_user(composed.clone(), "password1234".to_string())
+            .await
+            .unwrap();
+        auth.create_user(decomposed.clone(), "password5678".to_string())
+            .await
+            .unwrap();
+
+        assert!(
+            auth.verify(&composed, "password1234")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            auth.verify(&composed, "password5678")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            auth.verify(&decomposed, "password5678")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            auth.verify(&decomposed, "password1234")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_password_and_role_mutation_preserves_admin_access() {
+        let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
+        auth.create_user("alice".to_string(), "password0000".to_string())
+            .await
+            .unwrap();
+
+        let password_auth = auth.clone();
+        let password_task = tokio::spawn(async move {
+            for index in 1..=20 {
+                password_auth
+                    .alter_user_password("alice", format!("password{index:04}"))
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let role_auth = auth.clone();
+        let role_task = tokio::spawn(async move {
+            for index in 0..20 {
+                let role = format!("role-{index:02}");
+                role_auth.create_role(role.clone()).await.unwrap();
+                role_auth
+                    .grant_permission(Permission::Read, format!("tenant-{index}:*"), &role)
+                    .await
+                    .unwrap();
+                role_auth.grant_role(&role, "alice").await.unwrap();
+            }
+        });
+
+        password_task.await.unwrap();
+        role_task.await.unwrap();
+
+        assert!(auth.verify("root", "secret").await.unwrap().is_some());
+        assert!(
+            auth.verify("alice", "password0020")
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn rotates_password_for_future_auth_attempts() {
         let auth = AuthConfig::new("root".to_string(), "secret".to_string()).unwrap();
         auth.create_user("alice".to_string(), "oldpassword1234".to_string())

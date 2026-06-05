@@ -10,6 +10,7 @@ The current server stores UTF-8 keys with opaque byte values using segmented WAL
 
 Detailed architecture context lives in [LLM.md](LLM.md).
 Benchmark guidance lives in [BENCHMARKING.md](BENCHMARKING.md).
+Stability and compatibility contracts live in [STABILITY.md](STABILITY.md), [COMPATIBILITY_1_0.md](COMPATIBILITY_1_0.md), [ERROR_CODES.md](ERROR_CODES.md), [NON_GOALS.md](NON_GOALS.md), and [DEPLOYMENT.md](DEPLOYMENT.md).
 
 ## Downloads
 
@@ -17,7 +18,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.8.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.9.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -39,7 +40,7 @@ Mount `/var/lib/vaylix` for persistence. The data directory contains snapshots, 
 
 The published container uses a Debian 13 distroless runtime. It starts through the image-internal `vaylix-init` binary as root only long enough to create and repair ownership for `VAYLIX_DATA_DIR` and `VAYLIX_BACKUP_DIR`, then drops privileges and execs the server as UID/GID `65532`. This keeps Linux bind mounts working without manual host `chown` while keeping the database process unprivileged.
 
-The server data directory defaults to `/var/lib/vaylix` in every runtime. Use `--data-dir` or `VAYLIX_DATA_DIR` only when an operator-controlled mount policy requires a different durable path. The interactive client still stores local history under the OS user data directory.
+Native and local server runs default to `./default.vaylix`. Published Docker images override `VAYLIX_DATA_DIR` to `/var/lib/vaylix`. Use `--data-dir` or `VAYLIX_DATA_DIR` when an operator-controlled mount policy requires a different durable path. The interactive client still stores local history under the OS user data directory.
 
 Useful runtime environment variables for containers:
 
@@ -115,7 +116,7 @@ are deterministic non-mutating conditional-write failures.
 
 ## High Availability
 
-Vaylix 0.8.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
+Vaylix 0.9.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
 
 Recommended production shape:
 
@@ -187,15 +188,15 @@ Require mTLS by adding `--tls-client-ca` on the server and `--tls-client-cert` /
 ## Build from Source
 
 ```bash
-cargo build --workspace
-cargo test --workspace
+cargo build --locked --workspace
+cargo test --locked --workspace
 ```
 
 Release binaries:
 
 ```bash
-cargo build --release -p server
-cargo build --release -p client
+cargo build --locked --release -p server
+cargo build --locked --release -p client
 ```
 
 Benchmarking:
@@ -222,9 +223,20 @@ Quality gates:
 
 ```bash
 cargo fmt --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
-cargo audit
+cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace
+cargo check --manifest-path fuzz/Cargo.toml
+cargo audit --file Cargo.lock
+```
+
+Fuzz smoke:
+
+```bash
+cd fuzz
+cargo +nightly fuzz run vtp_frame -- -runs=4096
+cargo +nightly fuzz run command_text -- -runs=4096
+cargo +nightly fuzz run storage_recovery -- -runs=2048
+cargo +nightly fuzz run replication_json -- -runs=4096
 ```
 
 ## Essential Notes
@@ -244,3 +256,9 @@ cargo audit
 - Audit JSONL records are SHA-256 hash chained and verified on startup. This is tamper-evident logging, not non-repudiation without external anchoring.
 - HA writes should use the default quorum acknowledgement mode. `local` acknowledgement is for explicitly weaker development or disaster-recovery workflows.
 - Vaylix does not implement sharding, MVCC, distributed ACID transactions, or linearizable follower reads.
+
+## Storage Defaults
+
+- Native and local server runs default to `./default.vaylix`.
+- Docker images override the server data root to `/var/lib/vaylix`.
+- `--data-dir` and `VAYLIX_DATA_DIR` remain the authoritative overrides in both environments.

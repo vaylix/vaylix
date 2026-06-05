@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-05
+
+### Added
+
+- Added stability and compatibility contract documents for the 1.0 freeze path: `STABILITY.md`, `COMPATIBILITY_1_0.md`, `NON_GOALS.md`, and `DEPLOYMENT.md`.
+- Added `ERROR_CODES.md` as the canonical client-facing error-code contract.
+- Added embedded server git SHA reporting through `INFO` as `server.git_sha`.
+- Added deterministic replication hardening tests for bounded follower commit advancement, stale-candidate rejection, minority partition behavior, seeded five-node churn invariants, and explicit 3/5-node simulated partition events.
+- Added adversarial and deterministic mutation VTP frame tests proving malformed inputs fail without parser panics.
+- Added a `cargo-fuzz` VTP2 frame fuzz target and bounded CI smoke run.
+- Added fail-closed recovery tests for truncated WAL payloads, interrupted snapshot/manifest temp files, missing snapshots with manifests, and manifest/snapshot sequence mismatches.
+- Added consensus membership regression tests proving unknown candidates and leaders cannot inflate terms or mutate membership through vote/heartbeat RPCs.
+- Added auth/RBAC abuse tests for wildcard boundaries, Unicode-distinct usernames, and concurrent password/role mutation.
+- Added TLS hardening tests for expired certificates and failed reload preserving the active server config.
+- Added TCP idle-timeout coverage for negotiated connections that stop before sending a request and 10k pipelined request progress coverage.
+- Added an opt-in `runtime-invariants` server feature for debug assertions around replication commit/applied index safety.
+- Added a private durable replacement helper for snapshot, manifest, and keyring writes.
+
+### Changed
+
+- Bumped all workspace crates to `0.9.0`.
+- Tightened CI and release build commands to use `cargo --locked` for reproducible dependency resolution.
+- Documented storage, protocol, error-code, INFO, METRICS, deployment, and non-goal compatibility boundaries for pre-1.0 lockdown.
+- Restored the native server default data directory to `./default.vaylix` while keeping Docker images on `/var/lib/vaylix` through `VAYLIX_DATA_DIR`.
+- Documented authentication lockout as process-local, with per-peer and username-wide enforcement during one server process lifetime.
+
+### Fixed
+
+- Fixed follower commit advancement so leader heartbeats and leader status updates cannot mark entries committed beyond the follower's local applied log.
+- Fixed recovery so a manifest cannot silently advance the snapshot baseline unless the snapshot payload, checksum, size, and embedded sequence match the manifest.
+- Fixed consensus vote and heartbeat handling so unknown non-voter node IDs are rejected before term or membership mutation.
+- Fixed WAL replay to fail closed when multiple active segment files make recovery state ambiguous.
+- Fixed Unix snapshot, manifest, keyring, WAL segment, and cluster-state replacement paths to fsync parent directories after atomic rename/create operations.
+- Fixed replication simulation temp paths to use UUIDs instead of timestamp-only names under parallel test execution.
+- Fixed backup and generated manifest writes to reject final symlink escapes before writing, using `O_NOFOLLOW` on Unix.
+- Fixed auth lockout to add a username-wide fallback after repeated peer-rotated failures.
+- Fixed transport checksum mismatch errors to report expected and actual checksums while preserving `TRN-009`.
+
 ## [0.8.0] - 2026-06-04
 
 ### Added
