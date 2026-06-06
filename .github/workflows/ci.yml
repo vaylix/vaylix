@@ -32,6 +32,8 @@ jobs:
 
       - name: Install nightly toolchain for fuzz smoke
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
 
       - name: Install cargo-fuzz
         uses: taiki-e/install-action@v2
@@ -39,12 +41,15 @@ jobs:
           tool: cargo-fuzz
 
       - name: Run bounded fuzz smokes
+        env:
+          FUZZ_TARGET: x86_64-unknown-linux-gnu
         run: |
+          unset CARGO_BUILD_TARGET
           cd fuzz
-          cargo +nightly fuzz run vtp_frame -- -runs=2048
-          cargo +nightly fuzz run command_text -- -runs=2048
-          cargo +nightly fuzz run storage_recovery -- -runs=1024
-          cargo +nightly fuzz run replication_json -- -runs=2048
+          cargo +nightly fuzz run --target "${FUZZ_TARGET}" vtp_frame -- -runs=2048
+          cargo +nightly fuzz run --target "${FUZZ_TARGET}" command_text -- -runs=2048
+          cargo +nightly fuzz run --target "${FUZZ_TARGET}" storage_recovery -- -runs=1024
+          cargo +nightly fuzz run --target "${FUZZ_TARGET}" replication_json -- -runs=2048
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@v2
