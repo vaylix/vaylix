@@ -190,3 +190,67 @@ fn now_millis() -> u64 {
         .unwrap_or(Duration::from_secs(0))
         .as_millis() as u64
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{TlsState, load_server_config};
+    use rcgen::{CertificateParams, KeyPair, date_time_ymd};
+    use std::fs;
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vaylix-tls-{name}-{unique}"))
+    }
+
+    fn write_cert(
+        root: &std::path::Path,
+        name: &str,
+        expired: bool,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        fs::create_dir_all(root).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        if expired {
+            params.not_before = date_time_ymd(2019, 1, 1);
+            params.not_after = date_time_ymd(2020, 1, 1);
+        }
+        let cert = params.self_signed(&key).unwrap();
+        let cert_path = root.join(format!("{name}.crt"));
+        let key_path = root.join(format!("{name}.key"));
+        fs::write(&cert_path, cert.pem().as_bytes()).unwrap();
+        fs::write(&key_path, key.serialize_pem().as_bytes()).unwrap();
+        (cert_path, key_path)
+    }
+
+    #[test]
+    fn rejects_expired_server_certificate() {
+        let root = temp_dir("expired");
+        let (cert_path, key_path) = write_cert(&root, "server", true);
+
+        assert!(load_server_config(&cert_path, &key_path, None).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_reload_preserves_active_server_config() {
+        let root = temp_dir("reload-failure");
+        let (cert_path, key_path) = write_cert(&root, "server", false);
+        let state = TlsState::load(&cert_path, &key_path, None).unwrap();
+        let previous = state.server_config().await;
+
+        fs::write(&key_path, b"not a private key").unwrap();
+        assert!(state.reload().await.is_err());
+
+        let current = state.server_config().await;
+        let metadata = state.metadata_snapshot().await;
+        assert!(Arc::ptr_eq(&previous, &current));
+        assert!(metadata.last_reload_failure_at_ms.is_some());
+        assert!(metadata.last_reload_success_at_ms.is_none());
+        fs::remove_dir_all(root).ok();
+    }
+}

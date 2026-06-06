@@ -2,13 +2,13 @@ use crate::config::{StorageKey, StorageKeyring};
 use crate::{EngineError, Result};
 use rand::random;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{ErrorKind, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-use super::binary;
+use super::{binary, durable};
 
 const DEFAULT_SECRET_BYTES: usize = 32;
 const DEFAULT_ROTATION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -29,15 +29,17 @@ struct StoredKeyring {
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
+        .unwrap_or_default()
         .as_millis() as u64
 }
 
 fn random_secret() -> String {
     let bytes = random::<[u8; DEFAULT_SECRET_BYTES]>();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
-        encoded.push_str(&format!("{byte:02x}"));
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
 }
@@ -83,12 +85,7 @@ fn from_runtime(keyring: &StorageKeyring) -> StoredKeyring {
 pub fn save(keyring: &StorageKeyring, path: &Path, temp_path: &Path) -> Result<()> {
     let bytes = binary::encode(&from_runtime(keyring))
         .map_err(|err| EngineError::ManifestSerialize(err.to_string()))?;
-    let mut file = File::create(temp_path)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temp_path, path)?;
-    File::open(path)?.sync_all()?;
-    Ok(())
+    durable::atomic_replace(path, temp_path, &bytes)
 }
 
 pub fn load(path: &Path) -> Result<Option<StorageKeyring>> {
@@ -139,7 +136,7 @@ pub fn rotate_if_due(path: &Path, temp_path: &Path, keyring: &mut StorageKeyring
 
 #[cfg(test)]
 mod tests {
-    use super::{load_or_create, rotate_if_due};
+    use super::{DEFAULT_SECRET_BYTES, load_or_create, random_secret, rotate_if_due};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -173,5 +170,13 @@ mod tests {
         assert_eq!(keyring.previous.len(), 1);
         fs::remove_file(path).ok();
         fs::remove_file(temp).ok();
+    }
+
+    #[test]
+    fn generated_secret_is_lowercase_hex() {
+        let secret = random_secret();
+        assert_eq!(secret.len(), DEFAULT_SECRET_BYTES * 2);
+        assert!(secret.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(!secret.bytes().any(|byte| byte.is_ascii_uppercase()));
     }
 }

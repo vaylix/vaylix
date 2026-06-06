@@ -538,6 +538,22 @@ impl ReplicationRuntime {
         self.notify_commit_if_advanced(previous_commit_sequence, &state);
     }
 
+    /// Advances follower-visible commit state after local log application.
+    ///
+    /// A follower must never report a committed position beyond the entries it
+    /// has durably applied locally; leader commit observations are therefore
+    /// bounded by `local_last_applied_sequence`.
+    pub async fn observe_leader_commit(&self, leader_commit_sequence: u64) {
+        let mut state = self.state.lock().await;
+        if state.role == ReplicationRole::Leader || state.role == ReplicationRole::Standalone {
+            return;
+        }
+        let previous_commit_sequence = state.commit_sequence;
+        let bounded_commit = leader_commit_sequence.min(state.local_last_applied_sequence);
+        state.commit_sequence = state.commit_sequence.max(bounded_commit);
+        self.notify_commit_if_advanced(previous_commit_sequence, &state);
+    }
+
     pub async fn update_follower_phase(
         &self,
         phase: FollowerPhase,
@@ -798,6 +814,23 @@ impl ReplicationRuntime {
 
     pub async fn handle_vote_request(&self, request: VoteRequest) -> Result<VoteResponse> {
         let mut state = self.state.lock().await;
+        if !is_voting_member(&state, &request.candidate_node_id) {
+            log_event(
+                "WARN",
+                "server.consensus",
+                &format!(
+                    "vote reject node={} candidate={} request_term={} local_term={} reason=unknown_candidate",
+                    self.config.node_id,
+                    request.candidate_node_id,
+                    request.term,
+                    state.current_term
+                ),
+            );
+            return Ok(VoteResponse {
+                term: state.current_term,
+                vote_granted: false,
+            });
+        }
         let local_log_term = state.local_last_applied_term.unwrap_or(0);
         let request_log_term = request.last_log_term.unwrap_or(0);
         let up_to_date = request_log_term > local_log_term
@@ -993,6 +1026,20 @@ impl ReplicationRuntime {
 
     pub async fn handle_heartbeat(&self, request: HeartbeatRequest) -> Result<HeartbeatResponse> {
         let mut state = self.state.lock().await;
+        if !is_voting_member(&state, &request.leader_node_id) {
+            log_event(
+                "WARN",
+                "server.consensus",
+                &format!(
+                    "heartbeat reject node={} leader={} request_term={} local_term={} reason=unknown_leader",
+                    self.config.node_id, request.leader_node_id, request.term, state.current_term
+                ),
+            );
+            return Ok(HeartbeatResponse {
+                term: state.current_term,
+                accepted: false,
+            });
+        }
         if request.term < state.current_term {
             return Ok(HeartbeatResponse {
                 term: state.current_term,
@@ -1013,7 +1060,10 @@ impl ReplicationRuntime {
         state.leader_node_id = Some(request.leader_node_id.clone());
         state.leader_advertise_addr = Some(request.leader_addr.clone());
         let previous_commit_sequence = state.commit_sequence;
-        state.commit_sequence = state.commit_sequence.max(request.commit_sequence);
+        let bounded_commit = request
+            .commit_sequence
+            .min(state.local_last_applied_sequence);
+        state.commit_sequence = state.commit_sequence.max(bounded_commit);
         state.leader_target_sequence = state.leader_target_sequence.max(
             request
                 .leader_frontier_sequence
@@ -1074,7 +1124,8 @@ impl ReplicationRuntime {
         state.leader_node_id = Some(leader_node_id);
         state.leader_advertise_addr = leader_addr;
         let previous_commit_sequence = state.commit_sequence;
-        state.commit_sequence = state.commit_sequence.max(commit_sequence);
+        let bounded_commit = commit_sequence.min(state.local_last_applied_sequence);
+        state.commit_sequence = state.commit_sequence.max(bounded_commit);
         state.leader_target_sequence = state
             .leader_target_sequence
             .max(leader_frontier_sequence.max(commit_sequence));
@@ -1213,6 +1264,7 @@ impl ReplicationRuntime {
     }
 
     fn notify_commit_if_advanced(&self, previous_commit_sequence: u64, state: &ReplicationState) {
+        assert_runtime_invariants(state);
         if state.commit_sequence > previous_commit_sequence {
             self.commit_notify.notify_waiters();
         }
@@ -1245,6 +1297,7 @@ impl ReplicationRuntime {
 
     pub async fn snapshot(&self) -> ReplicationStatusSnapshot {
         let state = self.state.lock().await;
+        assert_runtime_invariants(&state);
         let now = Instant::now();
         let followers = state
             .followers
@@ -1315,17 +1368,48 @@ fn default_true() -> bool {
     true
 }
 
+fn is_voting_member(state: &ReplicationState, node_id: &str) -> bool {
+    state
+        .members
+        .get(node_id)
+        .is_some_and(|member| member.voter)
+}
+
+#[cfg(feature = "runtime-invariants")]
+fn assert_runtime_invariants(state: &ReplicationState) {
+    // Consensus safety requires commit visibility to be bounded by local durable
+    // application. A follower may observe a higher leader frontier, but it must
+    // not publish that frontier as committed until its own log has caught up.
+    debug_assert!(
+        state.commit_sequence <= state.local_last_applied_sequence,
+        "commit index exceeded local applied index"
+    );
+    if state.role == ReplicationRole::Standalone {
+        debug_assert_eq!(
+            state.commit_sequence, state.local_last_applied_sequence,
+            "standalone nodes commit exactly what they apply locally"
+        );
+    }
+    if state.role == ReplicationRole::Candidate {
+        debug_assert!(
+            state.voted_for.is_some(),
+            "candidate must record its vote for the active term"
+        );
+    }
+}
+
+#[cfg(not(feature = "runtime-invariants"))]
+fn assert_runtime_invariants(_: &ReplicationState) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     fn temp_state_path(label: &str) -> (PathBuf, PathBuf) {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
+        let unique = Uuid::now_v7();
         let root = std::env::temp_dir().join(format!("vaylix-repl-test-{label}-{unique}"));
         (
             root.join("cluster-state.json"),
@@ -1334,6 +1418,10 @@ mod tests {
     }
 
     fn test_runtime(node_id: &str) -> ReplicationRuntime {
+        test_runtime_with_members(node_id, &["node-1", "node-2", "node-3"])
+    }
+
+    fn test_runtime_with_members(node_id: &str, node_ids: &[&str]) -> ReplicationRuntime {
         let (state_path, state_tmp_path) = temp_state_path(node_id);
         ReplicationRuntime::new(ReplicationConfig {
             node_id: node_id.to_string(),
@@ -1353,25 +1441,327 @@ mod tests {
             election_timeout_max: Duration::from_millis(300),
             state_path,
             state_tmp_path,
-            initial_members: vec![
-                ClusterMember {
-                    node_id: "node-1".to_string(),
-                    advertise_addr: "node-1.local:9173".to_string(),
+            initial_members: node_ids
+                .iter()
+                .map(|node_id| ClusterMember {
+                    node_id: (*node_id).to_string(),
+                    advertise_addr: format!("{node_id}.local:9173"),
                     voter: true,
-                },
-                ClusterMember {
-                    node_id: "node-2".to_string(),
-                    advertise_addr: "node-2.local:9173".to_string(),
-                    voter: true,
-                },
-                ClusterMember {
-                    node_id: "node-3".to_string(),
-                    advertise_addr: "node-3.local:9173".to_string(),
-                    voter: true,
-                },
-            ],
+                })
+                .collect(),
         })
         .unwrap()
+    }
+
+    async fn elect_with_reachable(
+        candidate: &ReplicationRuntime,
+        voters: &[&ReplicationRuntime],
+    ) -> bool {
+        let (term, members, last_log_index, last_log_term) =
+            candidate.begin_election().await.unwrap();
+        let mut votes = 1;
+        for voter in voters {
+            let response = voter
+                .handle_vote_request(VoteRequest {
+                    term,
+                    candidate_node_id: candidate.config.node_id.clone(),
+                    candidate_addr: candidate
+                        .config
+                        .advertise_addr
+                        .clone()
+                        .unwrap_or_else(|| format!("{}.local:9173", candidate.config.node_id)),
+                    last_log_index,
+                    last_log_term,
+                    prevote: false,
+                })
+                .await
+                .unwrap();
+            if response.term > term {
+                candidate.observe_remote_term(response.term).await.unwrap();
+            }
+            votes += usize::from(response.vote_granted);
+        }
+        candidate
+            .finalize_election(term, votes, members.len())
+            .await
+            .unwrap()
+    }
+
+    async fn assert_replication_invariants(nodes: &[&ReplicationRuntime]) {
+        let mut leaders_by_term = BTreeMap::<u64, String>::new();
+        for node in nodes {
+            let snapshot = node.snapshot().await;
+            assert!(
+                snapshot.commit_sequence <= snapshot.local_last_applied_sequence,
+                "node {} commit {} exceeded local applied {}",
+                snapshot.node_id,
+                snapshot.commit_sequence,
+                snapshot.local_last_applied_sequence
+            );
+            if snapshot.role == "leader" {
+                let previous =
+                    leaders_by_term.insert(snapshot.current_term, snapshot.node_id.clone());
+                assert!(
+                    previous.is_none(),
+                    "term {} had multiple leaders: {:?} and {}",
+                    snapshot.current_term,
+                    previous,
+                    snapshot.node_id
+                );
+            }
+        }
+    }
+
+    fn next_sim_value(seed: &mut u64) -> usize {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        (*seed >> 32) as usize
+    }
+
+    struct SimulatedCluster {
+        ids: Vec<String>,
+        nodes: BTreeMap<String, ReplicationRuntime>,
+        links: BTreeSet<(String, String)>,
+        seed: u64,
+        next_sequence: u64,
+        committed: BTreeMap<u64, u32>,
+        last_terms: BTreeMap<String, u64>,
+        last_commits: BTreeMap<String, u64>,
+    }
+
+    impl SimulatedCluster {
+        fn new(ids: &[&str], seed: u64) -> Self {
+            let nodes = ids
+                .iter()
+                .map(|node_id| {
+                    (
+                        (*node_id).to_string(),
+                        test_runtime_with_members(node_id, ids),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut cluster = Self {
+                ids: ids.iter().map(|node_id| (*node_id).to_string()).collect(),
+                nodes,
+                links: BTreeSet::new(),
+                seed,
+                next_sequence: 1,
+                committed: BTreeMap::new(),
+                last_terms: BTreeMap::new(),
+                last_commits: BTreeMap::new(),
+            };
+            cluster.heal_all();
+            cluster
+        }
+
+        fn heal_all(&mut self) {
+            self.links.clear();
+            for from in &self.ids {
+                for to in &self.ids {
+                    if from != to {
+                        self.links.insert((from.clone(), to.clone()));
+                    }
+                }
+            }
+        }
+
+        fn partition(&mut self, groups: &[&[&str]]) {
+            self.links.clear();
+            for group in groups {
+                for from in *group {
+                    for to in *group {
+                        if from != to {
+                            self.links.insert(((*from).to_string(), (*to).to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        fn reachable(&self, from: &str, to: &str) -> bool {
+            self.links.contains(&(from.to_string(), to.to_string()))
+        }
+
+        async fn try_elect(&self, candidate_id: &str) -> bool {
+            let candidate = self.nodes.get(candidate_id).unwrap();
+            let (term, members, last_log_index, last_log_term) =
+                candidate.begin_election().await.unwrap();
+            let mut votes = 1;
+            for voter_id in &self.ids {
+                if voter_id == candidate_id || !self.reachable(candidate_id, voter_id) {
+                    continue;
+                }
+                let voter = self.nodes.get(voter_id).unwrap();
+                let response = voter
+                    .handle_vote_request(VoteRequest {
+                        term,
+                        candidate_node_id: candidate_id.to_string(),
+                        candidate_addr: format!("{candidate_id}.local:9173"),
+                        last_log_index,
+                        last_log_term,
+                        prevote: false,
+                    })
+                    .await
+                    .unwrap();
+                if response.term > term {
+                    candidate.observe_remote_term(response.term).await.unwrap();
+                }
+                votes += usize::from(response.vote_granted);
+            }
+            candidate
+                .finalize_election(term, votes, members.len())
+                .await
+                .unwrap()
+        }
+
+        async fn apply_leader_write(&mut self, leader_id: &str) {
+            let leader = self.nodes.get(leader_id).unwrap();
+            if leader.snapshot().await.role != "leader" {
+                return;
+            }
+            let term = leader.current_term().await;
+            let sequence = self.next_sequence;
+            let checksum = ((sequence as u32) << 8) ^ (term as u32);
+            leader
+                .set_local_last_applied_state(sequence, Some(term), Some(checksum))
+                .await;
+            for follower_id in &self.ids {
+                if follower_id == leader_id || !self.reachable(leader_id, follower_id) {
+                    continue;
+                }
+                let follower = self.nodes.get(follower_id).unwrap();
+                follower
+                    .set_local_last_applied_state(sequence, Some(term), Some(checksum))
+                    .await;
+                leader
+                    .register_follower_ack(follower_id.clone(), sequence, term, leader_id)
+                    .await;
+            }
+            let commit = leader.snapshot().await.commit_sequence;
+            if commit >= sequence {
+                let previous = self.committed.insert(sequence, checksum);
+                assert!(
+                    previous.is_none_or(|value| value == checksum),
+                    "state machine safety violated at sequence {sequence}"
+                );
+                for follower_id in &self.ids {
+                    if follower_id != leader_id && self.reachable(leader_id, follower_id) {
+                        self.nodes
+                            .get(follower_id)
+                            .unwrap()
+                            .observe_leader_commit(sequence)
+                            .await;
+                    }
+                }
+                self.next_sequence = self.next_sequence.saturating_add(1);
+            }
+        }
+
+        async fn heartbeat_from(&self, leader_id: &str) {
+            let leader = self.nodes.get(leader_id).unwrap();
+            let leader_snapshot = leader.snapshot().await;
+            if leader_snapshot.role != "leader" {
+                return;
+            }
+            for follower_id in &self.ids {
+                if follower_id == leader_id || !self.reachable(leader_id, follower_id) {
+                    continue;
+                }
+                let heartbeat = HeartbeatRequest {
+                    term: leader_snapshot.current_term,
+                    leader_node_id: leader_id.to_string(),
+                    leader_addr: format!("{leader_id}.local:9173"),
+                    commit_sequence: leader_snapshot.commit_sequence,
+                    leader_frontier_sequence: leader_snapshot.local_last_applied_sequence,
+                    members: leader.current_members().await,
+                };
+                self.nodes
+                    .get(follower_id)
+                    .unwrap()
+                    .handle_heartbeat(heartbeat)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        async fn random_event(&mut self) {
+            match next_sim_value(&mut self.seed) % 6 {
+                0 => self.heal_all(),
+                1 => {
+                    if self.ids.len() == 3 {
+                        self.partition(&[&["node-1", "node-2"], &["node-3"]]);
+                    } else {
+                        self.partition(&[&["node-1", "node-2", "node-3"], &["node-4", "node-5"]]);
+                    }
+                }
+                2 => {
+                    let index = next_sim_value(&mut self.seed) % self.ids.len();
+                    let candidate_id = self.ids[index].clone();
+                    let _ = self.try_elect(&candidate_id).await;
+                }
+                3 => {
+                    let leaders = self.current_leaders().await;
+                    if let Some(leader_id) =
+                        leaders.get(next_sim_value(&mut self.seed) % leaders.len().max(1))
+                    {
+                        self.apply_leader_write(leader_id).await;
+                    }
+                }
+                4 => {
+                    let leaders = self.current_leaders().await;
+                    for leader_id in leaders {
+                        self.heartbeat_from(&leader_id).await;
+                    }
+                }
+                _ => {
+                    let index = next_sim_value(&mut self.seed) % self.ids.len();
+                    let node_id = self.ids[index].clone();
+                    let term = self.nodes.get(&node_id).unwrap().current_term().await + 1;
+                    self.nodes
+                        .get(&node_id)
+                        .unwrap()
+                        .observe_remote_term(term)
+                        .await
+                        .unwrap();
+                }
+            }
+            self.assert_invariants().await;
+        }
+
+        async fn current_leaders(&self) -> Vec<String> {
+            let mut leaders = Vec::new();
+            for id in &self.ids {
+                if self.nodes.get(id).unwrap().snapshot().await.role == "leader" {
+                    leaders.push(id.clone());
+                }
+            }
+            leaders
+        }
+
+        async fn assert_invariants(&mut self) {
+            let refs = self.nodes.values().collect::<Vec<_>>();
+            assert_replication_invariants(&refs).await;
+            for node in self.nodes.values() {
+                let snapshot = node.snapshot().await;
+                let previous_term = self
+                    .last_terms
+                    .insert(snapshot.node_id.clone(), snapshot.current_term)
+                    .unwrap_or(0);
+                assert!(
+                    snapshot.current_term >= previous_term,
+                    "term regressed for {}",
+                    snapshot.node_id
+                );
+                let previous_commit = self
+                    .last_commits
+                    .insert(snapshot.node_id.clone(), snapshot.commit_sequence)
+                    .unwrap_or(0);
+                assert!(
+                    snapshot.commit_sequence >= previous_commit,
+                    "commit regressed for {}",
+                    snapshot.node_id
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1448,6 +1838,407 @@ mod tests {
         assert_eq!(snapshot.role, "follower");
         assert_eq!(snapshot.current_term, 5);
         assert_eq!(snapshot.leader_node_id.as_deref(), Some("node-1"));
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_candidate_without_term_inflation_or_membership_mutation() {
+        let runtime = test_runtime("node-2");
+
+        let response = runtime
+            .handle_vote_request(VoteRequest {
+                term: 9,
+                candidate_node_id: "node-99".to_string(),
+                candidate_addr: "node-99.local:9173".to_string(),
+                last_log_index: 100,
+                last_log_term: Some(9),
+                prevote: false,
+            })
+            .await
+            .unwrap();
+
+        assert!(!response.vote_granted);
+        assert_eq!(response.term, 0);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.current_term, 0);
+        assert_eq!(snapshot.role, "follower");
+        assert!(
+            snapshot
+                .members
+                .iter()
+                .all(|member| member.node_id != "node-99")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_leader_heartbeat_without_term_inflation_or_membership_mutation() {
+        let runtime = test_runtime("node-2");
+
+        let response = runtime
+            .handle_heartbeat(HeartbeatRequest {
+                term: 7,
+                leader_node_id: "node-99".to_string(),
+                leader_addr: "node-99.local:9173".to_string(),
+                commit_sequence: 10,
+                leader_frontier_sequence: 10,
+                members: vec![ClusterMember {
+                    node_id: "node-99".to_string(),
+                    advertise_addr: "node-99.local:9173".to_string(),
+                    voter: true,
+                }],
+            })
+            .await
+            .unwrap();
+
+        assert!(!response.accepted);
+        assert_eq!(response.term, 0);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.current_term, 0);
+        assert_eq!(snapshot.role, "follower");
+        assert_eq!(snapshot.commit_sequence, 0);
+        assert!(
+            snapshot
+                .members
+                .iter()
+                .all(|member| member.node_id != "node-99")
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_heartbeat_commit_is_bounded_by_local_log() {
+        let runtime = test_runtime("node-2");
+        runtime
+            .set_local_last_applied_state(3, Some(1), Some(11))
+            .await;
+
+        let response = runtime
+            .handle_heartbeat(HeartbeatRequest {
+                term: 2,
+                leader_node_id: "node-1".to_string(),
+                leader_addr: "node-1.local:9173".to_string(),
+                commit_sequence: 9,
+                leader_frontier_sequence: 9,
+                members: runtime.current_members().await,
+            })
+            .await
+            .unwrap();
+
+        assert!(response.accepted);
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.role, "follower");
+        assert_eq!(snapshot.current_term, 2);
+        assert_eq!(snapshot.local_last_applied_sequence, 3);
+        assert_eq!(snapshot.commit_sequence, 3);
+    }
+
+    #[tokio::test]
+    async fn follower_commit_advances_after_local_entries_arrive() {
+        let runtime = test_runtime("node-2");
+        runtime
+            .handle_heartbeat(HeartbeatRequest {
+                term: 2,
+                leader_node_id: "node-1".to_string(),
+                leader_addr: "node-1.local:9173".to_string(),
+                commit_sequence: 9,
+                leader_frontier_sequence: 9,
+                members: runtime.current_members().await,
+            })
+            .await
+            .unwrap();
+        assert_eq!(runtime.snapshot().await.commit_sequence, 0);
+
+        runtime
+            .set_local_last_applied_state(5, Some(2), Some(55))
+            .await;
+        runtime.observe_leader_commit(9).await;
+        assert_eq!(runtime.snapshot().await.commit_sequence, 5);
+
+        runtime
+            .set_local_last_applied_state(9, Some(2), Some(99))
+            .await;
+        runtime.observe_leader_commit(9).await;
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.local_last_applied_sequence, 9);
+        assert_eq!(snapshot.commit_sequence, 9);
+    }
+
+    #[tokio::test]
+    async fn deterministic_leader_churn_preserves_term_and_commit_invariants() {
+        let node_1 = test_runtime("node-1");
+        let node_2 = test_runtime("node-2");
+        let node_3 = test_runtime("node-3");
+
+        let (term_1, members, last_log_index, last_log_term) =
+            node_1.begin_election().await.unwrap();
+        let votes =
+            1 + usize::from(
+                node_2
+                    .handle_vote_request(VoteRequest {
+                        term: term_1,
+                        candidate_node_id: "node-1".to_string(),
+                        candidate_addr: "node-1.local:9173".to_string(),
+                        last_log_index,
+                        last_log_term,
+                        prevote: false,
+                    })
+                    .await
+                    .unwrap()
+                    .vote_granted,
+            ) + usize::from(
+                node_3
+                    .handle_vote_request(VoteRequest {
+                        term: term_1,
+                        candidate_node_id: "node-1".to_string(),
+                        candidate_addr: "node-1.local:9173".to_string(),
+                        last_log_index,
+                        last_log_term,
+                        prevote: false,
+                    })
+                    .await
+                    .unwrap()
+                    .vote_granted,
+            );
+        assert!(
+            node_1
+                .finalize_election(term_1, votes, members.len())
+                .await
+                .unwrap()
+        );
+        assert_eq!(node_1.snapshot().await.role, "leader");
+
+        node_1
+            .set_local_last_applied_state(5, Some(term_1), Some(50))
+            .await;
+        node_1
+            .register_follower_ack("node-2".to_string(), 5, term_1, "node-1")
+            .await;
+        assert_eq!(node_1.snapshot().await.commit_sequence, 5);
+
+        node_2.observe_remote_term(term_1 + 1).await.unwrap();
+        let (term_2, members, last_log_index, last_log_term) =
+            node_2.begin_election().await.unwrap();
+        assert!(term_2 > term_1);
+        let votes = 1 + usize::from(
+            node_3
+                .handle_vote_request(VoteRequest {
+                    term: term_2,
+                    candidate_node_id: "node-2".to_string(),
+                    candidate_addr: "node-2.local:9173".to_string(),
+                    last_log_index,
+                    last_log_term,
+                    prevote: false,
+                })
+                .await
+                .unwrap()
+                .vote_granted,
+        );
+        assert!(
+            node_2
+                .finalize_election(term_2, votes, members.len())
+                .await
+                .unwrap()
+        );
+        node_1.observe_remote_term(term_2).await.unwrap();
+
+        let node_1_snapshot = node_1.snapshot().await;
+        let node_2_snapshot = node_2.snapshot().await;
+        assert_eq!(node_1_snapshot.role, "follower");
+        assert_eq!(node_2_snapshot.role, "leader");
+        assert_eq!(node_1_snapshot.current_term, term_2);
+        assert_eq!(node_2_snapshot.current_term, term_2);
+        assert!(node_1_snapshot.commit_sequence <= node_1_snapshot.local_last_applied_sequence);
+        assert!(node_2_snapshot.commit_sequence <= node_2_snapshot.local_last_applied_sequence);
+    }
+
+    #[tokio::test]
+    async fn stale_candidate_missing_committed_prefix_cannot_win() {
+        let node_1 = test_runtime("node-1");
+        let node_2 = test_runtime("node-2");
+        let node_3 = test_runtime("node-3");
+
+        {
+            let mut state = node_1.state.lock().await;
+            state.role = ReplicationRole::Leader;
+            state.current_term = 1;
+            state.leader_node_id = Some("node-1".to_string());
+        }
+        node_1
+            .set_local_last_applied_state(5, Some(1), Some(50))
+            .await;
+        node_3
+            .set_local_last_applied_state(5, Some(1), Some(50))
+            .await;
+        node_2
+            .set_local_last_applied_state(3, Some(1), Some(30))
+            .await;
+
+        node_1
+            .register_follower_ack("node-3".to_string(), 5, 1, "node-1")
+            .await;
+        node_3.observe_leader_commit(5).await;
+        assert_eq!(node_1.snapshot().await.commit_sequence, 5);
+        assert_eq!(node_3.snapshot().await.commit_sequence, 5);
+
+        assert!(!elect_with_reachable(&node_2, &[&node_1, &node_3]).await);
+        let node_2_snapshot = node_2.snapshot().await;
+        assert_ne!(node_2_snapshot.role, "leader");
+        assert_eq!(node_2_snapshot.commit_sequence, 0);
+        assert_replication_invariants(&[&node_1, &node_2, &node_3]).await;
+    }
+
+    #[tokio::test]
+    async fn minority_partition_leader_cannot_advance_quorum_commit() {
+        let node_1 = test_runtime("node-1");
+        let node_2 = test_runtime("node-2");
+        let node_3 = test_runtime("node-3");
+
+        assert!(elect_with_reachable(&node_1, &[&node_2, &node_3]).await);
+        node_1
+            .set_local_last_applied_state(10, Some(1), Some(100))
+            .await;
+        assert_eq!(
+            node_1.snapshot().await.commit_sequence,
+            0,
+            "isolated leader must not quorum-commit local-only entries"
+        );
+
+        assert!(elect_with_reachable(&node_2, &[&node_3]).await);
+        let node_2_term = node_2.current_term().await;
+        node_2
+            .set_local_last_applied_state(11, Some(node_2_term), Some(110))
+            .await;
+        node_3
+            .set_local_last_applied_state(11, Some(node_2_term), Some(110))
+            .await;
+        node_2
+            .register_follower_ack("node-3".to_string(), 11, node_2_term, "node-2")
+            .await;
+        node_3.observe_leader_commit(11).await;
+
+        assert_eq!(node_2.snapshot().await.role, "leader");
+        assert_eq!(node_2.snapshot().await.commit_sequence, 11);
+        assert_eq!(node_3.snapshot().await.commit_sequence, 11);
+        assert_eq!(node_1.snapshot().await.commit_sequence, 0);
+
+        let heartbeat = HeartbeatRequest {
+            term: node_2_term,
+            leader_node_id: "node-2".to_string(),
+            leader_addr: "node-2.local:9173".to_string(),
+            commit_sequence: 11,
+            leader_frontier_sequence: 11,
+            members: node_2.current_members().await,
+        };
+        let response = node_1.handle_heartbeat(heartbeat).await.unwrap();
+        assert!(response.accepted);
+        let node_1_snapshot = node_1.snapshot().await;
+        assert_eq!(node_1_snapshot.role, "follower");
+        assert_eq!(node_1_snapshot.current_term, node_2_term);
+        assert_eq!(
+            node_1_snapshot.commit_sequence, 10,
+            "healed follower commit is bounded by its local applied frontier"
+        );
+        assert_replication_invariants(&[&node_1, &node_2, &node_3]).await;
+    }
+
+    #[tokio::test]
+    async fn seeded_five_node_churn_preserves_core_invariants() {
+        let ids = ["node-1", "node-2", "node-3", "node-4", "node-5"];
+        let nodes = ids
+            .iter()
+            .map(|node_id| test_runtime_with_members(node_id, &ids))
+            .collect::<Vec<_>>();
+        let node_refs = nodes.iter().collect::<Vec<_>>();
+        let mut last_terms = BTreeMap::<String, u64>::new();
+        let mut last_commits = BTreeMap::<String, u64>::new();
+        let mut seed = 0x5eed_0f09_u64;
+        let mut next_sequence = 1_u64;
+
+        for _ in 0..80 {
+            let candidate_index = next_sim_value(&mut seed) % nodes.len();
+            let mut reachable = Vec::new();
+            for offset in 1..=3 {
+                reachable.push(&nodes[(candidate_index + offset) % nodes.len()]);
+            }
+
+            if elect_with_reachable(&nodes[candidate_index], &reachable).await {
+                let term = nodes[candidate_index].current_term().await;
+                nodes[candidate_index]
+                    .set_local_last_applied_state(
+                        next_sequence,
+                        Some(term),
+                        Some((next_sequence as u32).wrapping_mul(17)),
+                    )
+                    .await;
+                for follower in reachable.iter().take(2) {
+                    follower
+                        .set_local_last_applied_state(
+                            next_sequence,
+                            Some(term),
+                            Some((next_sequence as u32).wrapping_mul(17)),
+                        )
+                        .await;
+                    nodes[candidate_index]
+                        .register_follower_ack(
+                            follower.config.node_id.clone(),
+                            next_sequence,
+                            term,
+                            &nodes[candidate_index].config.node_id,
+                        )
+                        .await;
+                    follower.observe_leader_commit(next_sequence).await;
+                }
+                next_sequence = next_sequence.saturating_add(1);
+            }
+
+            assert_replication_invariants(&node_refs).await;
+            for node in &node_refs {
+                let snapshot = node.snapshot().await;
+                let previous_term = last_terms
+                    .insert(snapshot.node_id.clone(), snapshot.current_term)
+                    .unwrap_or(0);
+                assert!(
+                    snapshot.current_term >= previous_term,
+                    "term regressed for {}",
+                    snapshot.node_id
+                );
+                let previous_commit = last_commits
+                    .insert(snapshot.node_id.clone(), snapshot.commit_sequence)
+                    .unwrap_or(0);
+                assert!(
+                    snapshot.commit_sequence >= previous_commit,
+                    "commit regressed for {}",
+                    snapshot.node_id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn simulated_three_node_partitions_preserve_raft_invariants() {
+        let mut cluster = SimulatedCluster::new(&["node-1", "node-2", "node-3"], 0x9_003);
+        for _ in 0..160 {
+            cluster.random_event().await;
+        }
+        cluster.heal_all();
+        for node_id in ["node-1", "node-2", "node-3"] {
+            let _ = cluster.try_elect(node_id).await;
+            cluster.random_event().await;
+        }
+        cluster.assert_invariants().await;
+    }
+
+    #[tokio::test]
+    async fn simulated_five_node_partitions_preserve_raft_invariants() {
+        let mut cluster =
+            SimulatedCluster::new(&["node-1", "node-2", "node-3", "node-4", "node-5"], 0x9_005);
+        for _ in 0..220 {
+            cluster.random_event().await;
+        }
+        cluster.heal_all();
+        for node_id in ["node-1", "node-2", "node-3", "node-4", "node-5"] {
+            let _ = cluster.try_elect(node_id).await;
+            cluster.random_event().await;
+        }
+        cluster.assert_invariants().await;
     }
 
     #[tokio::test]
