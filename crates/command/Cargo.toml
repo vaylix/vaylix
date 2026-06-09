@@ -1,7 +1,8 @@
 [package]
 name = "command"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 thiserror = "2.0.18"

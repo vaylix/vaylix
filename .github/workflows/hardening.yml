@@ -1,0 +1,376 @@
+name: Hardening
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
+
+jobs:
+  loom-models:
+    name: Loom concurrency models
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run loom invariant models
+        run: cargo test --locked -p server --test loom_invariants --features loom-tests -- --nocapture
+
+  clock-policy:
+    name: Clock policy guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check replication clock policy
+        run: cargo test --locked -p server --test clock_policy
+
+  soak-short:
+    name: Short engine soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run short soak
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+          VAYLIX_SOAK_SECONDS: "2"
+        run: cargo test --locked -p engine --test soak_endurance --features soak-tests -- --nocapture
+
+  cluster-soak-short:
+    name: Short 3-node cluster soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run short cluster soak
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: cargo test --locked -p server --test tcp_integration short_three_node_cluster_soak_bounds_wal_and_replication_lag --features cluster-soak-tests -- --nocapture
+
+  recovery-characterization:
+    name: Recovery characterization
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure short recovery baseline
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+          VAYLIX_RECOVERY_ENTRIES: "2000"
+        run: cargo test --locked -p engine --test recovery_characterization --features capacity-tests -- --nocapture
+
+  network-chaos-smoke:
+    name: Real process network chaos smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run process/proxy chaos smoke
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: cargo test --locked -p server --test network_chaos --features chaos-tests -- --nocapture
+
+  ha-fault-matrix:
+    name: HA RPC fault matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run HA RPC fault matrix
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: cargo test --locked -p server --test tcp_integration ha_rpc_fault_matrix_preserves_quorum_and_bounded_errors --features chaos-tests -- --nocapture
+
+  capacity-rto:
+    name: HA capacity and RTO characterization
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Measure leader failover RTO distribution
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: cargo test --locked -p server --test tcp_integration leader_failover_rto_distribution_stays_within_short_baseline --features capacity-tests -- --nocapture
+
+      - name: Measure snapshot install and catch-up RTO
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: cargo test --locked -p server --test tcp_integration late_follower_snapshot_install_and_catchup_rto_stays_within_short_baseline --features capacity-tests -- --nocapture
+
+  soak-long:
+    name: Long soak and endurance
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run 2-hour engine soak
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+          VAYLIX_SOAK_SECONDS: "7200"
+        run: cargo test --locked -p engine --test soak_endurance --features soak-tests -- --nocapture
+
+      - name: Run 2-hour cluster soak
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+          VAYLIX_CLUSTER_SOAK_SECONDS: "7200"
+          VAYLIX_CLUSTER_SOAK_OPS: "30"
+        run: cargo test --locked -p server --test tcp_integration short_three_node_cluster_soak_bounds_wal_and_replication_lag --features cluster-soak-tests -- --nocapture
+
+  miri-smoke:
+    name: Miri parser and codec smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly with Miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Miri smoke tests
+        run: |
+          cargo +nightly miri test --locked -p command --lib
+          cargo +nightly miri test --locked -p transport --lib
+
+  sanitizer-smoke:
+    name: Sanitizer smoke ${{ matrix.sanitizer }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run sanitizer smoke tests
+        env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+        run: |
+          cargo +nightly test -Zbuild-std --locked -p command -p transport --lib --target x86_64-unknown-linux-gnu
+
+  mutation-critical:
+    name: Mutation critical shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-mutants
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+
+      - name: Run critical mutation shard
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: cargo mutants --shard "${{ matrix.shard }}/4"
+
+      - name: Upload mutation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out-${{ matrix.shard }}
+          path: mutants.out
+          if-no-files-found: ignore
+
+  coverage-critical:
+    name: Coverage critical crates
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - name: Generate coverage summary
+        env:
+          VAYLIX_TEST_SEED: "11400714819323198485"
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --locked --workspace --all-features --json --summary-only --output-path target/llvm-cov/summary.json --ignore-filename-regex 'crates/.*/tests/|crates/.*/benches/|fuzz/'
+
+      - name: Upload coverage summary
+        uses: actions/upload-artifact@v4
+        with:
+          name: llvm-cov-summary
+          path: target/llvm-cov/summary.json
+
+  supply-chain:
+    name: Supply chain
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check advisories bans licenses sources
+
+  semver-surfaces:
+    name: SemVer public Rust surfaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [command, engine, transport]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-semver-checks
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-semver-checks
+
+      - name: Check public API
+        run: cargo semver-checks -p "${{ matrix.crate }}" --baseline-rev origin/main

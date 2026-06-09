@@ -48,6 +48,7 @@ jobs:
           cd fuzz
           cargo +nightly fuzz run --target "${FUZZ_TARGET}" vtp_frame -- -runs=2048
           cargo +nightly fuzz run --target "${FUZZ_TARGET}" command_text -- -runs=2048
+          cargo +nightly fuzz run --target "${FUZZ_TARGET}" auth_handshake -- -runs=2048
           cargo +nightly fuzz run --target "${FUZZ_TARGET}" storage_recovery -- -runs=1024
           cargo +nightly fuzz run --target "${FUZZ_TARGET}" replication_json -- -runs=2048
 

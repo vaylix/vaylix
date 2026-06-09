@@ -214,6 +214,7 @@ async fn peer_worker(
 ) {
     let mut connection = None;
     while let Some(request) = receiver.recv().await {
+        let request = coalesce_pending_peer_requests(request, &mut receiver);
         match request {
             PeerRequest::Append {
                 payload,
@@ -231,6 +232,40 @@ async fn peer_worker(
                     send_heartbeat(&runtime, &member, &mut connection, &counters, payload).await;
                 let _ = respond_to.send(result);
             }
+        }
+    }
+}
+
+fn coalesce_pending_peer_requests(
+    mut current: PeerRequest,
+    receiver: &mut mpsc::Receiver<PeerRequest>,
+) -> PeerRequest {
+    while let Ok(next) = receiver.try_recv() {
+        current = coalesce_peer_request(current, next);
+    }
+    current
+}
+
+fn coalesce_peer_request(current: PeerRequest, next: PeerRequest) -> PeerRequest {
+    match (&current, &next) {
+        (PeerRequest::Append { .. }, PeerRequest::Heartbeat { .. }) => {
+            fail_peer_request(next);
+            current
+        }
+        _ => {
+            fail_peer_request(current);
+            next
+        }
+    }
+}
+
+fn fail_peer_request(request: PeerRequest) {
+    match request {
+        PeerRequest::Append { respond_to, .. } => {
+            let _ = respond_to.send(Err(ServerError::ReplicationAckUnavailable));
+        }
+        PeerRequest::Heartbeat { respond_to, .. } => {
+            let _ = respond_to.send(Err(ServerError::ReplicationAckUnavailable));
         }
     }
 }

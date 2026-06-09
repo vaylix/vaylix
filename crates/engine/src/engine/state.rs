@@ -489,6 +489,38 @@ mod tests {
     }
 
     #[test]
+    fn ttl_handles_wall_clock_steps_without_resurrection_or_early_expiry() {
+        let mut state = EngineState::new();
+        state
+            .apply_entry(&entry(
+                1,
+                WalOperation::Set {
+                    key: "session".to_string(),
+                    value: b"active".to_vec(),
+                    version: 1,
+                },
+            ))
+            .unwrap();
+        state
+            .apply_entry(&entry(
+                2,
+                WalOperation::Expire {
+                    key: "session".to_string(),
+                    expires_at_ms: 2_000,
+                },
+            ))
+            .unwrap();
+
+        assert_eq!(state.ttl_for("session", 1_500), 1);
+        assert_eq!(state.ttl_for("session", 1_200), 1);
+        assert_eq!(state.get_live("session", 1_200), Some(b"active".to_vec()));
+
+        assert_eq!(state.ttl_for("session", 2_500), TTL_KEY_MISSING);
+        assert_eq!(state.ttl_for("session", 1_500), TTL_KEY_MISSING);
+        assert_eq!(state.get_live("session", 1_500), None);
+    }
+
+    #[test]
     fn rolls_back_failed_numeric_updates() {
         let mut state = EngineState::new();
         state

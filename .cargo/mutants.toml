@@ -1,0 +1,41 @@
+# cargo-mutants reads this file by default from the workspace root.
+
+test_workspace = true
+all_features = false
+additional_cargo_args = ["--locked"]
+timeout_multiplier = 3.0
+build_timeout_multiplier = 3.0
+minimum_test_timeout = 60.0
+copy_vcs = false
+gitignore = true
+output = "mutants.out"
+cap_lints = true
+skip_calls_defaults = true
+
+examine_globs = [
+    "crates/engine/src/engine/core.rs",
+    "crates/engine/src/engine/state.rs",
+    "crates/engine/src/store/**/*.rs",
+    "crates/server/src/auth/**/*.rs",
+    "crates/server/src/server/ha_write_coordinator.rs",
+    "crates/server/src/server/read_index.rs",
+    "crates/server/src/replication/**/*.rs",
+    "crates/transport/src/**/*.rs",
+]
+
+exclude_globs = [
+    "crates/*/benches/**/*.rs",
+    "crates/*/tests/**/*.rs",
+    "fuzz/**/*.rs",
+]
+
+skip_calls = [
+    "debug",
+    "eprintln",
+    "error",
+    "info",
+    "panic",
+    "println",
+    "trace",
+    "warn",
+]

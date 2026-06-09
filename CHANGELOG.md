@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-09
+
+### Added
+
+- Added pre-1.0 hardening gates for seeded engine/reference-model testing, focused mutation baselines, loom concurrency models, clock-policy checks, real-process HA/network chaos, single-node and 3-node cluster soaks, recovery/RTO characterization, error-code catalog checks, `cargo-deny`, `cargo-semver-checks`, and coverage reporting.
+- Added an auth-handshake fuzz target for the transport/command pre-auth parser boundary.
+- Added explicit parser rejection tests for non-goal command surfaces such as distributed transactions, sharding, MVCC, explicit linearizable reads, read-index commands, and online PITR archive restore.
+- Added concurrent audit-log append coverage that reopens and verifies the resulting hash chain.
+- Added real-process HA fault coverage for latency, jitter, bandwidth caps, packet loss, half-open connections, slow-reader/slow-writer behavior, majority-loss partitions, healed partitions, and slow-follower catch-up.
+- Added RTO characterization for WAL replay, snapshot recovery, leader election, late-follower snapshot install/catch-up, and backup/snapshot contention latency.
+
+### Changed
+
+- Bumped all workspace crates to `0.10.0`.
+- Added crate license metadata and explicit internal path dependency versions so supply-chain tooling can evaluate the workspace cleanly.
+
+### Fixed
+
+- Fixed HA background catch-up fanout so slower followers are not starved by quorum-short-circuit foreground write acknowledgement.
+- Fixed the consensus ticker to schedule liveness heartbeats and append/catch-up heartbeats from the same heartbeat-due decision.
+- Fixed late-follower replication planning to send a snapshot when retained WAL entries are no longer contiguous from the follower's expected sequence.
+
 ## [0.9.0] - 2026-06-05
 
 ### Added

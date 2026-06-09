@@ -1,15 +1,16 @@
 [package]
 name = "bench"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
+license = "MIT"
 
 [[bin]]
 name = "vaylix-bench"
 path = "src/main.rs"
 
 [dependencies]
-command = { path = "../command" }
-transport = { path = "../transport" }
+command = { path = "../command", version = "0.10.0" }
+transport = { path = "../transport", version = "0.10.0" }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 hdrhistogram = "7.5.4"
 pin-project-lite = "0.2.17"

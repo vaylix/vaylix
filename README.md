@@ -18,7 +18,7 @@ Release binaries are published from tagged releases:
 
 - Server and client archives: <https://github.com/vaylix/vaylix/releases>
 - Server image: `ghcr.io/vaylix/vaylix:latest`
-- Versioned server image example: `ghcr.io/vaylix/vaylix:0.9.0`
+- Versioned server image example: `ghcr.io/vaylix/vaylix:0.10.0`
 
 Release builds also publish SBOMs and keyless Sigstore/cosign attestations.
 
@@ -116,7 +116,7 @@ are deterministic non-mutating conditional-write failures.
 
 ## High Availability
 
-Vaylix 0.9.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
+Vaylix 0.10.x supports a single-region HA topology using the existing `vaylix` server binary. Nodes keep stable identities, exchange vote/heartbeat/append RPCs over the normal framed transport, elect one leader, reject mutating commands on non-leaders, and commit writes according to the configured acknowledgement policy.
 
 Recommended production shape:
 
@@ -229,12 +229,35 @@ cargo check --manifest-path fuzz/Cargo.toml
 cargo audit --file Cargo.lock
 ```
 
+Hardening gates:
+
+```bash
+cargo test --locked -p engine --test model_semantics -- --nocapture
+cargo test --locked -p server --test error_code_catalog
+cargo test --locked -p server --test clock_policy
+cargo test --locked -p server --test loom_invariants --features loom-tests -- --nocapture
+cargo test --locked -p server --test network_chaos --features chaos-tests -- --nocapture
+cargo test --locked -p server --test tcp_integration ha_rpc_fault_matrix_preserves_quorum_and_bounded_errors --features chaos-tests -- --nocapture
+cargo test --locked -p engine --test soak_endurance --features soak-tests -- --nocapture
+cargo test --locked -p server --test tcp_integration short_three_node_cluster_soak_bounds_wal_and_replication_lag --features cluster-soak-tests -- --nocapture
+cargo test --locked -p engine --test recovery_characterization --features capacity-tests -- --nocapture
+cargo test --locked -p server --test tcp_integration leader_failover_rto_distribution_stays_within_short_baseline --features capacity-tests -- --nocapture
+cargo test --locked -p server --test tcp_integration late_follower_snapshot_install_and_catchup_rto_stays_within_short_baseline --features capacity-tests -- --nocapture
+cargo deny check advisories bans licenses sources
+for crate in command engine transport; do cargo semver-checks -p "$crate" --baseline-rev origin/main; done
+cargo llvm-cov --locked --workspace --all-features --json --summary-only --output-path target/llvm-cov/summary.json
+cargo mutants
+```
+
+The scheduled `Hardening` workflow runs the expensive gates outside the default PR path: sharded mutation testing, loom models, real-process HA chaos, short and long soaks, recovery/RTO characterization, Miri smoke, sanitizer smoke, supply-chain checks, SemVer checks, and coverage reporting. Local randomized/model tests print `VAYLIX_TEST_SEED` and accept the same environment variable as an override.
+
 Fuzz smoke:
 
 ```bash
 cd fuzz
 cargo +nightly fuzz run vtp_frame -- -runs=4096
 cargo +nightly fuzz run command_text -- -runs=4096
+cargo +nightly fuzz run auth_handshake -- -runs=4096
 cargo +nightly fuzz run storage_recovery -- -runs=2048
 cargo +nightly fuzz run replication_json -- -runs=4096
 ```

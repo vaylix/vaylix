@@ -103,3 +103,16 @@ Error codes are stable client-facing identifiers. A code must not be reused for 
 | `SRV-037` | Follower Write Rejected | A follower rejected a write command. |
 | `SRV-038` | Replication Promotion Denied | Manual promotion was rejected by safety checks. |
 | `SRV-039` | Healthcheck Failed | The server healthcheck command failed. |
+
+## Client CLI
+
+Client CLI errors are local process errors. Parser and transport failures keep their original `CMD-*` and `TRN-*` codes instead of being wrapped in a separate CLI code.
+
+| Code | Name | Client meaning |
+| --- | --- | --- |
+| `CLI-003` | Filesystem I/O Failure | A local filesystem operation failed. |
+| `CLI-004` | Readline Failure | The interactive line editor failed. |
+| `CLI-005` | Project Directories Unavailable | The client could not determine required project directories. |
+| `CLI-006` | Response Id Mismatch | A response did not match the request id the client was waiting for. |
+| `CLI-007` | Local Command Response | A local-only client command unexpectedly received a server response. |
+| `CLI-008` | Invalid Client Configuration | The supplied client configuration is invalid. |

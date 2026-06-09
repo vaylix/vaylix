@@ -263,6 +263,7 @@ mod tests {
     use serde_json::Value;
     use std::collections::BTreeMap;
     use std::fs;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -437,5 +438,41 @@ mod tests {
             assert!(AuditLogger::open(&path).is_err());
             fs::remove_file(path).ok();
         }
+    }
+
+    #[test]
+    fn concurrent_records_preserve_a_verifiable_chain() {
+        let path = temp_path();
+        let logger = Arc::new(AuditLogger::open(&path).unwrap());
+        let threads = (0..4)
+            .map(|worker| {
+                let logger = Arc::clone(&logger);
+                std::thread::spawn(move || {
+                    for index in 0..25 {
+                        logger
+                            .record(&event(&format!("SET-{worker}-{index}")))
+                            .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        drop(logger);
+
+        let lines = read_lines(&path);
+        assert_eq!(lines.len(), 100);
+        for (index, line) in lines.iter().enumerate() {
+            assert_eq!(line["sequence"], (index + 1) as u64);
+            if index == 0 {
+                assert_eq!(line["previous_hash"], GENESIS_HASH);
+            } else {
+                assert_eq!(line["previous_hash"], lines[index - 1]["event_hash"]);
+            }
+        }
+        AuditLogger::open(&path).unwrap();
+        fs::remove_file(path).ok();
     }
 }

@@ -2,6 +2,8 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "chaos-tests")]
+use std::sync::Mutex as StdMutex;
 use std::sync::{Arc as StdArc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -25,8 +27,12 @@ use server::server::{
     CommittedReadIndex, ReplicationClientPool, ServerGuards, ServerRuntimeConfig,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+#[cfg(feature = "chaos-tests")]
+use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+#[cfg(feature = "chaos-tests")]
+use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
@@ -292,6 +298,43 @@ fn clustered_replication(
 ) -> Arc<ReplicationRuntime> {
     let state_dir = temp_dir(&format!("cluster-state-{node_id}"));
     clustered_replication_with_state_dir(node_id, role, advertise_addr, members, &state_dir)
+}
+
+#[cfg(any(feature = "chaos-tests", feature = "capacity-tests"))]
+fn clustered_replication_with_timing(
+    node_id: &str,
+    role: ReplicationRole,
+    advertise_addr: SocketAddr,
+    members: &[ClusterMember],
+    ack_timeout: Duration,
+    heartbeat_interval: Duration,
+    election_timeout_min: Duration,
+    election_timeout_max: Duration,
+) -> Arc<ReplicationRuntime> {
+    let state_dir = temp_dir(&format!("cluster-state-{node_id}"));
+    Arc::new(
+        ReplicationRuntime::new(ReplicationConfig {
+            node_id: node_id.to_string(),
+            group_id: "ha-test-group".to_string(),
+            advertise_addr: Some(advertise_addr.to_string()),
+            role,
+            upstream: None,
+            upstream_username: Some("vaylix".to_string()),
+            upstream_password: Some("vaylix".to_string()),
+            write_ack_mode: WriteAckMode::Replica,
+            ack_timeout,
+            poll_interval: Duration::from_millis(50),
+            fetch_batch_size: 32,
+            stale_after: Duration::from_secs(2),
+            heartbeat_interval,
+            election_timeout_min,
+            election_timeout_max,
+            state_path: state_dir.join("cluster-state.json"),
+            state_tmp_path: state_dir.join("cluster-state.json.tmp"),
+            initial_members: members.to_vec(),
+        })
+        .unwrap(),
+    )
 }
 
 fn clustered_replication_with_state_dir(
@@ -2255,6 +2298,1311 @@ async fn elects_leader_fails_over_and_keeps_replicating() {
     fs::remove_dir_all(root1).ok();
     fs::remove_dir_all(root2).ok();
     fs::remove_dir_all(root3).ok();
+}
+
+#[cfg(feature = "cluster-soak-tests")]
+fn cluster_soak_request_id(index: u128, op: u128) -> u128 {
+    7_000_000_000_u128 + index.saturating_mul(10) + op
+}
+
+#[cfg(feature = "cluster-soak-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn short_three_node_cluster_soak_bounds_wal_and_replication_lag() {
+    let _ha_test_lock = acquire_ha_test_lock().await;
+    let duration =
+        Duration::from_secs(capacity_env_u64("VAYLIX_CLUSTER_SOAK_SECONDS").unwrap_or(0));
+    let max_ops = capacity_env_u64("VAYLIX_CLUSTER_SOAK_OPS").unwrap_or(30);
+    eprintln!(
+        "VAYLIX_CLUSTER_SOAK_SECONDS={} VAYLIX_CLUSTER_SOAK_OPS={max_ops}",
+        duration.as_secs()
+    );
+    let node1_addr = reserve_local_addr();
+    let node2_addr = reserve_local_addr();
+    let node3_addr = reserve_local_addr();
+    let members = vec![
+        ClusterMember {
+            node_id: "soak-node-1".to_string(),
+            advertise_addr: node1_addr.to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "soak-node-2".to_string(),
+            advertise_addr: node2_addr.to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "soak-node-3".to_string(),
+            advertise_addr: node3_addr.to_string(),
+            voter: true,
+        },
+    ];
+
+    let root1 = temp_dir("ha-soak-node-1");
+    let root2 = temp_dir("ha-soak-node-2");
+    let root3 = temp_dir("ha-soak-node-3");
+    let paths1 = Paths::from_data_dir(&root1).unwrap();
+    let paths2 = Paths::from_data_dir(&root2).unwrap();
+    let paths3 = Paths::from_data_dir(&root3).unwrap();
+    let paths = [paths1.clone(), paths2.clone(), paths3.clone()];
+    let roots = [root1.clone(), root2.clone(), root3.clone()];
+
+    let engine_options = |key: &str| EngineOptions {
+        wal_sync: WalSyncPolicy::Flush,
+        wal_segment_size_bytes: 16 * 1024,
+        wal_retain_segments: 8,
+        keyring: Some(test_keyring(key)),
+    };
+    let engine1 =
+        Engine::from_paths_with_options(paths1, engine_options("ha-soak-node-1-key")).unwrap();
+    let engine2 =
+        Engine::from_paths_with_options(paths2, engine_options("ha-soak-node-2-key")).unwrap();
+    let engine3 =
+        Engine::from_paths_with_options(paths3, engine_options("ha-soak-node-3-key")).unwrap();
+
+    let snapshot_interval = (duration > Duration::ZERO).then_some(Duration::from_secs(10));
+    let mut runtime1 = runtime_without_auth(snapshot_interval);
+    runtime1.replication =
+        clustered_replication("soak-node-1", ReplicationRole::Leader, node1_addr, &members);
+    let mut runtime2 = runtime_without_auth(snapshot_interval);
+    runtime2.replication = clustered_replication(
+        "soak-node-2",
+        ReplicationRole::Follower,
+        node2_addr,
+        &members,
+    );
+    let mut runtime3 = runtime_without_auth(snapshot_interval);
+    runtime3.replication = clustered_replication(
+        "soak-node-3",
+        ReplicationRole::Follower,
+        node3_addr,
+        &members,
+    );
+
+    let server1 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node1_addr.port(),
+        16,
+        engine1,
+        runtime1,
+    )
+    .await
+    .unwrap();
+    let server2 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node2_addr.port(),
+        16,
+        engine2,
+        runtime2,
+    )
+    .await
+    .unwrap();
+    let server3 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        node3_addr.port(),
+        16,
+        engine3,
+        runtime3,
+    )
+    .await
+    .unwrap();
+
+    let task1 = tokio::spawn(async move { server1.start().await });
+    let task2 = tokio::spawn(async move { server2.start().await });
+    let task3 = tokio::spawn(async move { server3.start().await });
+    let tasks = [task1, task2, task3];
+    let addrs = [node1_addr, node2_addr, node3_addr];
+
+    let leader = wait_for_writable_leader(
+        &addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        70_000,
+        "ha:soak:probe",
+    )
+    .await;
+    let mut stream = connect_tcp(addrs[leader]).await;
+    authenticate(&mut stream).await;
+
+    let started = Instant::now();
+    let mut writes = 0_u128;
+    while if duration > Duration::ZERO {
+        started.elapsed() < duration
+    } else {
+        writes < max_ops as u128
+    } {
+        let index = writes;
+        let set = issue_command(
+            &mut stream,
+            cluster_soak_request_id(index, 0),
+            Command::Set {
+                key: format!("ha:soak:key:{index:02}"),
+                value: format!("value:{index}").into_bytes(),
+                options: SetOptions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            set.status,
+            Status::Ok,
+            "cluster soak SET failed at {index}: {:?}",
+            String::from_utf8_lossy(&set.payload)
+        );
+
+        if index % 3 == 0 {
+            let read = issue_command(
+                &mut stream,
+                cluster_soak_request_id(index, 1),
+                Command::Get {
+                    key: format!("ha:soak:key:{index:02}"),
+                },
+            )
+            .await;
+            assert_eq!(
+                read.status,
+                Status::Ok,
+                "cluster soak GET failed at {index}: {:?}",
+                String::from_utf8_lossy(&read.payload)
+            );
+        }
+
+        if index % 5 == 0 {
+            let incr = issue_command(
+                &mut stream,
+                cluster_soak_request_id(index, 2),
+                Command::Incr {
+                    key: "ha:soak:counter".to_string(),
+                },
+            )
+            .await;
+            assert_eq!(
+                incr.status,
+                Status::Ok,
+                "cluster soak INCR failed at {index}: {:?}",
+                String::from_utf8_lossy(&incr.payload)
+            );
+        }
+
+        if index % 11 == 0 {
+            let expire = issue_command(
+                &mut stream,
+                cluster_soak_request_id(index, 3),
+                Command::Expire {
+                    key: format!("ha:soak:key:{index:02}"),
+                    seconds: 60,
+                },
+            )
+            .await;
+            assert_eq!(
+                expire.status,
+                Status::Ok,
+                "cluster soak EXPIRE failed at {index}: {:?}",
+                String::from_utf8_lossy(&expire.payload)
+            );
+        }
+
+        writes = writes.saturating_add(1);
+    }
+    assert!(writes > 0, "cluster soak did not issue any writes");
+
+    let final_key = "ha:soak:sentinel".to_string();
+    let final_value = format!("value:{writes}");
+    let final_set = issue_command(
+        &mut stream,
+        cluster_soak_request_id(writes, 4),
+        Command::Set {
+            key: final_key.clone(),
+            value: final_value.clone().into_bytes(),
+            options: SetOptions::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        final_set.status,
+        Status::Ok,
+        "cluster soak sentinel SET failed after {writes} writes: {:?}",
+        String::from_utf8_lossy(&final_set.payload)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut last_results = Vec::new();
+    let mut replication_views = Vec::new();
+    loop {
+        let mut visible = 0usize;
+        last_results.clear();
+        replication_views.clear();
+        for (idx, addr) in addrs.iter().enumerate() {
+            let mut stream = connect_tcp(*addr).await;
+            authenticate(&mut stream).await;
+            let response = issue_command(
+                &mut stream,
+                cluster_soak_request_id(writes + idx as u128 + 1, 5),
+                Command::Get {
+                    key: final_key.clone(),
+                },
+            )
+            .await;
+            let decoded = if response.status == Status::Ok {
+                Some(response.decode_value().unwrap())
+            } else {
+                None
+            };
+            if decoded.as_deref() == Some(final_value.as_str()) {
+                visible += 1;
+            }
+            last_results.push((
+                idx,
+                response.status,
+                decoded.unwrap_or_else(|| String::from_utf8_lossy(&response.payload).into_owned()),
+            ));
+            let replication = issue_command(
+                &mut stream,
+                cluster_soak_request_id(writes + idx as u128 + 1, 6),
+                Command::ShowReplication,
+            )
+            .await;
+            replication_views.push((
+                idx,
+                replication.status,
+                String::from_utf8_lossy(&replication.payload).into_owned(),
+            ));
+        }
+        if visible == 3 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cluster soak sentinel write did not become visible on all nodes: {last_results:?}; replication={replication_views:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    eprintln!(
+        "cluster_soak ops={writes} elapsed_ms={}",
+        started.elapsed().as_millis()
+    );
+
+    for (idx, path) in paths.iter().enumerate() {
+        let report = inspect_wal(&path.wal_dir).unwrap();
+        eprintln!(
+            "cluster_soak node={idx} wal_segments={} wal_bytes={}",
+            report.segment_count, report.total_size_bytes
+        );
+        let max_wal_bytes = if duration > Duration::ZERO {
+            1024 * 1024
+        } else {
+            512 * 1024
+        };
+        let max_wal_segments = if duration > Duration::ZERO { 32 } else { 8 };
+        assert!(
+            report.total_size_bytes <= max_wal_bytes,
+            "node {idx} WAL exceeded cluster soak envelope: {:?}",
+            report
+        );
+        assert!(
+            report.segment_count <= max_wal_segments,
+            "node {idx} WAL segment count exceeded cluster soak envelope: {:?}",
+            report
+        );
+    }
+
+    for task in tasks {
+        task.abort();
+    }
+    for root in roots {
+        fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn ha_rpc_fault_matrix_preserves_quorum_and_bounded_errors() {
+    let _ha_test_lock = acquire_ha_test_lock().await;
+    let seed = ha_chaos_seed();
+    eprintln!("VAYLIX_TEST_SEED={seed}");
+
+    let actual_addrs = [
+        reserve_local_addr(),
+        reserve_local_addr(),
+        reserve_local_addr(),
+    ];
+    let proxies = [
+        ChaosPeerProxy::start(actual_addrs[0], seed ^ 0x101).await,
+        ChaosPeerProxy::start(actual_addrs[1], seed ^ 0x202).await,
+        ChaosPeerProxy::start(actual_addrs[2], seed ^ 0x303).await,
+    ];
+    let proxy_addrs = [proxies[0].addr(), proxies[1].addr(), proxies[2].addr()];
+    let members = vec![
+        ClusterMember {
+            node_id: "chaos-node-1".to_string(),
+            advertise_addr: proxy_addrs[0].to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "chaos-node-2".to_string(),
+            advertise_addr: proxy_addrs[1].to_string(),
+            voter: true,
+        },
+        ClusterMember {
+            node_id: "chaos-node-3".to_string(),
+            advertise_addr: proxy_addrs[2].to_string(),
+            voter: true,
+        },
+    ];
+
+    let roots = [
+        temp_dir("ha-chaos-node-1"),
+        temp_dir("ha-chaos-node-2"),
+        temp_dir("ha-chaos-node-3"),
+    ];
+    let paths = [
+        Paths::from_data_dir(&roots[0]).unwrap(),
+        Paths::from_data_dir(&roots[1]).unwrap(),
+        Paths::from_data_dir(&roots[2]).unwrap(),
+    ];
+    let engine_options = |key: &str| EngineOptions {
+        wal_sync: WalSyncPolicy::Flush,
+        wal_segment_size_bytes: 16 * 1024,
+        wal_retain_segments: 8,
+        keyring: Some(test_keyring(key)),
+    };
+    let engine1 =
+        Engine::from_paths_with_options(paths[0].clone(), engine_options("ha-chaos-node-1-key"))
+            .unwrap();
+    let engine2 =
+        Engine::from_paths_with_options(paths[1].clone(), engine_options("ha-chaos-node-2-key"))
+            .unwrap();
+    let engine3 =
+        Engine::from_paths_with_options(paths[2].clone(), engine_options("ha-chaos-node-3-key"))
+            .unwrap();
+
+    let mut runtime1 = runtime_without_auth(None);
+    runtime1.replication = clustered_replication_with_timing(
+        "chaos-node-1",
+        ReplicationRole::Leader,
+        proxy_addrs[0],
+        &members,
+        Duration::from_millis(600),
+        Duration::from_millis(50),
+        Duration::from_millis(300),
+        Duration::from_millis(600),
+    );
+    let mut runtime2 = runtime_without_auth(None);
+    runtime2.replication = clustered_replication_with_timing(
+        "chaos-node-2",
+        ReplicationRole::Follower,
+        proxy_addrs[1],
+        &members,
+        Duration::from_millis(600),
+        Duration::from_millis(50),
+        Duration::from_millis(300),
+        Duration::from_millis(600),
+    );
+    let mut runtime3 = runtime_without_auth(None);
+    runtime3.replication = clustered_replication_with_timing(
+        "chaos-node-3",
+        ReplicationRole::Follower,
+        proxy_addrs[2],
+        &members,
+        Duration::from_millis(600),
+        Duration::from_millis(50),
+        Duration::from_millis(300),
+        Duration::from_millis(600),
+    );
+
+    let server1 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        actual_addrs[0].port(),
+        16,
+        engine1,
+        runtime1,
+    )
+    .await
+    .unwrap();
+    let server2 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        actual_addrs[1].port(),
+        16,
+        engine2,
+        runtime2,
+    )
+    .await
+    .unwrap();
+    let server3 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        actual_addrs[2].port(),
+        16,
+        engine3,
+        runtime3,
+    )
+    .await
+    .unwrap();
+
+    let tasks = [
+        tokio::spawn(async move { server1.start().await }),
+        tokio::spawn(async move { server2.start().await }),
+        tokio::spawn(async move { server3.start().await }),
+    ];
+
+    write_to_current_leader(&actual_addrs, 80_000, "ha:chaos:baseline", "baseline").await;
+    wait_for_value_on_all(
+        &actual_addrs,
+        "ha:chaos:baseline",
+        "baseline",
+        80_500,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let scenarios = [
+        (
+            "latency_jitter",
+            true,
+            ChaosFault::LatencyJitter {
+                base_ms: 15,
+                jitter_ms: 20,
+            },
+        ),
+        (
+            "bandwidth_cap",
+            true,
+            ChaosFault::BandwidthCap {
+                chunk_bytes: 64,
+                delay_ms: 2,
+            },
+        ),
+        (
+            "slow_reader_writer",
+            true,
+            ChaosFault::SlowBothDirections { delay_ms: 25 },
+        ),
+        (
+            "packet_loss_single_follower",
+            false,
+            ChaosFault::DropEveryNthClientChunk { every: 3 },
+        ),
+        (
+            "half_open_single_follower",
+            false,
+            ChaosFault::HalfOpenClientToServer,
+        ),
+    ];
+
+    for (scenario_index, (name, all_peers, fault)) in scenarios.into_iter().enumerate() {
+        eprintln!("ha_chaos_scenario={name}");
+        let targets = if all_peers {
+            vec![0, 1, 2]
+        } else {
+            let leader = wait_for_writable_leader(
+                &actual_addrs,
+                None,
+                Instant::now() + Duration::from_secs(10),
+                80_600 + scenario_index as u128 * 100,
+                &format!("ha:chaos:{name}:target-probe"),
+            )
+            .await;
+            vec![(leader + 1) % 3]
+        };
+        set_faults(&proxies, &targets, fault);
+        let key = format!("ha:chaos:{name}");
+        let value = format!("value:{scenario_index}");
+        write_to_current_leader(
+            &actual_addrs,
+            81_000 + scenario_index as u128 * 100,
+            &key,
+            &value,
+        )
+        .await;
+        reset_faults(&proxies);
+        wait_for_value_on_all(
+            &actual_addrs,
+            &key,
+            &value,
+            82_000 + scenario_index as u128 * 100,
+            Duration::from_secs(10),
+        )
+        .await;
+    }
+
+    let leader = wait_for_writable_leader(
+        &actual_addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        83_000,
+        "ha:chaos:partition-probe",
+    )
+    .await;
+    let follower_targets = [0usize, 1, 2]
+        .into_iter()
+        .filter(|idx| *idx != leader)
+        .collect::<Vec<_>>();
+    set_faults(&proxies, &follower_targets, ChaosFault::Partition);
+
+    let mut leader_stream = connect_tcp(actual_addrs[leader]).await;
+    authenticate(&mut leader_stream).await;
+    let partitioned = timeout(
+        Duration::from_secs(8),
+        issue_command(
+            &mut leader_stream,
+            84_000,
+            Command::Set {
+                key: "ha:chaos:majority-loss".to_string(),
+                value: b"must-not-commit".to_vec(),
+                options: SetOptions::default(),
+            },
+        ),
+    )
+    .await
+    .expect("majority-loss write should return a bounded response");
+    assert_eq!(
+        partitioned.status,
+        Status::Error,
+        "majority-loss partition must not acknowledge a quorum write"
+    );
+    let error = partitioned.decode_error().unwrap();
+    assert!(
+        matches!(error.code.as_str(), "SRV-035" | "SRV-036" | "SRV-037"),
+        "unexpected partition error code: {} {}",
+        error.code,
+        error.name
+    );
+
+    reset_faults(&proxies);
+    write_to_current_leader(
+        &actual_addrs,
+        85_000,
+        "ha:chaos:healed",
+        "committed-after-heal",
+    )
+    .await;
+    wait_for_value_on_all(
+        &actual_addrs,
+        "ha:chaos:healed",
+        "committed-after-heal",
+        85_500,
+        Duration::from_secs(12),
+    )
+    .await;
+
+    let leader = wait_for_writable_leader(
+        &actual_addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        86_000,
+        "ha:chaos:slow-follower-probe",
+    )
+    .await;
+    let slow_follower = [0usize, 1, 2]
+        .into_iter()
+        .find(|idx| *idx != leader)
+        .unwrap();
+    set_faults(
+        &proxies,
+        &[slow_follower],
+        ChaosFault::SlowBothDirections { delay_ms: 35 },
+    );
+    for index in 0..24_u128 {
+        write_to_current_leader(
+            &actual_addrs,
+            86_100 + index,
+            &format!("ha:chaos:slow-follower-catchup:{index:02}"),
+            &format!("value:{index}"),
+        )
+        .await;
+    }
+    reset_faults(&proxies);
+    wait_for_value_on_all(
+        &actual_addrs,
+        "ha:chaos:slow-follower-catchup:23",
+        "value:23",
+        86_500,
+        Duration::from_secs(12),
+    )
+    .await;
+
+    for proxy in proxies {
+        drop(proxy);
+    }
+    for task in tasks {
+        task.abort();
+    }
+    for root in roots {
+        fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChaosFault {
+    Healthy,
+    LatencyJitter { base_ms: u64, jitter_ms: u64 },
+    BandwidthCap { chunk_bytes: usize, delay_ms: u64 },
+    SlowBothDirections { delay_ms: u64 },
+    DropEveryNthClientChunk { every: u64 },
+    HalfOpenClientToServer,
+    Partition,
+}
+
+#[cfg(feature = "chaos-tests")]
+#[derive(Clone, Copy)]
+enum ChaosDirection {
+    ClientToServer,
+    ServerToClient,
+}
+
+#[cfg(feature = "chaos-tests")]
+struct ChaosPeerProxy {
+    addr: SocketAddr,
+    fault: StdArc<StdMutex<ChaosFault>>,
+    task: JoinHandle<()>,
+}
+
+#[cfg(feature = "chaos-tests")]
+impl ChaosPeerProxy {
+    async fn start(upstream: SocketAddr, seed: u64) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("chaos proxy should bind");
+        let addr = listener
+            .local_addr()
+            .expect("chaos proxy should expose local addr");
+        let fault = StdArc::new(StdMutex::new(ChaosFault::Healthy));
+        let task_fault = StdArc::clone(&fault);
+        let task = tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                tokio::spawn(handle_chaos_proxy_connection(
+                    client,
+                    upstream,
+                    StdArc::clone(&task_fault),
+                    seed,
+                ));
+            }
+        });
+        Self { addr, fault, task }
+    }
+
+    fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn set_fault(&self, fault: ChaosFault) {
+        *self.fault.lock().expect("chaos fault mutex poisoned") = fault;
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+impl Drop for ChaosPeerProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+async fn handle_chaos_proxy_connection(
+    mut client: TcpStream,
+    upstream: SocketAddr,
+    fault: StdArc<StdMutex<ChaosFault>>,
+    seed: u64,
+) {
+    if matches!(current_fault(&fault), ChaosFault::Partition) {
+        return;
+    }
+    let Ok(mut server) = TcpStream::connect(upstream).await else {
+        return;
+    };
+    let (mut client_read, mut client_write) = client.split();
+    let (mut server_read, mut server_write) = server.split();
+    let client_to_server = relay_chaos(
+        &mut client_read,
+        &mut server_write,
+        StdArc::clone(&fault),
+        ChaosDirection::ClientToServer,
+        seed ^ 0xc1e17,
+    );
+    let server_to_client = relay_chaos(
+        &mut server_read,
+        &mut client_write,
+        fault,
+        ChaosDirection::ServerToClient,
+        seed ^ 0x5e2e7,
+    );
+    tokio::select! {
+        _ = client_to_server => {}
+        _ = server_to_client => {}
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+async fn relay_chaos<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    fault: StdArc<StdMutex<ChaosFault>>,
+    direction: ChaosDirection,
+    seed: u64,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 1024];
+    let mut bytes_seen = 0u64;
+    let mut chunks_seen = 0u64;
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        bytes_seen = bytes_seen.saturating_add(n as u64);
+        chunks_seen = chunks_seen.saturating_add(1);
+        match current_fault(&fault) {
+            ChaosFault::Healthy => {
+                writer.write_all(&buf[..n]).await?;
+            }
+            ChaosFault::LatencyJitter { base_ms, jitter_ms } => {
+                let jitter = if jitter_ms == 0 {
+                    0
+                } else {
+                    seed.wrapping_add(bytes_seen.wrapping_mul(1_103_515_245)) % (jitter_ms + 1)
+                };
+                sleep(Duration::from_millis(base_ms.saturating_add(jitter))).await;
+                writer.write_all(&buf[..n]).await?;
+            }
+            ChaosFault::BandwidthCap {
+                chunk_bytes,
+                delay_ms,
+            } => {
+                for chunk in buf[..n].chunks(chunk_bytes.max(1)) {
+                    writer.write_all(chunk).await?;
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+            }
+            ChaosFault::SlowBothDirections { delay_ms } => {
+                sleep(Duration::from_millis(delay_ms)).await;
+                writer.write_all(&buf[..n]).await?;
+            }
+            ChaosFault::DropEveryNthClientChunk { every }
+                if matches!(direction, ChaosDirection::ClientToServer)
+                    && every > 0
+                    && chunks_seen.is_multiple_of(every) => {}
+            ChaosFault::DropEveryNthClientChunk { .. } => {
+                writer.write_all(&buf[..n]).await?;
+            }
+            ChaosFault::HalfOpenClientToServer
+                if matches!(direction, ChaosDirection::ClientToServer) =>
+            {
+                while matches!(current_fault(&fault), ChaosFault::HalfOpenClientToServer) {
+                    sleep(Duration::from_millis(25)).await;
+                }
+                return Ok(());
+            }
+            ChaosFault::HalfOpenClientToServer => {
+                writer.write_all(&buf[..n]).await?;
+            }
+            ChaosFault::Partition => return Ok(()),
+        }
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+fn current_fault(fault: &StdArc<StdMutex<ChaosFault>>) -> ChaosFault {
+    *fault.lock().expect("chaos fault mutex poisoned")
+}
+
+#[cfg(feature = "chaos-tests")]
+fn set_faults(proxies: &[ChaosPeerProxy; 3], targets: &[usize], fault: ChaosFault) {
+    for target in targets {
+        proxies[*target].set_fault(fault);
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+fn reset_faults(proxies: &[ChaosPeerProxy; 3]) {
+    for proxy in proxies {
+        proxy.set_fault(ChaosFault::Healthy);
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+async fn write_to_current_leader(
+    addrs: &[SocketAddr; 3],
+    request_id_base: u128,
+    key: &str,
+    value: &str,
+) -> usize {
+    let leader = wait_for_writable_leader(
+        addrs,
+        None,
+        Instant::now() + Duration::from_secs(12),
+        request_id_base,
+        &format!("{key}:leader-probe"),
+    )
+    .await;
+    let mut stream = connect_tcp(addrs[leader]).await;
+    authenticate(&mut stream).await;
+    let response = issue_command(
+        &mut stream,
+        request_id_base + 50,
+        Command::Set {
+            key: key.to_string(),
+            value: value.as_bytes().to_vec(),
+            options: SetOptions::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        response.status,
+        Status::Ok,
+        "leader write failed for {key}: {:?}",
+        String::from_utf8_lossy(&response.payload)
+    );
+    leader
+}
+
+#[cfg(any(feature = "chaos-tests", feature = "capacity-tests"))]
+async fn wait_for_value_on_all(
+    addrs: &[SocketAddr],
+    key: &str,
+    value: &str,
+    request_id_base: u128,
+    timeout_after: Duration,
+) {
+    let deadline = Instant::now() + timeout_after;
+    loop {
+        let mut visible = 0usize;
+        for (idx, addr) in addrs.iter().enumerate() {
+            let mut stream = connect_tcp(*addr).await;
+            authenticate(&mut stream).await;
+            let response = issue_command(
+                &mut stream,
+                request_id_base + idx as u128,
+                Command::Get {
+                    key: key.to_string(),
+                },
+            )
+            .await;
+            if response.status == Status::Ok && response.decode_value().unwrap() == value {
+                visible += 1;
+            }
+        }
+        if visible == addrs.len() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{key}={value} did not become visible on all nodes before timeout"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(feature = "chaos-tests")]
+fn ha_chaos_seed() -> u64 {
+    std::env::var("VAYLIX_TEST_SEED")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0x6a09_e667_f3bc_c909)
+}
+
+#[cfg(feature = "capacity-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leader_failover_rto_distribution_stays_within_short_baseline() {
+    let _ha_test_lock = acquire_ha_test_lock().await;
+    let seed = capacity_seed();
+    let runs = capacity_env_u64("VAYLIX_ELECTION_RTO_RUNS").unwrap_or(3);
+    let max_p99_ms = capacity_env_u64("VAYLIX_ELECTION_RTO_MAX_MS").unwrap_or(8_000) as u128;
+    eprintln!("VAYLIX_TEST_SEED={seed}");
+    eprintln!("VAYLIX_ELECTION_RTO_RUNS={runs}");
+
+    let mut samples_ms = Vec::new();
+    for run in 0..runs {
+        let addrs = [
+            reserve_local_addr(),
+            reserve_local_addr(),
+            reserve_local_addr(),
+        ];
+        let node_ids = [
+            format!("rto-election-{run}-node-1"),
+            format!("rto-election-{run}-node-2"),
+            format!("rto-election-{run}-node-3"),
+        ];
+        let members = node_ids
+            .iter()
+            .zip(addrs.iter())
+            .map(|(node_id, addr)| ClusterMember {
+                node_id: node_id.clone(),
+                advertise_addr: addr.to_string(),
+                voter: true,
+            })
+            .collect::<Vec<_>>();
+        let roots = [
+            temp_dir(&format!("rto-election-{run}-node-1")),
+            temp_dir(&format!("rto-election-{run}-node-2")),
+            temp_dir(&format!("rto-election-{run}-node-3")),
+        ];
+        let paths = [
+            Paths::from_data_dir(&roots[0]).unwrap(),
+            Paths::from_data_dir(&roots[1]).unwrap(),
+            Paths::from_data_dir(&roots[2]).unwrap(),
+        ];
+        let engine_options = |idx: usize| EngineOptions {
+            wal_sync: WalSyncPolicy::Flush,
+            wal_segment_size_bytes: 16 * 1024,
+            wal_retain_segments: 8,
+            keyring: Some(test_keyring(&format!("rto-election-{run}-node-{idx}-key"))),
+        };
+        let engine1 = Engine::from_paths_with_options(paths[0].clone(), engine_options(1)).unwrap();
+        let engine2 = Engine::from_paths_with_options(paths[1].clone(), engine_options(2)).unwrap();
+        let engine3 = Engine::from_paths_with_options(paths[2].clone(), engine_options(3)).unwrap();
+
+        let mut runtime1 = runtime_without_auth(None);
+        runtime1.replication = clustered_replication_with_timing(
+            &node_ids[0],
+            ReplicationRole::Leader,
+            addrs[0],
+            &members,
+            Duration::from_millis(600),
+            Duration::from_millis(50),
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+        );
+        let mut runtime2 = runtime_without_auth(None);
+        runtime2.replication = clustered_replication_with_timing(
+            &node_ids[1],
+            ReplicationRole::Follower,
+            addrs[1],
+            &members,
+            Duration::from_millis(600),
+            Duration::from_millis(50),
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+        );
+        let mut runtime3 = runtime_without_auth(None);
+        runtime3.replication = clustered_replication_with_timing(
+            &node_ids[2],
+            ReplicationRole::Follower,
+            addrs[2],
+            &members,
+            Duration::from_millis(600),
+            Duration::from_millis(50),
+            Duration::from_millis(250),
+            Duration::from_millis(500),
+        );
+
+        let server1 = Server::with_engine(
+            "127.0.0.1".to_string(),
+            addrs[0].port(),
+            16,
+            engine1,
+            runtime1,
+        )
+        .await
+        .unwrap();
+        let server2 = Server::with_engine(
+            "127.0.0.1".to_string(),
+            addrs[1].port(),
+            16,
+            engine2,
+            runtime2,
+        )
+        .await
+        .unwrap();
+        let server3 = Server::with_engine(
+            "127.0.0.1".to_string(),
+            addrs[2].port(),
+            16,
+            engine3,
+            runtime3,
+        )
+        .await
+        .unwrap();
+
+        let mut tasks = vec![
+            tokio::spawn(async move { server1.start().await }),
+            tokio::spawn(async move { server2.start().await }),
+            tokio::spawn(async move { server3.start().await }),
+        ];
+
+        let request_base = 90_000 + run as u128 * 10_000;
+        let initial_leader = wait_for_writable_leader(
+            &addrs,
+            None,
+            Instant::now() + Duration::from_secs(10),
+            request_base,
+            &format!("rto:election:{run}:initial"),
+        )
+        .await;
+
+        let started = Instant::now();
+        tasks[initial_leader].abort();
+        let _ = (&mut tasks[initial_leader]).await;
+        let new_leader = wait_for_writable_leader(
+            &addrs,
+            Some(initial_leader),
+            Instant::now() + Duration::from_secs(12),
+            request_base + 2_000,
+            &format!("rto:election:{run}:after-failover"),
+        )
+        .await;
+        let elapsed_ms = started.elapsed().as_millis();
+        eprintln!(
+            "election_rto sample={run} old_leader={initial_leader} new_leader={new_leader} elapsed_ms={elapsed_ms}"
+        );
+        samples_ms.push(elapsed_ms);
+
+        for task in tasks {
+            task.abort();
+        }
+        for root in roots {
+            fs::remove_dir_all(root).ok();
+        }
+    }
+
+    samples_ms.sort_unstable();
+    let min = samples_ms.first().copied().unwrap_or(0);
+    let p50 = capacity_percentile(&samples_ms, 50);
+    let p99 = capacity_percentile(&samples_ms, 99);
+    eprintln!("election_rto samples_ms={samples_ms:?} min_ms={min} p50_ms={p50} p99_ms={p99}");
+    assert!(
+        p99 <= max_p99_ms,
+        "election RTO p99 exceeded short baseline: {p99}ms > {max_p99_ms}ms"
+    );
+}
+
+#[cfg(feature = "capacity-tests")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_follower_snapshot_install_and_catchup_rto_stays_within_short_baseline() {
+    let _ha_test_lock = acquire_ha_test_lock().await;
+    let seed = capacity_seed() ^ 0x5a9f_0170_c174_cade;
+    let entries = capacity_env_u64("VAYLIX_SNAPSHOT_CATCHUP_ENTRIES").unwrap_or(160);
+    let max_catchup_ms = capacity_env_u64("VAYLIX_SNAPSHOT_CATCHUP_MAX_MS").unwrap_or(12_000);
+    eprintln!("VAYLIX_TEST_SEED={seed}");
+    eprintln!("VAYLIX_SNAPSHOT_CATCHUP_ENTRIES={entries}");
+
+    let addrs = [
+        reserve_local_addr(),
+        reserve_local_addr(),
+        reserve_local_addr(),
+    ];
+    let node_ids = [
+        "rto-snapshot-node-1".to_string(),
+        "rto-snapshot-node-2".to_string(),
+        "rto-snapshot-node-3".to_string(),
+    ];
+    let members = node_ids
+        .iter()
+        .zip(addrs.iter())
+        .map(|(node_id, addr)| ClusterMember {
+            node_id: node_id.clone(),
+            advertise_addr: addr.to_string(),
+            voter: true,
+        })
+        .collect::<Vec<_>>();
+    let roots = [
+        temp_dir("rto-snapshot-node-1"),
+        temp_dir("rto-snapshot-node-2"),
+        temp_dir("rto-snapshot-node-3"),
+    ];
+    let paths = [
+        Paths::from_data_dir(&roots[0]).unwrap(),
+        Paths::from_data_dir(&roots[1]).unwrap(),
+        Paths::from_data_dir(&roots[2]).unwrap(),
+    ];
+    let engine_options = |idx: usize| EngineOptions {
+        wal_sync: WalSyncPolicy::Flush,
+        wal_segment_size_bytes: 512,
+        wal_retain_segments: 1,
+        keyring: Some(test_keyring(&format!("rto-snapshot-node-{idx}-key"))),
+    };
+    let engine1 = Engine::from_paths_with_options(paths[0].clone(), engine_options(1)).unwrap();
+    let engine2 = Engine::from_paths_with_options(paths[1].clone(), engine_options(2)).unwrap();
+
+    let mut runtime1 = runtime_without_auth(None);
+    runtime1.replication = clustered_replication_with_timing(
+        &node_ids[0],
+        ReplicationRole::Leader,
+        addrs[0],
+        &members,
+        Duration::from_millis(600),
+        Duration::from_millis(50),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    );
+    let mut runtime2 = runtime_without_auth(None);
+    runtime2.replication = clustered_replication_with_timing(
+        &node_ids[1],
+        ReplicationRole::Follower,
+        addrs[1],
+        &members,
+        Duration::from_millis(600),
+        Duration::from_millis(50),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    );
+
+    let server1 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        addrs[0].port(),
+        16,
+        engine1,
+        runtime1,
+    )
+    .await
+    .unwrap();
+    let server2 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        addrs[1].port(),
+        16,
+        engine2,
+        runtime2,
+    )
+    .await
+    .unwrap();
+    let mut tasks = vec![
+        tokio::spawn(async move { server1.start().await }),
+        tokio::spawn(async move { server2.start().await }),
+    ];
+
+    let active_addrs = [addrs[0], addrs[1]];
+    let leader = wait_for_writable_leader(
+        &active_addrs,
+        None,
+        Instant::now() + Duration::from_secs(10),
+        110_000,
+        "rto:snapshot:initial",
+    )
+    .await;
+    let mut leader_stream = connect_tcp(active_addrs[leader]).await;
+    authenticate(&mut leader_stream).await;
+    for index in 0..entries {
+        let response = issue_command(
+            &mut leader_stream,
+            111_000 + index as u128,
+            Command::Set {
+                key: format!("rto:snapshot:key:{index:05}"),
+                value: format!("value:{seed}:{index}:{}", "x".repeat(192)).into_bytes(),
+                options: SetOptions::default(),
+            },
+        )
+        .await;
+        assert_eq!(
+            response.status,
+            Status::Ok,
+            "snapshot catch-up preload write failed at {index}: {:?}",
+            String::from_utf8_lossy(&response.payload)
+        );
+    }
+
+    let snapshot = issue_command(&mut leader_stream, 112_000, Command::Snapshot).await;
+    assert_eq!(
+        snapshot.status,
+        Status::Ok,
+        "leader snapshot failed: {:?}",
+        String::from_utf8_lossy(&snapshot.payload)
+    );
+
+    let final_key = "rto:snapshot:final";
+    let final_value = "installed-from-leader-snapshot";
+    let final_write = issue_command(
+        &mut leader_stream,
+        112_100,
+        Command::Set {
+            key: final_key.to_string(),
+            value: final_value.as_bytes().to_vec(),
+            options: SetOptions::default(),
+        },
+    )
+    .await;
+    assert_eq!(
+        final_write.status,
+        Status::Ok,
+        "post-snapshot leader write failed: {:?}",
+        String::from_utf8_lossy(&final_write.payload)
+    );
+    wait_for_value_on_all(
+        &active_addrs,
+        final_key,
+        final_value,
+        112_200,
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let engine3 = Engine::from_paths_with_options(paths[2].clone(), engine_options(3)).unwrap();
+    let mut runtime3 = runtime_without_auth(None);
+    runtime3.replication = clustered_replication_with_timing(
+        &node_ids[2],
+        ReplicationRole::Follower,
+        addrs[2],
+        &members,
+        Duration::from_millis(600),
+        Duration::from_millis(50),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+    );
+    let server3 = Server::with_engine(
+        "127.0.0.1".to_string(),
+        addrs[2].port(),
+        16,
+        engine3,
+        runtime3,
+    )
+    .await
+    .unwrap();
+    tasks.push(tokio::spawn(async move { server3.start().await }));
+
+    let catchup_started = Instant::now();
+    wait_for_value_on_all(
+        &addrs,
+        final_key,
+        final_value,
+        112_500,
+        Duration::from_millis(max_catchup_ms),
+    )
+    .await;
+    let catchup_ms = catchup_started.elapsed().as_millis();
+    let snapshot_bytes = fs::metadata(&paths[2].snapshot_path)
+        .expect("late follower should persist installed snapshot")
+        .len();
+    assert!(
+        snapshot_bytes > 0,
+        "late follower snapshot install wrote an empty snapshot"
+    );
+    assert!(
+        paths[2].manifest_path.exists(),
+        "late follower snapshot install did not persist the manifest"
+    );
+    eprintln!(
+        "snapshot_catchup entries={entries} catchup_ms={catchup_ms} snapshot_bytes={snapshot_bytes}"
+    );
+    assert!(
+        catchup_ms <= max_catchup_ms as u128,
+        "snapshot catch-up exceeded short baseline: {catchup_ms}ms > {max_catchup_ms}ms"
+    );
+
+    for task in tasks {
+        task.abort();
+    }
+    for root in roots {
+        fs::remove_dir_all(root).ok();
+    }
+}
+
+#[cfg(any(feature = "capacity-tests", feature = "cluster-soak-tests"))]
+fn capacity_env_u64(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+#[cfg(feature = "capacity-tests")]
+fn capacity_seed() -> u64 {
+    capacity_env_u64("VAYLIX_TEST_SEED").unwrap_or(0xc4ca_c17a_7e57_5eed)
+}
+
+#[cfg(feature = "capacity-tests")]
+fn capacity_percentile(values: &[u128], percentile: usize) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let index = ((values.len() - 1) * percentile).div_ceil(100);
+    values[index]
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

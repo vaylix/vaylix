@@ -928,7 +928,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::Parser;
-    use crate::{Command, Expiration, SetCondition, SetOptions};
+    use crate::{Command, CommandError, Expiration, SetCondition, SetOptions};
 
     #[test]
     fn parses_serious_v1_commands() {
@@ -1175,6 +1175,30 @@ mod tests {
     #[test]
     fn parses_quit_alias() {
         assert_eq!(Parser::parse("quit").unwrap(), Command::Exit);
+    }
+
+    #[test]
+    fn rejects_non_goal_command_surfaces() {
+        for command in [
+            "begin distributed transaction",
+            "commit distributed transaction",
+            "create shard users",
+            "move shard users to node-2",
+            "get user:1 linearizable",
+            "read index user:1",
+            "mvcc snapshot",
+            "restore pitr archive now",
+        ] {
+            assert!(
+                Parser::parse(command).is_err(),
+                "{command} should remain outside the command surface"
+            );
+        }
+
+        assert!(matches!(
+            Parser::parse("mvcc snapshot"),
+            Err(CommandError::UnknownCommand { .. })
+        ));
     }
 
     #[test]

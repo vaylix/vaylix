@@ -602,11 +602,29 @@ Pull request CI runs:
 - `cargo test --locked --workspace`
 - `cargo audit --file Cargo.lock`
 
+Scheduled/pre-1.0 hardening CI also runs:
+
+- sharded `cargo-mutants` over `.cargo/mutants.toml`
+- seeded engine/reference-model tests
+- server error-code catalog tests
+- replication clock-policy guard
+- gated loom invariant models through `--features loom-tests`
+- gated real-process network chaos smoke and HA RPC fault matrix through `--features chaos-tests`
+- gated short and scheduled 2-hour engine soak through `--features soak-tests`
+- gated short and scheduled 2-hour 3-node cluster soak through `--features cluster-soak-tests`
+- gated recovery, leader-election RTO, and follower snapshot-install/catch-up characterization through `--features capacity-tests`
+- `cargo-deny`
+- `cargo-semver-checks` for public Rust library surfaces (`command`, `engine`, `transport`)
+- `cargo-llvm-cov` summary reporting
+- nightly Miri and sanitizer smoke jobs for parser/codec surfaces
+
+Mutation and randomized/model reports live under `hardening/` and `PROGRESS.md`. Docs-site prose that cannot be published directly from this repo is staged under `docs-site/`. There is no TypeScript SDK package in this repository, so TypeScript API snapshot/diff automation is not implemented here.
+
 Release workflow goal:
 
 - publish multi-OS client binaries
 - publish multi-OS server binaries
-- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.9.0`
+- publish a multi-arch server image to GHCR with both `latest` and the release version tag, for example `0.10.0`
 - publish SBOMs for release archives and Docker images
 - use keyless Sigstore/cosign signing and attestations through GitHub OIDC
 
@@ -619,6 +637,7 @@ Release workflow goal:
 - backup/restore remains logical JSON based; there is no separate streaming backup utility yet
 - no TLS certificate automation or rotation workflow yet
 - TLS is opt-in rather than mandatory
+- TTL uses persisted wall-clock expiration timestamps; state-level tests cover backward wall-clock steps before and after expiry, and election/heartbeat timers use monotonic `Instant`
 
 ## Guidance for Agents
 

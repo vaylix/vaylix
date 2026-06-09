@@ -640,7 +640,8 @@ fn spawn_consensus_loop(
                     if runtime.replication.current_members().await.len() <= 1 {
                         continue;
                     }
-                    if runtime.replication.heartbeat_due().await
+                    let heartbeat_due = runtime.replication.heartbeat_due().await;
+                    if heartbeat_due
                         && let Err(err) = send_cluster_liveness_heartbeats(engine.clone(), runtime.clone()).await
                     {
                         log_event(
@@ -649,7 +650,7 @@ fn spawn_consensus_loop(
                             &format!("[{}] {}: {err}", err.code(), err.name()),
                         );
                     }
-                    if runtime.replication.heartbeat_due().await
+                    if heartbeat_due
                         && let Err(err) = try_send_cluster_heartbeats(engine.clone(), runtime.clone()).await
                     {
                         log_event(
@@ -889,7 +890,7 @@ async fn send_cluster_heartbeats_role_guarded(
 ) -> Result<()> {
     let _fanout_guard = runtime.replication_fanout_lock.lock().await;
     let peer_timeout = runtime.replication.config().ack_timeout;
-    send_cluster_appends_locked(engine, runtime.clone(), peer_timeout).await
+    send_cluster_appends_locked(engine, runtime.clone(), peer_timeout, true).await
 }
 
 async fn send_cluster_heartbeats_role_guarded_with_timeout(
@@ -936,13 +937,14 @@ async fn try_send_cluster_heartbeats(
         .saturating_mul(5)
         .max(Duration::from_millis(250))
         .min(runtime.replication.config().ack_timeout);
-    send_cluster_appends_locked(engine, runtime.clone(), peer_timeout).await
+    send_cluster_appends_locked(engine, runtime.clone(), peer_timeout, false).await
 }
 
 async fn send_cluster_appends_locked(
     engine: EngineHandle,
     runtime: ServerRuntimeConfig,
     peer_timeout: Duration,
+    abort_after_quorum: bool,
 ) -> Result<()> {
     if runtime.replication.role().await != ReplicationRole::Leader {
         return Ok(());
@@ -1011,7 +1013,20 @@ async fn send_cluster_appends_locked(
                 .take(fetch_batch_size)
                 .cloned()
                 .collect::<Vec<_>>();
-            (None, None, entries, None)
+            if entries
+                .first()
+                .is_some_and(|entry| entry.sequence != prev_sequence.saturating_add(1))
+                || (entries.is_empty() && local_sequence > prev_sequence)
+            {
+                (
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(engine.replication_snapshot().await?),
+                )
+            } else {
+                (None, None, entries, None)
+            }
         } else if let Some(prev_entry_index) = cached_by_sequence.get(&prev_sequence).copied() {
             let prev_entry = &cached_entries[prev_entry_index];
             let prev_term = Some(prev_entry.term);
@@ -1122,8 +1137,9 @@ async fn send_cluster_appends_locked(
                         ),
                     );
                 }
-                if runtime.replication.config().write_ack_mode
-                    == crate::replication::WriteAckMode::Replica
+                if abort_after_quorum
+                    && runtime.replication.config().write_ack_mode
+                        == crate::replication::WriteAckMode::Replica
                     && runtime.replication.commit_sequence().await >= local_sequence
                 {
                     fanout.abort_all();
